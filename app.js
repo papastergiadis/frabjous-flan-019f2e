@@ -191,6 +191,25 @@ async function dbSaveProject(proj) {
   const {error} = await sb.from('be_projects').upsert({id:proj.id, data:proj});
   if (error) { showToast('Σφάλμα αποθήκευσης έργου.','error'); throw error; }
 }
+
+// Phase 2E: refresh the authoritative server copy after a narrow mutation RPC.
+async function refreshProjectFromServer(projectId) {
+  const {data,error}=await sb.from('be_projects').select('data').eq('id',projectId).single();
+  if (error) throw error;
+  const fresh=data?.data;
+  if (!fresh) throw new Error('Το έργο δεν επιστράφηκε από τη βάση.');
+  const idx=(state.db.projects||[]).findIndex(p=>p.id===projectId);
+  if (idx>=0) state.db.projects[idx]=fresh;
+  else state.db.projects.push(fresh);
+  return fresh;
+}
+
+async function secureProjectRpc(rpcName,args,projectId) {
+  const {data,error}=await sb.rpc(rpcName,args);
+  if (error) throw error;
+  if (projectId) await refreshProjectFromServer(projectId);
+  return data;
+}
 async function dbSaveTemplate(tpl) {
   const {error} = await sb.from('be_templates').upsert({id:tpl.id, data:tpl});
   if (error) { showToast('Σφάλμα αποθήκευσης προτύπου.','error'); throw error; }
@@ -1713,7 +1732,7 @@ function renderProject() {
   const proj=getProject(state.projectId); if(!proj) return '<p>Έργο not found.</p>';
   const cat=getCategory(proj.categoryId); const mgrNames=projManagerNames(proj);
   const prog=projectProgress(proj); const isComp=proj.status==='completed'; const canMod=canModifyProject(proj);
-  const isAdminOrMgmt = state.cu?.role === 'management';
+  const isAdminOrMgmt = ['admin','management'].includes(state.cu?.role);
   const init=proj.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();
 
   const phases=(proj.phases||[]).map((ph,phIdx)=>{
@@ -2694,26 +2713,68 @@ function restoreExpanded() {
   });
 }
 
-function handleStatusChange(sel) {
+async function handleStatusChange(sel) {
   const {pid,phid,tid}=sel.dataset;
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid);
   if (!task) return;
-  const old=task.status; task.status=sel.value;
-  if (sel.value==='completed'&&!task.completedDate) task.completedDate=today();
-  if (sel.value!=='completed') task.completedDate=null;
-  auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[sel.value]?.label}`);
+  const old=task.status;
+  const next=sel.value;
+
+  if (isSupabaseAuthMode()) {
+    sel.disabled=true;
+    try {
+      await secureProjectRpc('app_task_set_status',{
+        p_project_id:pid,
+        p_phase_id:phid,
+        p_task_id:tid,
+        p_status:next
+      },pid);
+      auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`);
+    } catch(err) {
+      console.error('app_task_set_status:',err);
+      showToast('Η αλλαγή κατάστασης απορρίφθηκε: '+(err.message||err),'error');
+    } finally {
+      render(); requestAnimationFrame(()=>restoreExpanded());
+    }
+    return;
+  }
+
+  task.status=next;
+  if (next==='completed'&&!task.completedDate) task.completedDate=today();
+  if (next!=='completed') task.completedDate=null;
+  auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`);
   dbSaveProject(proj).catch(()=>{});
-  render(); requestAnimationFrame(()=>{ restoreExpanded(); });
+  render(); requestAnimationFrame(()=>restoreExpanded());
 }
 
-function toggleSubtask(pid,phid,tid,stid,checked) {
+async function toggleSubtask(pid,phid,tid,stid,checked) {
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); const st=task?.subtasks.find(s=>s.id===stid);
   if (!st) return;
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_subtask_set_done',{
+        p_project_id:pid,
+        p_phase_id:phid,
+        p_task_id:tid,
+        p_subtask_id:stid,
+        p_done:!!checked
+      },pid);
+      auditLog('Υποεργασία',`"${st.name}" → ${checked?'Ολοκλήρωση':'Αναίρεση'}`);
+    } catch(err) {
+      console.error('app_subtask_set_done:',err);
+      showToast('Η ενημέρωση υποεργασίας απορρίφθηκε: '+(err.message||err),'error');
+    } finally {
+      render(); requestAnimationFrame(()=>restoreExpanded());
+    }
+    return;
+  }
+
   st.done=checked;
-  if (!checked) st.reviewStatus=undefined; // αναίρεση → επαναφορά για νέο αίτημα
+  if (!checked) st.reviewStatus=undefined;
   auditLog('Υποεργασία',`"${st.name}" → ${checked?'Ολοκλήρωση':'Αναίρεση'}`);
   dbSaveProject(proj).catch(()=>{});
-  render(); requestAnimationFrame(()=>{ restoreExpanded(); });
+  render(); requestAnimationFrame(()=>restoreExpanded());
 }
 
 function handleClick(e) {
@@ -3221,7 +3282,21 @@ window.modalSaveDocUrl=async function(did,tid){
   const url=(el('durl-input')?.value||'').trim();
   if (!url) { alert('Εισάγετε σύνδεσμο Dropbox.'); return; }
   const found=findDoc(did,tid); if(!found) return;
-  const {proj,task,doc}=found;
+  const {proj,ph,task,doc}=found;
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_document_complete',{
+        p_project_id:proj.id,p_phase_id:ph.id,p_task_id:task.id,
+        p_document_id:did,p_file_name:null,p_url:url,p_client_uploaded:false
+      },proj.id);
+      auditLog('Σύνδεσμος εγγράφου',`"${doc.name}" – ${task.name}`);
+      closeModal(); render(); requestAnimationFrame(()=>restoreExpanded());
+      showToast('Σύνδεσμος αποθηκεύτηκε.','success');
+    } catch(err) { showToast('Ο σύνδεσμος δεν αποθηκεύτηκε: '+(err.message||err),'error'); }
+    return;
+  }
+
   doc.url=url; doc.file=null; doc.done=true; doc.at=today();
   auditLog('Σύνδεσμος εγγράφου',`"${doc.name}" – ${task.name}`);
   await dbSaveProject(proj); closeModal();
@@ -3240,6 +3315,18 @@ window.modalUploadDocFile=async function(did,tid){
   try {
     // First file → fills the existing doc slot
     await fileSave(did, files[0]);
+
+    if (isSupabaseAuthMode() && files.length===1) {
+      await secureProjectRpc('app_document_complete',{
+        p_project_id:proj.id,p_phase_id:found.ph.id,p_task_id:task.id,
+        p_document_id:did,p_file_name:files[0].name,p_url:null,p_client_uploaded:false
+      },proj.id);
+      auditLog('Ανέβασμα αρχείου',`"${files[0].name}" – ${task.name}`);
+      closeModal(); render(); requestAnimationFrame(()=>restoreExpanded());
+      showToast(`Αρχείο «${files[0].name}» αποθηκεύτηκε.`,'success');
+      return;
+    }
+
     doc.file=files[0].name; doc.url=null; doc.done=true; doc.at=today();
     auditLog('Ανέβασμα αρχείου',`"${files[0].name}" – ${task.name}`);
     // Extra files → create new doc entries automatically
@@ -3286,8 +3373,21 @@ async function viewDocFile(did, fname) {
 async function removeDocUrl(did,tid) {
   if (!confirm('Αφαίρεση εγγράφου/συνδέσμου;')) return;
   const found=findDoc(did,tid); if(!found) return;
-  const {proj,doc,task}=found;
+  const {proj,ph,doc,task}=found;
   if (doc.file) await fileDelete(did).catch(()=>{});
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_document_clear',{
+        p_project_id:proj.id,p_phase_id:ph.id,p_task_id:task.id,p_document_id:did
+      },proj.id);
+      auditLog('Αφαίρεση εγγράφου',`"${doc.name}" από "${task.name}"`);
+      render(); requestAnimationFrame(()=>restoreExpanded());
+      showToast('Έγγραφο αφαιρέθηκε.','');
+    } catch(err) { showToast('Το έγγραφο δεν αφαιρέθηκε: '+(err.message||err),'error'); }
+    return;
+  }
+
   doc.done=false; doc.url=null; doc.file=null; doc.at=null; doc.manualCheck=false; doc.checkedBy=null;
   auditLog('Αφαίρεση εγγράφου',`"${doc.name}" από "${task.name}"`);
   await dbSaveProject(proj);
@@ -4763,7 +4863,20 @@ window.requestTaskReview = async function(pid, phid, tid) {
   const proj=getProject(pid); if(!proj) return;
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
   const task=ph.tasks.find(t=>t.id===tid); if(!task) return;
-  task.reviewStatus = 'pending';
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_request',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,
+        p_subtask_id:null,p_entity_type:'task'
+      },pid);
+      auditLog('Αίτημα Ελέγχου Εργασίας', `"${task.name}" – ${ph.name}`);
+      render(); showToast('Το αίτημα ελέγχου στάλθηκε στη Διοίκηση.','success');
+    } catch(err) { showToast('Αποτυχία αιτήματος ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
+  task.reviewStatus='pending';
   auditLog('Αίτημα Ελέγχου Εργασίας', `"${task.name}" – ${ph.name}`);
   await dbSaveProject(proj);
   render(); showToast('Το αίτημα ελέγχου στάλθηκε στη Διοίκηση.', 'success');
@@ -4772,7 +4885,20 @@ window.requestTaskReview = async function(pid, phid, tid) {
 window.requestPhaseReview = async function(pid, phid) {
   const proj=getProject(pid); if(!proj) return;
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
-  ph.reviewStatus = 'pending';
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_request',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:null,
+        p_subtask_id:null,p_entity_type:'phase'
+      },pid);
+      auditLog('Αίτημα Ελέγχου Φάσης', `"${ph.name}" – ${proj.name}`);
+      render(); showToast('Το αίτημα ελέγχου φάσης στάλθηκε στη Διοίκηση.','success');
+    } catch(err) { showToast('Αποτυχία αιτήματος ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
+  ph.reviewStatus='pending';
   auditLog('Αίτημα Ελέγχου Φάσης', `"${ph.name}" – ${proj.name}`);
   await dbSaveProject(proj);
   render(); showToast('Το αίτημα ελέγχου φάσης στάλθηκε στη Διοίκηση.', 'success');
@@ -4782,8 +4908,22 @@ window.resolveTaskReview = async function(pid, phid, tid, decision) {
   const proj=getProject(pid); if(!proj) return;
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
   const task=ph.tasks.find(t=>t.id===tid); if(!task) return;
-  task.reviewStatus = decision; // 'approved' | 'rejected'
-  const label = decision==='approved' ? 'Εγκρίθηκε' : 'Απορρίφθηκε';
+  const label=decision==='approved'?'Εγκρίθηκε':'Απορρίφθηκε';
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_resolve',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,
+        p_subtask_id:null,p_entity_type:'task',p_decision:decision
+      },pid);
+      auditLog(`Έλεγχος Εργασίας: ${label}`, `"${task.name}" – ${ph.name}`);
+      render(); updateHeaderUser();
+      showToast(`Εργασία "${task.name}": ${label}.`, decision==='approved'?'success':'');
+    } catch(err) { showToast('Αποτυχία ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
+  task.reviewStatus=decision;
   auditLog(`Έλεγχος Εργασίας: ${label}`, `"${task.name}" – ${ph.name}`);
   await dbSaveProject(proj);
   render(); updateHeaderUser();
@@ -4793,8 +4933,22 @@ window.resolveTaskReview = async function(pid, phid, tid, decision) {
 window.resolvePhaseReview = async function(pid, phid, decision) {
   const proj=getProject(pid); if(!proj) return;
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
-  ph.reviewStatus = decision;
-  const label = decision==='approved' ? 'Εγκρίθηκε' : 'Απορρίφθηκε';
+  const label=decision==='approved'?'Εγκρίθηκε':'Απορρίφθηκε';
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_resolve',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:null,
+        p_subtask_id:null,p_entity_type:'phase',p_decision:decision
+      },pid);
+      auditLog(`Έλεγχος Φάσης: ${label}`, `"${ph.name}" – ${proj.name}`);
+      render(); updateHeaderUser();
+      showToast(`Φάση "${ph.name}": ${label}.`, decision==='approved'?'success':'');
+    } catch(err) { showToast('Αποτυχία ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
+  ph.reviewStatus=decision;
   auditLog(`Έλεγχος Φάσης: ${label}`, `"${ph.name}" – ${proj.name}`);
   await dbSaveProject(proj);
   render(); updateHeaderUser();
@@ -4806,6 +4960,20 @@ window.requestSubtaskReview = async function(pid, phid, tid, stid) {
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
   const task=ph.tasks.find(t=>t.id===tid); if(!task) return;
   const st=(task.subtasks||[]).find(s=>s.id===stid); if(!st) return;
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_request',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,
+        p_subtask_id:stid,p_entity_type:'subtask'
+      },pid);
+      auditLog('Αίτημα Ελέγχου Υποεργασίας',`"${st.name}" – "${task.name}"`);
+      render(); requestAnimationFrame(()=>restoreExpanded());
+      showToast('Αίτημα ελέγχου στάλθηκε στη Διοίκηση.','success');
+    } catch(err) { showToast('Αποτυχία αιτήματος ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
   st.reviewStatus='pending';
   auditLog('Αίτημα Ελέγχου Υποεργασίας',`"${st.name}" – "${task.name}"`);
   await dbSaveProject(proj);
@@ -4818,8 +4986,22 @@ window.resolveSubtaskReview = async function(pid, phid, tid, stid, decision) {
   const ph=proj.phases.find(p=>p.id===phid); if(!ph) return;
   const task=ph.tasks.find(t=>t.id===tid); if(!task) return;
   const st=(task.subtasks||[]).find(s=>s.id===stid); if(!st) return;
-  st.reviewStatus=decision;
   const label=decision==='approved'?'Εγκρίθηκε':'Απορρίφθηκε';
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_review_resolve',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,
+        p_subtask_id:stid,p_entity_type:'subtask',p_decision:decision
+      },pid);
+      auditLog(`Έλεγχος Υποεργασίας: ${label}`,`"${st.name}" – "${task.name}"`);
+      render(); requestAnimationFrame(()=>restoreExpanded()); updateHeaderUser();
+      showToast(`Υποεργασία "${st.name}": ${label}.`, decision==='approved'?'success':'');
+    } catch(err) { showToast('Αποτυχία ελέγχου: '+(err.message||err),'error'); }
+    return;
+  }
+
+  st.reviewStatus=decision;
   auditLog(`Έλεγχος Υποεργασίας: ${label}`,`"${st.name}" – "${task.name}"`);
   await dbSaveProject(proj);
   render(); requestAnimationFrame(()=>restoreExpanded()); updateHeaderUser();
@@ -5492,6 +5674,30 @@ async function sendCommentNotifications(proj, ph, task, commentText) {
 async function addComment(pid, phid, tid) {
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); if(!task) return;
   const input=el('ci-'+tid); const text=(input?.value||'').trim(); if(!text) return;
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_comment_add',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,p_text:text
+      },pid);
+      state.expandedTasks[tid]=true;
+      if(!state.commentsOpen) state.commentsOpen={};
+      state.commentsOpen[tid]=true;
+      render();
+      showToast('Σχόλιο προστέθηκε.','success');
+
+      const freshProj=getProject(pid);
+      const freshPh=freshProj?.phases?.find(p=>p.id===phid);
+      const freshTask=freshPh?.tasks?.find(t=>t.id===tid);
+      if (freshProj && freshPh && freshTask) {
+        sendCommentNotifications(freshProj,freshPh,freshTask,text);
+      }
+    } catch(err) {
+      showToast('Το σχόλιο δεν αποθηκεύτηκε: '+(err.message||err),'error');
+    }
+    return;
+  }
+
   if(!task.comments) task.comments=[];
   task.comments.push({id:'c_'+uid(),userId:state.cu.id,text,at:nowTS()});
   await dbSaveProject(proj);
@@ -5500,11 +5706,25 @@ async function addComment(pid, phid, tid) {
   state.commentsOpen[tid]=true;
   render();
   showToast('Σχόλιο προστέθηκε.','success');
-  sendCommentNotifications(proj, ph, task, text); // fire-and-forget
+  sendCommentNotifications(proj, ph, task, text);
 }
 
 async function deleteComment(pid, phid, tid, cid) {
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); if(!task) return;
+
+  if (isSupabaseAuthMode()) {
+    try {
+      await secureProjectRpc('app_comment_delete',{
+        p_project_id:pid,p_phase_id:phid,p_task_id:tid,p_comment_id:cid
+      },pid);
+      state.expandedTasks[tid]=true;
+      render();
+    } catch(err) {
+      showToast('Το σχόλιο δεν διαγράφηκε: '+(err.message||err),'error');
+    }
+    return;
+  }
+
   task.comments=(task.comments||[]).filter(c=>c.id!==cid);
   await dbSaveProject(proj);
   state.expandedTasks[tid]=true;
@@ -5708,25 +5928,42 @@ window.closeGsearch=function(){const o=document.getElementById('gsearch-overlay'
 window.clientUploadDoc=async function(docId,taskId,projId,inputEl){
   const file=inputEl.files?.[0];
   if(!file) return;
+  if(file.size>50*1024*1024){showToast('Το αρχείο υπερβαίνει τα 50MB.','error');return;}
   const proj=getProject(projId);
   if(!proj) return;
-  let targetDoc=null;
-  outer:for(const ph of proj.phases||[]){for(const t of ph.tasks||[]){const d=(t.docs||[]).find(x=>x.id===docId);if(d){targetDoc=d;break outer;}}}
-  if(!targetDoc){showToast('Δεν βρέθηκε έγγραφο.','error');return;}
+
+  let targetDoc=null, targetPhase=null;
+  outer:for(const ph of proj.phases||[]){
+    for(const t of ph.tasks||[]){
+      const d=(t.docs||[]).find(x=>x.id===docId);
+      if(d){targetDoc=d;targetPhase=ph;break outer;}
+    }
+  }
+  if(!targetDoc||!targetPhase){showToast('Δεν βρέθηκε έγγραφο.','error');return;}
+
   showToast('Ανέβασμα αρχείου…','info');
   try{
     await fileSave(docId,file);
-    targetDoc.done=true;
-    targetDoc.file=file.name;
-    targetDoc.doneAt=nowTS();
-    targetDoc.clientUploaded=true;
-    await dbSaveProject(proj);
+
+    if (isSupabaseAuthMode()) {
+      await secureProjectRpc('app_document_complete',{
+        p_project_id:projId,p_phase_id:targetPhase.id,p_task_id:taskId,
+        p_document_id:docId,p_file_name:file.name,p_url:null,p_client_uploaded:true
+      },projId);
+    } else {
+      targetDoc.done=true;
+      targetDoc.file=file.name;
+      targetDoc.doneAt=nowTS();
+      targetDoc.clientUploaded=true;
+      await dbSaveProject(proj);
+    }
+
     if(!state.clientExpanded)state.clientExpanded={};
     state.clientExpanded[taskId]=true;
     render();
     showToast('Το αρχείο ανέβηκε επιτυχώς! ✓','success');
   }catch(e){
-    showToast('Σφάλμα: '+e.message,'error');
+    showToast('Σφάλμα: '+(e.message||e),'error');
   }
 };
 
