@@ -51,56 +51,135 @@ const DOC_TYPES = {
   third_party: 'Τρίτος',
 };
 
-// ── SUPABASE ──────────────────────────────────────────────────────
-const SUPA_URL = 'https://ppqkqoymjrgdfuuiekgr.supabase.co';
-const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwcWtxb3ltanJnZGZ1dWlla2dyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1MDg2NDMsImV4cCI6MjEwMDA4NDY0M30.VxblOy7w_SPtqAsjtQycx7-sYbiTLVDyOoB_WY7ciVg';
+// ── SUPABASE / TRANSITION AUTH ────────────────────────────────────
+// `sb` is initialized in index.html before this script loads.
+// During the transition, Admin + Management use Supabase Auth.
+// Other roles temporarily continue with the legacy username/password flow
+// until their Auth accounts are provisioned and the final cutover is complete.
+const TRANSITION_AUTH_ROLES = new Set(['admin','management']);
+let AUTH_MODE = 'legacy'; // 'legacy' | 'supabase'
+
+function emptyDbState() {
+  return {
+    users:[], categories:[], projects:[], auditLog:[],
+    templates:[], timesheets:[], clientCalendar:[],
+    crmCompanies:[], crmContacts:[], offers:[]
+  };
+}
+
+function isSupabaseAuthMode() { return AUTH_MODE === 'supabase'; }
 // sb is initialized in index.html before this script loads
 
 // ── DB OPERATIONS (Supabase) ──────────────────────────────────────
+async function loadCurrentAppUser() {
+  const {data, error} = await sb.rpc('app_me');
+  if (error) throw error;
+  return data || null;
+}
+
 async function loadFromDB() {
   try {
-    const [u, c, p, a, t, ts, cc, comp, cont, off] = await Promise.all([
-      sb.from('be_users').select('data'),
-      sb.from('be_categories').select('data'),
-      sb.from('be_projects').select('data'),
-      sb.from('be_audit_log').select('data').order('ts', {ascending:false}).limit(200),
-      sb.from('be_templates').select('data'),
-      sb.from('be_timesheets').select('data').order('id', {ascending:false}),
-      sb.from('be_client_calendar').select('data').order('id', {ascending:false}),
-      sb.from('companies').select('*').is('deleted_at', null).order('company_name').limit(10000),
-      sb.from('contacts').select('*').is('deleted_at', null).order('last_name').limit(10000),
-      sb.from('be_offers').select('data').order('id', {ascending:false}),
-    ]);
-    if (u.error) throw u.error;
-    if (c.error) throw c.error;
-    if (p.error) throw p.error;
+    if (isSupabaseAuthMode()) {
+      const [u, c, p, a, t, ts, cc, comp, cont, off] = await Promise.all([
+        sb.rpc('app_user_directory'),
+        sb.from('be_categories').select('data'),
+        sb.from('be_projects').select('data'),
+        sb.from('be_audit_log').select('data').order('ts', {ascending:false}).limit(200),
+        sb.from('be_templates').select('data'),
+        sb.from('be_timesheets').select('data').order('id', {ascending:false}),
+        sb.from('be_client_calendar').select('data').order('id', {ascending:false}),
+        sb.rpc('app_crm_companies_safe'),
+        sb.rpc('app_crm_contacts_safe'),
+        sb.from('be_offers').select('data').order('id', {ascending:false}),
+      ]);
 
-    state.db = {
-      users:           (u.data||[]).map(r=>r.data),
-      categories:      (c.data||[]).map(r=>r.data),
-      projects:        (p.data||[]).map(r=>r.data),
-      auditLog:        (a.data||[]).map(r=>r.data),
-      templates:       (t.data||[]).map(r=>r.data),
-      timesheets:      (ts.data||[]).map(r=>r.data),
-      clientCalendar:  (cc.data||[]).map(r=>r.data),
-      crmCompanies:    comp.data||[],
-      crmContacts:     cont.data||[],
-      offers:          (off.data||[]).map(r=>r.data),
-    };
+      for (const [label,res] of Object.entries({
+        users:u,categories:c,projects:p,audit:a,templates:t,
+        timesheets:ts,clientCalendar:cc,companies:comp,contacts:cont,offers:off
+      })) {
+        if (res?.error) throw new Error(`${label}: ${res.error.message||res.error}`);
+      }
 
-    if (!state.db.users.length) await seedAndPush();
-    // Sync current user's notifications from DB (they may have been updated by others)
+      state.db = {
+        users:           (u.data||[]).map(r=>r.data ?? r),
+        categories:      (c.data||[]).map(r=>r.data),
+        projects:        (p.data||[]).map(r=>r.data),
+        auditLog:        (a.data||[]).map(r=>r.data),
+        templates:       (t.data||[]).map(r=>r.data),
+        timesheets:      (ts.data||[]).map(r=>r.data),
+        clientCalendar:  (cc.data||[]).map(r=>r.data),
+        crmCompanies:    (comp.data||[]).map(r=>r.data ?? r),
+        crmContacts:     (cont.data||[]).map(r=>r.data ?? r),
+        offers:          (off.data||[]).map(r=>r.data),
+      };
+    } else {
+      // Temporary legacy loader for users not yet migrated to Supabase Auth.
+      const [u, c, p, a, t, ts, cc, comp, cont, off] = await Promise.all([
+        sb.from('be_users').select('data'),
+        sb.from('be_categories').select('data'),
+        sb.from('be_projects').select('data'),
+        sb.from('be_audit_log').select('data').order('ts', {ascending:false}).limit(200),
+        sb.from('be_templates').select('data'),
+        sb.from('be_timesheets').select('data').order('id', {ascending:false}),
+        sb.from('be_client_calendar').select('data').order('id', {ascending:false}),
+        sb.from('companies').select('*').is('deleted_at', null).order('company_name').limit(10000),
+        sb.from('contacts').select('*').is('deleted_at', null).order('last_name').limit(10000),
+        sb.from('be_offers').select('data').order('id', {ascending:false}),
+      ]);
+
+      for (const [label,res] of Object.entries({
+        users:u,categories:c,projects:p,audit:a,templates:t,
+        timesheets:ts,clientCalendar:cc,companies:comp,contacts:cont,offers:off
+      })) {
+        if (res?.error) throw new Error(`${label}: ${res.error.message||res.error}`);
+      }
+
+      state.db = {
+        users:           (u.data||[]).map(r=>r.data),
+        categories:      (c.data||[]).map(r=>r.data),
+        projects:        (p.data||[]).map(r=>r.data),
+        auditLog:        (a.data||[]).map(r=>r.data),
+        templates:       (t.data||[]).map(r=>r.data),
+        timesheets:      (ts.data||[]).map(r=>r.data),
+        clientCalendar:  (cc.data||[]).map(r=>r.data),
+        crmCompanies:    comp.data||[],
+        crmContacts:     cont.data||[],
+        offers:          (off.data||[]).map(r=>r.data),
+      };
+
+      // SECURITY: never auto-seed demo credentials in production.
+      // Empty user tables must be handled explicitly by an administrator.
+    }
+
     if (state.cu) {
       const fresh = state.db.users.find(u=>u.id===state.cu.id);
-      if (fresh) { state.cu.notifications = fresh.notifications||[]; }
+      if (fresh) state.cu.notifications = fresh.notifications||[];
     }
   } catch(err) {
     console.error('DB load error:', err);
-    showToast('Σφάλμα σύνδεσης με τη βάση δεδομένων: ' + (err.message||err), 'error');
+    showToast(
+      (isSupabaseAuthMode() ? 'Σφάλμα ασφαλούς φόρτωσης δεδομένων: ' : 'Σφάλμα σύνδεσης με τη βάση δεδομένων: ')
+      + (err.message||err),
+      'error'
+    );
+    throw err;
   }
 }
 
 async function dbSaveUser(user) {
+  if (isSupabaseAuthMode()) {
+    const safeUser={...user};
+    delete safeUser.password;
+    const {data,error}=await sb.rpc('app_admin_update_user',{
+      p_app_user_id:user.id,
+      p_data:safeUser
+    });
+    if (error) {
+      showToast('Σφάλμα ασφαλούς ενημέρωσης χρήστη.','error');
+      throw error;
+    }
+    return data;
+  }
   const {error} = await sb.from('be_users').upsert({id:user.id, data:user});
   if (error) { showToast('Σφάλμα αποθήκευσης χρήστη.','error'); throw error; }
 }
@@ -132,7 +211,11 @@ async function dbDeleteProject(pid) {
   await sb.from('be_projects').delete().eq('id', pid);
 }
 async function dbDeleteUser(uid) {
-  await sb.from('be_users').delete().eq('id', uid);
+  if (isSupabaseAuthMode()) {
+    throw new Error('Η διαγραφή χρήστη είναι προσωρινά απενεργοποιημένη κατά τη μετάβαση Auth, ώστε να μη δημιουργηθεί ορφανός Auth λογαριασμός.');
+  }
+  const {error}=await sb.from('be_users').delete().eq('id', uid);
+  if(error) throw error;
 }
 async function dbDeleteCategory(cid) {
   await sb.from('be_categories').delete().eq('id', cid);
@@ -211,16 +294,31 @@ async function dbDeleteOffer(id) {
 }
 
 async function dbClearAudit() {
-  await sb.from('be_audit_log').delete().neq('id','__none__');
+  if (isSupabaseAuthMode()) {
+    throw new Error('Το audit trail δεν εκκαθαρίζεται από το Auth-enabled περιβάλλον.');
+  }
+  const {error}=await sb.from('be_audit_log').delete().neq('id','__none__');
+  if(error) throw error;
 }
 
 // Fire-and-forget audit (never blocks UI)
 function auditLog(action, details='') {
   if (!state.cu || !sb) return;
   const entry = { id:uid(), userId:state.cu.id, userName:state.cu.name, role:state.cu.role, timestamp:nowTS(), action, details };
+  state.db.auditLog = state.db.auditLog || [];
   state.db.auditLog.unshift(entry);
   if (state.db.auditLog.length > 500) state.db.auditLog = state.db.auditLog.slice(0,500);
-  try { Promise.resolve(sb.from('be_audit_log').upsert({id:entry.id, data:entry, ts:entry.timestamp})).then(()=>{},e=>console.error('auditLog:',e)); } catch(e){ console.error('auditLog:', e); }
+  try {
+    if (isSupabaseAuthMode()) {
+      Promise.resolve(
+        sb.rpc('app_write_audit',{p_action:action,p_details:details})
+      ).then(({error})=>{if(error)console.error('auditLog RPC:',error);},e=>console.error('auditLog RPC:',e));
+    } else {
+      Promise.resolve(
+        sb.from('be_audit_log').upsert({id:entry.id, data:entry, ts:entry.timestamp})
+      ).then(()=>{},e=>console.error('auditLog:',e));
+    }
+  } catch(e){ console.error('auditLog:', e); }
 }
 
 // ── FILE STORAGE (Supabase Storage) ───────────────────────────────
@@ -566,9 +664,16 @@ async function pushContactToGoogle(contact) {
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
-function getCurrentUser() { try { return JSON.parse(sessionStorage.getItem('be_pm_user')); } catch { return null; } }
-function setCurrentUser(u) { sessionStorage.setItem('be_pm_user', JSON.stringify(u)); }
-function clearCurrentUser() { sessionStorage.removeItem('be_pm_user'); }
+function getCurrentUser() {
+  if (isSupabaseAuthMode()) return state?.cu || null;
+  try { return JSON.parse(sessionStorage.getItem('be_pm_user')); } catch { return null; }
+}
+function setCurrentUser(u) {
+  if (!isSupabaseAuthMode()) sessionStorage.setItem('be_pm_user', JSON.stringify(u));
+}
+function clearCurrentUser() {
+  sessionStorage.removeItem('be_pm_user');
+}
 
 function isAdmin()  { return ['admin','management'].includes(state.cu?.role); }
 function isPM()     { return state.cu?.role === 'project_manager'; }
@@ -685,6 +790,35 @@ async function loadStorageStats() {
 function getUser(id)     { return state.db.users.find(u=>u.id===id); }
 function getCategory(id) { return state.db.categories.find(c=>c.id===id); }
 function getProject(id)  { return state.db.projects.find(p=>p.id===id); }
+// ── PHASE DATE HELPERS ────────────────────────────────────────────
+// Planned dates: auto από min plannedStart / max plannedEnd των tasks
+function phasePlannedDates(ph) {
+  const starts = (ph.tasks||[]).map(t=>t.plannedStart).filter(Boolean).sort();
+  const ends   = (ph.tasks||[]).map(t=>t.plannedEnd).filter(Boolean).sort();
+  return {
+    start: starts.length ? starts[0] : null,
+    end:   ends.length   ? ends[ends.length-1] : null
+  };
+}
+// Actual dates: auto από min startDate / max completedDate των tasks
+function phaseActualDates(ph) {
+  const starts = (ph.tasks||[]).map(t=>t.startDate).filter(Boolean).sort();
+  const ends   = (ph.tasks||[]).map(t=>t.completedDate).filter(Boolean).sort();
+  return {
+    start: starts.length ? starts[0] : null,
+    end:   ends.length   ? ends[ends.length-1] : null
+  };
+}
+// Project planned dates: auto από min/max των φάσεων
+function projectPlannedDates(proj) {
+  const starts = (proj.phases||[]).map(ph=>phasePlannedDates(ph).start).filter(Boolean).sort();
+  const ends   = (proj.phases||[]).map(ph=>phasePlannedDates(ph).end).filter(Boolean).sort();
+  return {
+    start: starts.length ? starts[0] : null,
+    end:   ends.length   ? ends[ends.length-1] : null
+  };
+}
+
 function getStandingProjects() {
   return (state.db.projects||[]).filter(p=>p.standing===true)
     .sort((a,b)=>(a.name||'').localeCompare(b.name||'','el'));
@@ -1123,7 +1257,12 @@ function updateHeaderUser() {
     if (state.cu.notifications && state.cu.notifications.some(n=>!n.read)) {
       state.cu.notifications.forEach(n=>n.read=true);
       const cuInDb = state.db.users.find(u=>u.id===state.cu.id);
-      if (cuInDb) { cuInDb.notifications=state.cu.notifications; dbSaveUser(cuInDb).catch(()=>{}); }
+      if (cuInDb) cuInDb.notifications=state.cu.notifications;
+      if (isSupabaseAuthMode()) {
+        sb.rpc('app_mark_notifications_read').then(({error})=>{if(error)console.warn('mark notifications:',error);});
+      } else if (cuInDb) {
+        dbSaveUser(cuInDb).catch(()=>{});
+      }
     }
     // Close on outside click
     const close=()=>{ state.notifOpen=false; document.removeEventListener('click',close,true); updateHeaderUser(); };
@@ -1139,11 +1278,19 @@ function renderLogin() {
       <div class="login-logo"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'"></div>
       <h2 class="login-title">Project Management</h2>
       <p class="login-sub">Συνδεθείτε για να συνεχίσετε</p>
-      <div class="form-group"><label class="form-label">Όνομα χρήστη</label><input class="form-control" id="login-user" placeholder="username" autocomplete="username"></div>
-      <div class="form-group"><label class="form-label">Κωδικός πρόσβασης</label><input class="form-control" type="password" id="login-pass" placeholder="••••••••" autocomplete="current-password"></div>
+      <div class="form-group">
+        <label class="form-label">Email ή Όνομα χρήστη</label>
+        <input class="form-control" id="login-user" placeholder="email ή username" autocomplete="username">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Κωδικός πρόσβασης</label>
+        <input class="form-control" type="password" id="login-pass" placeholder="••••••••" autocomplete="current-password">
+      </div>
       <div id="login-err" class="login-err" style="display:none"></div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-login">Σύνδεση</button>
-      <div class="login-hint">Demo: admin/admin · pm1/pm1 · tm1/tm1 · papado/papado</div>
+      <div class="login-hint">
+        Μεταβατική έκδοση: Διαχειριστής/Διοίκηση → Supabase Auth · λοιποί χρήστες → προσωρινά παλιό login
+      </div>
     </div>
   </div>`;
 }
@@ -1252,8 +1399,9 @@ function _dashProjTable(projs) {
       const cat  = getCategory(p.categoryId);
       const ph   = nextActivePhase(p);
       const phName  = ph ? esc(ph.name) : '<span style="color:var(--green);font-weight:600">✓ Ολοκληρ.</span>';
-      const phStart = ph?.startDate ? fmt(ph.startDate) : '—';
-      const phEnd   = ph?.endDate   ? fmt(ph.endDate)   : '—';
+      const phDates2 = ph ? phasePlannedDates(ph) : null;
+      const phStart = phDates2?.start ? fmt(phDates2.start) : '—';
+      const phEnd   = phDates2?.end   ? fmt(phDates2.end)   : '—';
       const inactive = !userHasActionInProject(p, state.cu?.id);
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
         <div class="case-row-title">${esc(p.name)}</div>
@@ -1349,7 +1497,7 @@ function renderCategories() {
   <div class="projects-grid" id="cat-grid">
     ${cats.map(cat=>{const projs=visibleProjects().filter(p=>p.categoryId===cat.id);const active=projs.filter(p=>p.status==='in_progress').length;const done=projs.filter(p=>p.status==='completed').length;const mgrIds=[...new Set([...(cat.managerIds||[]),...state.db.users.filter(u=>u.categoryRoles&&u.categoryRoles[cat.id]==='project_manager').map(u=>u.id)])];const mgrs=mgrIds.map(id=>getUser(id)?.name).filter(Boolean).join(', ');const init=cat.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();const canDelCat=(ROLE_INFO[state.cu?.role]?.level||0)>=2;
 const dragAttrs=canDrag?`draggable="true" ondragstart="catDragStart(event,'${cat.id}')" ondragover="catDragOver(event)" ondragleave="catDragLeave(event)" ondrop="catDrop(event,'${cat.id}')" ondragend="catDragEnd()"`:''
-return`<div class="project-card cat-card${canDrag?' cat-draggable':''}" data-action="open-category" data-cid="${cat.id}" ${dragAttrs}><div class="project-card-accent" style="background:${cat.color}"></div>${canDrag?`<div class="cat-drag-handle" title="Σύρε για αναδιάταξη">⠿</div>`:''}<div class="project-card-body"><div class="project-monogram" style="background:${cat.bgLight};color:${cat.color}">${init}</div><div class="project-card-name">${esc(cat.name)}</div>${cat.desc?`<div class="project-card-desc">${esc(cat.desc)}</div>`:''}</div><div class="project-card-stats"><div class="pstat"><div class="pstat-num">${projs.length}</div><div class="pstat-label">Έργα</div></div><div class="pstat"><div class="pstat-num" style="color:var(--orange)">${active}</div><div class="pstat-label">Ενεργά</div></div><div class="pstat"><div class="pstat-num" style="color:var(--green)">${done}</div><div class="pstat-label">Ολοκλ.</div></div></div><div class="project-card-footer" style="justify-content:space-between"><span class="text-sm text-muted">${(cat.template?.phases||[]).length} φάσεις στο πρότυπο</span>${canDelCat?`<button class="btn btn-danger btn-sm" data-action="delete-category" data-cid="${cat.id}">Διαγραφή</button>`:'<span class="text-sm text-muted">Προβολή →</span>'}</div></div>`;}).join('')}
+return`<div class="project-card cat-card${canDrag?' cat-draggable':''}" data-action="open-category" data-cid="${cat.id}" ${dragAttrs}><div class="project-card-accent" style="background:${cat.color}"></div>${canDrag?`<div class="cat-drag-handle" title="Σύρε για αναδιάταξη">⠿</div>`:''}<div class="project-card-body"><div class="project-monogram" style="background:${cat.bgLight};color:${cat.color}">${init}</div><div class="project-card-name">${esc(cat.name)}</div></div><div class="project-card-stats"><div class="pstat"><div class="pstat-num">${projs.length}</div><div class="pstat-label">Έργα</div></div><div class="pstat"><div class="pstat-num" style="color:var(--orange)">${active}</div><div class="pstat-label">Ενεργά</div></div><div class="pstat"><div class="pstat-num" style="color:var(--green)">${done}</div><div class="pstat-label">Ολοκλ.</div></div></div><div class="project-card-footer" style="justify-content:space-between"><span class="text-sm text-muted">${(cat.template?.phases||[]).length} φάσεις στο πρότυπο</span>${canDelCat?`<button class="btn btn-danger btn-sm" data-action="delete-category" data-cid="${cat.id}">Διαγραφή</button>`:'<span class="text-sm text-muted">Προβολή →</span>'}</div></div>`;}).join('')}
     ${state.cu&&state.cu.role!=='client'?`<div class="card-add" data-action="modal-add-category"><div class="card-add-icon">+</div><p>Νέα Κατηγορία</p></div>`:''}
   </div>`;
 }
@@ -1420,8 +1568,9 @@ function renderProjects() {
       const mgrNames = projManagerNames(p);
       const ph = nextActivePhase(p);
       const phName  = ph ? esc(ph.name) : '<span style="color:var(--green);font-weight:600">✓ Ολοκληρ.</span>';
-      const phStart = ph?.startDate ? fmt(ph.startDate) : '—';
-      const phEnd   = ph?.endDate   ? fmt(ph.endDate)   : '—';
+      const phDates = ph ? phasePlannedDates(ph) : null;
+      const phStart = phDates?.start ? fmt(phDates.start) : '—';
+      const phEnd   = phDates?.end   ? fmt(phDates.end)   : '—';
       const inactive = !userHasActionInProject(p, state.cu?.id);
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" data-proj-id="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
         <div class="case-row-title">${esc(p.name)}</div>
@@ -1456,8 +1605,8 @@ function renderProjectProgressChart(proj, prog) {
 
   // ── Timeline (mini-Gantt) ─────────────────────────────────────
   const allDates = phases.flatMap(ph => [
-    ph.startDate, ph.endDate,
-    ...(ph.tasks||[]).flatMap(t => [t.startDate, t.plannedStart, t.plannedEnd])
+    ...(()=>{const _pd=phasePlannedDates(ph);return[_pd.start,_pd.end];})(),
+    ...(ph.tasks||[]).flatMap(t => [t.plannedStart, t.plannedEnd])
     // completedDate εξαιρείται — δεν πρέπει να επηρεάζει το εύρος του timeline
   ]).filter(Boolean).sort();
 
@@ -1488,8 +1637,9 @@ function renderProjectProgressChart(proj, prog) {
 
       phBars = phases.map((ph, i) => {
         // Χρησιμοποιούμε ΜΟΝΟ τις ημερομηνίες φάσης (όχι completedDate) για τα όρια μπάρας
-        const phStarts = [ph.startDate, ...(ph.tasks||[]).map(t=>t.startDate||t.plannedStart)].filter(Boolean).sort();
-        const phEnds   = [ph.endDate,   ...(ph.tasks||[]).map(t=>t.plannedEnd)].filter(Boolean).sort();
+        const _phPDM = phasePlannedDates(ph);
+        const phStarts = [_phPDM.start, ...(ph.tasks||[]).map(t=>t.plannedStart)].filter(Boolean).sort();
+        const phEnds   = [_phPDM.end,   ...(ph.tasks||[]).map(t=>t.plannedEnd)].filter(Boolean).sort();
         const active   = (ph.tasks||[]).filter(t=>t.status!=='cancelled');
         const pct      = active.length===0 ? 0 : Math.round(active.filter(t=>t.status==='completed').length/active.length*100);
         const isDone   = pct === 100;
@@ -1500,8 +1650,8 @@ function renderProjectProgressChart(proj, prog) {
           barHtml = `<div class="ppc-tl-bar ppc-tl-nodate-bar" style="left:0%;width:100%;opacity:.25"></div>`;
         } else {
           // Αν υπάρχει endDate φάσης, αυτό κερδίζει — δεν αφήνουμε task dates να το παρακάμψουν
-          const ps    = ph.startDate || phStarts[0];
-          const pe    = ph.endDate   || (phEnds.length ? phEnds[phEnds.length-1] : ps);
+          const ps    = _phPDM.start || phStarts[0];
+          const pe    = _phPDM.end   || (phEnds.length ? phEnds[phEnds.length-1] : ps);
           const left  = toLeft(ps);
           const right = toLeft(pe);
           const w     = Math.max(2, right - left);
@@ -1582,10 +1732,13 @@ function renderProject() {
       const docGroups={}; (t.docs||[]).forEach(d=>{if(!docGroups[d.cat])docGroups[d.cat]=[];docGroups[d.cat].push(d);});
       const docsHtml=Object.keys(docGroups).length===0?'<p class="text-sm text-muted mt-8">Δεν υπάρχουν έγγραφα.</p>'
         :`<div class="docs-grid mt-8">${Object.entries(docGroups).map(([cat2,docs])=>`<div class="doc-category-label">${esc(cat2)}</div>${docs.map(d=>{
+          const _folderHref = d.folderPath
+            ? (()=>{ const p=d.folderPath.replace(/^"|"$/g,'').trim().replace(/\\/g,'/'); return 'file:///'+p.split('/').map((s,i)=>i===0?s:encodeURIComponent(s)).join('/'); })()
+            : (d.url ? _docFolderHref(_docHref(d.url)) : null);
           const docOpenBtn = d.done
-            ? (d.url
-                ? `<a class="btn btn-secondary btn-sm" href="${esc(_docFolderHref(_docHref(d.url)))}" target="_blank" rel="noopener">📁 Φάκελος</a>`
-                : `<button class="btn btn-secondary btn-sm" data-action="view-doc-file" data-did="${d.id}" data-fname="${esc(d.file||'')}">📄 Προβολή</button>`)
+            ? (_folderHref
+                ? `<a class="btn btn-secondary btn-sm" href="${esc(_folderHref)}" target="_blank" rel="noopener">📁 Φάκελος</a>`
+                : (d.file ? `<button class="btn btn-secondary btn-sm" data-action="view-doc-file" data-did="${d.id}" data-fname="${esc(d.file||'')}">📄 Προβολή</button>` : ''))
             : '';
           const canRemove = d.done&&unlocked&&!isComp&&(canMod||(d.manualCheck&&!d.file&&!d.url&&state.cu));
           const docRemoveBtn = canRemove
@@ -1597,6 +1750,9 @@ function renderProject() {
           const docRenameBtn = canMod&&unlocked&&!isComp
             ? `<button class="btn btn-ghost btn-icon btn-sm" data-action="doc-rename" data-did="${d.id}" data-tid="${t.id}" title="Μετονομασία εγγράφου">✏️</button>`
             : '';
+          const docFolderEditBtn = d.done&&unlocked&&!isComp&&canMod
+            ? `<button class="btn btn-ghost btn-icon btn-sm" onclick="showFolderPathModal('${d.id}','${t.id}')" title="${d.folderPath?'Επεξεργασία φακέλου: '+esc(d.folderPath):'Ορισμός τοπικής διαδρομής φακέλου'}">🗂️</button>`
+            : '';
           const docAddBtn = !d.done&&unlocked&&!isComp&&state.cu
             ? `<button class="btn btn-secondary btn-sm" data-action="add-doc-url" data-did="${d.id}" data-tid="${t.id}">+ Προσθήκη</button>`
             : '';
@@ -1606,7 +1762,7 @@ function renderProject() {
           const clientBadge = d.clientUploaded ? `<span class="doc-client-badge">👤 Από πελάτη</span>` : '';
           const manualBadge = d.done&&d.manualCheck&&!d.file&&!d.url ? `<div class="doc-filename">✓ Ολοκληρώθηκε χειροκίνητα${d.checkedBy?` · ${esc(d.checkedBy)}`:''}</div>` : '';
           const fileLabel = d.done&&d.file ? `<div class="doc-filename">📄 ${esc(d.file)}${clientBadge}</div>` : manualBadge;
-          return `<div class="doc-row ${d.done?'dr-done':''}" id="doc-${d.id}"><div class="doc-status ${d.done?'ds-done':''}">${d.done?'✓':''}</div><div class="doc-info"><div class="doc-name">${esc(d.name)} ${d.required?'<span style="color:var(--red);font-size:.65rem">✱</span>':''}</div>${fileLabel}${d.type?`<span class="doc-type-badge doc-type-${d.type}">${DOC_TYPES[d.type]||d.type}</span>`:''}</div><div class="doc-acts">${d.done&&d.at?`<span class="doc-date">${fmt(d.at)}</span>`:''} ${docOpenBtn}${docRemoveBtn}${docAddBtn}${docManualCheckBtn}${docRenameBtn}${docDeleteBtn}</div></div>`;
+          return `<div class="doc-row ${d.done?'dr-done':''}" id="doc-${d.id}"><div class="doc-status ${d.done?'ds-done':''}">${d.done?'✓':''}</div><div class="doc-info"><div class="doc-name">${esc(d.name)} ${d.required?'<span style="color:var(--red);font-size:.65rem">✱</span>':''}</div>${fileLabel}${d.type?`<span class="doc-type-badge doc-type-${d.type}">${DOC_TYPES[d.type]||d.type}</span>`:''}</div><div class="doc-acts">${d.done&&d.at?`<span class="doc-date">${fmt(d.at)}</span>`:''} ${docOpenBtn}${docRemoveBtn}${docAddBtn}${docManualCheckBtn}${docFolderEditBtn}${docRenameBtn}${docDeleteBtn}</div></div>`;
         }).join('')}`).join('')}</div>`;
       const canMoveTsk = state.cu && state.cu.role !== 'client' && !isComp;
       const canMoveToPhase = canMoveTsk && (proj.phases||[]).length > 1;
@@ -1620,7 +1776,7 @@ function renderProject() {
           ${canMoveTsk?'<div class="tpl-drag-handle" title="Σύρετε για αναδιάταξη">⠿</div>':''}
           <div class="task-status-dot" style="background:${stInfo.color}"></div>
           <div class="task-info">
-            <div class="task-name">${esc(t.name)}${t.parallel?' <span class="badge badge-gray" style="font-size:.58rem;padding:1px 6px">Παράλληλη</span>':''}</div>
+            <div class="task-name">${esc(t.name)}${t.parallel?' <span class="badge badge-gray" style="font-size:.58rem;padding:1px 6px">Παράλληλη</span>':''}${t.mgmtCheck?' <span class="badge" style="font-size:.58rem;padding:1px 7px;background:#7c3aed;color:#fff">⚑ ΕΛΕΓΧΟΣ ΔΙΟΙΚΗΣΗΣ</span>':''}</div>
             <div class="task-meta">${assignee?`<span>Υπεύθυνος: ${esc(assignee.name)}</span>`:''}${taskMembers.length?`<span>Μέλη: ${taskMembers.map(m=>esc(m.name)).join(', ')}</span>`:''}${t.plannedStart?`<span class="date-planned">📅 Προγρ: ${fmt(t.plannedStart)}${t.plannedEnd?' – '+fmt(t.plannedEnd):''}</span>`:''}${t.startDate?`<span>Έναρξη: ${fmt(t.startDate)}</span>`:''}${t.completedDate?`<span>Ολοκλήρωση: ${fmt(t.completedDate)}</span>`:''}${depNames.length?`<span class="dep-badge">⊞ Εξαρτάται από: ${esc(depNames.join(', '))}</span>`:''}</div>
           </div>
           <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end">
@@ -1727,6 +1883,7 @@ function renderUsers() {
       <div class="user-row-role"><span class="role-badge ${ri.cls}">${ri.label}</span></div>
       <div class="user-row-username text-sm text-muted">${esc(u.username)}</div>
       <div class="user-row-email text-sm text-muted">${esc(u.email||'—')}</div>
+      <div class="user-row-lastlogin text-sm text-muted">${fmtDT(u.lastLogin||null)}</div>
       <div class="user-row-actions">
         ${hasProjRole?`<button class="btn btn-ghost btn-sm" data-action="modal-user-priority" data-uid="${u.id}" title="Σειρά προτεραιότητας">⇅</button>`:''}
         <button class="btn btn-ghost btn-sm" data-action="modal-edit-user" data-uid="${u.id}">Επεξ.</button>
@@ -1751,6 +1908,7 @@ function renderUsers() {
       <div>Ρόλος</div>
       <div>Username</div>
       <div>Email</div>
+      <div>Τελευταία Είσοδος</div>
       <div></div>
     </div>
     ${rows}
@@ -1951,14 +2109,15 @@ function _renderCalMonth() {
   const phColorMap = {}; // ph.id -> color
   visibleProjects().forEach(proj => {
     (proj.phases||[]).forEach(ph => {
-      if (!ph.startDate || !ph.endDate) return;
+      const _phPD = phasePlannedDates(ph);
+      if (!_phPD.start || !_phPD.end) return;
       if (!phColorMap[ph.id]) { phColorMap[ph.id] = PHASE_COLORS[phColorIdx++ % PHASE_COLORS.length]; }
       const color = phColorMap[ph.id];
-      _datesBetween(ph.startDate, ph.endDate).forEach(ds => {
+      _datesBetween(_phPD.start, _phPD.end).forEach(ds => {
         if (!ds.startsWith(monthPrefix)) return;
         const day = parseInt(ds.slice(8), 10);
         if (!phasesByDay[day]) phasesByDay[day] = [];
-        phasesByDay[day].push({ph, proj, color, isFirst: ds===ph.startDate, isLast: ds===ph.endDate});
+        phasesByDay[day].push({ph, proj, color, isFirst: ds===_phPD.start, isLast: ds===_phPD.end});
       });
     });
   });
@@ -2048,8 +2207,9 @@ function _renderCalWeek() {
   const wPhColorMap = {};
   visibleProjects().forEach(proj => {
     (proj.phases||[]).forEach(ph => {
-      if (!ph.startDate || !ph.endDate) return;
-      const activeDays = new Set(_datesBetween(ph.startDate, ph.endDate).filter(ds=>weekDatesSet.has(ds)));
+      const _phPDW = phasePlannedDates(ph);
+      if (!_phPDW.start || !_phPDW.end) return;
+      const activeDays = new Set(_datesBetween(_phPDW.start, _phPDW.end).filter(ds=>weekDatesSet.has(ds)));
       if (!activeDays.size) return;
       if (!wPhColorMap[ph.id]) wPhColorMap[ph.id] = PHASE_COLORS[wPhColorIdx++ % PHASE_COLORS.length];
       weekPhases.push({ph, proj, color: wPhColorMap[ph.id], activeDays});
@@ -2083,7 +2243,7 @@ function _renderCalWeek() {
   const phaseLegend = weekPhases.length ? `<div class="cal-week-phases">
     ${weekPhases.map(({ph,proj,color})=>`<div class="cwp-badge" style="background:${color}18;border-left:3px solid ${color};color:${color}" data-action="open-project" data-pid="${proj.id}" title="${esc(proj.name)}">
       <strong>${esc(ph.name)}</strong> <span style="opacity:.7;font-size:.65rem">${esc(proj.name)}</span>
-      <span style="opacity:.6;font-size:.63rem"> · ${ph.startDate} → ${ph.endDate}</span>
+      <span style="opacity:.6;font-size:.63rem"> · ${(()=>{const _d=phasePlannedDates(ph);return (_d.start||'—')+' → '+(_d.end||'—');})()}</span>
     </div>`).join('')}
   </div>` : '';
 
@@ -2148,8 +2308,9 @@ function _renderCalDay() {
   const dpColorMap = {};
   visibleProjects().forEach(proj => {
     (proj.phases||[]).forEach(ph => {
-      if (!ph.startDate || !ph.endDate) return;
-      if (dateStr < ph.startDate || dateStr > ph.endDate) return;
+      const _phPDD = phasePlannedDates(ph);
+      if (!_phPDD.start || !_phPDD.end) return;
+      if (dateStr < _phPDD.start || dateStr > _phPDD.end) return;
       if (!dpColorMap[ph.id]) dpColorMap[ph.id] = PHASE_COLORS[dpColorIdx++ % PHASE_COLORS.length];
       dayPhases.push({ph, proj, color: dpColorMap[ph.id]});
     });
@@ -2181,7 +2342,7 @@ function _renderCalDay() {
     ${dayPhases.map(({ph,proj,color})=>`<div class="cdd-phase-banner" style="background:${color}15;border-left:4px solid ${color}" data-action="open-project" data-pid="${proj.id}">
       <span style="font-weight:700;color:${color}">${esc(ph.name)}</span>
       <span style="font-size:.72rem;color:var(--muted);margin-left:8px">📁 ${esc(proj.name)}</span>
-      <span style="font-size:.68rem;color:var(--muted);margin-left:8px">📅 ${ph.startDate} → ${ph.endDate}</span>
+      <span style="font-size:.68rem;color:var(--muted);margin-left:8px">📅 ${(()=>{const _d=phasePlannedDates(ph);return (_d.start||'—')+' → '+(_d.end||'—');})()}</span>
     </div>`).join('')}
   </div>` : '';
 
@@ -2400,17 +2561,70 @@ document.addEventListener('click',e=>{
 });
 
 // ── AUTH ACTIONS ──────────────────────────────────────────────────
-function doLogin() {
+async function doLogin() {
   try {
-    const username=(el('login-user')?.value||'').trim().toLowerCase();
-    const password=(el('login-pass')?.value||'').trim();
-    const user=state.db.users.find(u=>u.username.toLowerCase()===username);
-    if (!user) {
-      const err=el('login-err');
-      if(err){err.textContent='Λάθος username ή password.';err.style.display='block';}
+    const identifier=(el('login-user')?.value||'').trim().toLowerCase();
+    const password=(el('login-pass')?.value||'');
+    const errEl=el('login-err');
+    if(errEl) errEl.style.display='none';
+
+    if (!identifier || !password) {
+      if(errEl){errEl.textContent='Συμπληρώστε email/username και κωδικό.';errEl.style.display='block';}
       return;
     }
-    // Support both hashed ($2b$...) and plain text passwords (migration)
+
+    // At the login screen state.db is loaded through the legacy/anon path,
+    // allowing us to route only already-mapped high-privilege roles to Auth.
+    const user=state.db.users.find(u =>
+      (u.username||'').toLowerCase()===identifier ||
+      (u.email||'').toLowerCase()===identifier
+    );
+
+    if (!user) {
+      if(errEl){errEl.textContent='Λάθος στοιχεία σύνδεσης.';errEl.style.display='block';}
+      return;
+    }
+
+    if (TRANSITION_AUTH_ROLES.has(user.role)) {
+      if (!user.email) {
+        if(errEl){errEl.textContent='Ο λογαριασμός δεν έχει email Auth.';errEl.style.display='block';}
+        return;
+      }
+
+      const {error:loginError}=await sb.auth.signInWithPassword({
+        email:user.email,
+        password
+      });
+      if (loginError) {
+        if(errEl){errEl.textContent='Αποτυχία Supabase Auth. Ελέγξτε τον νέο κωδικό.';errEl.style.display='block';}
+        return;
+      }
+
+      AUTH_MODE='supabase';
+      sessionStorage.removeItem('be_pm_user');
+
+      const profile=await loadCurrentAppUser();
+      if (!profile || profile.id!==user.id || !TRANSITION_AUTH_ROLES.has(profile.role)) {
+        await sb.auth.signOut({scope:'local'}).catch(()=>{});
+        AUTH_MODE='legacy';
+        throw new Error('Ο Auth λογαριασμός δεν αντιστοιχεί στο αναμενόμενο ενεργό προφίλ.');
+      }
+
+      await loadFromDB();
+      state.cu=profile;
+      const idx=state.db.users.findIndex(u=>u.id===profile.id);
+      if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
+      state.view=profile.role==='client'?'client':'dashboard';
+
+      sb.rpc('app_touch_last_login').then(({error})=>{if(error)console.warn('touch last login:',error);});
+      initPresence();
+      initProjectsRealtime();
+      auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
+      render();
+      return;
+    }
+
+    // Temporary legacy path for users not yet provisioned in Supabase Auth.
     const isHashed = user.password && user.password.startsWith('$2');
     let passwordOk = false;
     if (isHashed) {
@@ -2418,32 +2632,51 @@ function doLogin() {
     } else {
       passwordOk = user.password === password;
       if (passwordOk) {
-        // Auto-upgrade plain text → bcrypt hash on successful login
         user.password = dcodeIO.bcrypt.hashSync(password, 10);
         dbSaveUser(user).catch(()=>{});
       }
     }
+
     if (!passwordOk) {
-      const err=el('login-err');
-      if(err){err.textContent='Λάθος username ή password.';err.style.display='block';}
+      if(errEl){errEl.textContent='Λάθος username ή password.';errEl.style.display='block';}
       return;
     }
+
+    AUTH_MODE='legacy';
+    user.lastLogin = nowTS();
+    dbSaveUser(user).catch(()=>{});
     setCurrentUser(user);
     state.cu=user;
     state.view = user.role==='client' ? 'client' : 'dashboard';
     initPresence();
     initProjectsRealtime();
-    auditLog('Σύνδεση',`Ο χρήστης ${user.name} συνδέθηκε`);
+    auditLog('Σύνδεση',`Ο χρήστης ${user.name} συνδέθηκε (legacy transition)`);
     render();
   } catch(err) {
     console.error('doLogin error:', err);
-    showToast('Σφάλμα σύνδεσης: ' + (err.message||err), 'error');
+    const errEl=el('login-err');
+    if(errEl){errEl.textContent='Σφάλμα σύνδεσης: '+(err.message||err);errEl.style.display='block';}
+    else showToast('Σφάλμα σύνδεσης: ' + (err.message||err), 'error');
   }
 }
-function doLogout() {
+
+async function doLogout() {
   try { auditLog('Αποσύνδεση',`Ο χρήστης ${state.cu?.name} αποσυνδέθηκε`); } catch(e){}
   cleanupPresence();
-  clearCurrentUser(); state.cu=null; state.view='login'; render();
+
+  if (isSupabaseAuthMode()) {
+    try { await sb.auth.signOut({scope:'local'}); } catch(e) { console.warn('signOut',e); }
+  }
+
+  clearCurrentUser();
+  state.cu=null;
+  state.view='login';
+  AUTH_MODE='legacy';
+
+  try { await loadFromDB(); }
+  catch(e) { state.db=emptyDbState(); }
+
+  render();
 }
 
 // ── TASK ACTIONS ──────────────────────────────────────────────────
@@ -2880,6 +3113,29 @@ window.modalSaveLocalPath = async function(did,tid) {
   render(); requestAnimationFrame(()=>{ restoreExpanded(); });
   showToast('Αρχείο συνδέθηκε.','success');
 };
+// ── FOLDER PATH MODAL ─────────────────────────────────────────────
+window.showFolderPathModal = function(did, tid) {
+  const found = findDoc(did, tid); if (!found) return;
+  const {doc} = found;
+  showModal(`<div class="modal-header"><div class="modal-title">📂 Φάκελος Εγγράφου</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div style="margin-bottom:12px;padding:10px 12px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.78rem;color:#92400e;line-height:1.5"><strong>Πώς να βρείτε τη διαδρομή:</strong><br>Στον Explorer, <strong>Shift + δεξί κλικ</strong> πάνω στον φάκελο → <strong>"Αντιγραφή ως διαδρομή"</strong> → επικολλήστε παρακάτω.</div><div class="form-group"><label class="form-label">Τοπική διαδρομή φακέλου</label><input class="form-control" id="folder-path-inp" placeholder="T:\\B&E SOLUTIONS Dropbox\\03. SOLUTIONS-PROJECTS\\..." value="${esc(doc.folderPath||'')}" style="font-size:.82rem"></div><div style="margin-top:10px;padding:8px 12px;background:rgba(29,78,216,.06);border:1px solid rgba(29,78,216,.15);border-radius:6px;font-size:.72rem;color:var(--steel);line-height:1.6">💡 Το κουμπί <strong>📁 Φάκελος</strong> λειτουργεί όταν η εφαρμογή ανοίγεται απευθείας από το <strong>index.html</strong> (τοπικά), όχι από το Netlify.</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button>${doc.folderPath?`<button class="btn btn-danger btn-sm" onclick="modalClearFolderPath('${did}','${tid}')" style="margin-right:auto">Εκκαθάριση</button>`:''}<button class="btn btn-primary" onclick="modalSaveFolderPath('${did}','${tid}')">Αποθήκευση</button></div>`);
+};
+window.modalSaveFolderPath = async function(did, tid) {
+  const raw = (el('folder-path-inp')?.value||'').trim().replace(/^"|"$/g,'').trim();
+  const found = findDoc(did, tid); if (!found) return;
+  const {proj, doc} = found;
+  doc.folderPath = raw || null;
+  await dbSaveProject(proj); closeModal();
+  render(); requestAnimationFrame(()=>{ restoreExpanded(); });
+  showToast(raw ? 'Φάκελος αποθηκεύτηκε.' : 'Φάκελος εκκαθαρίστηκε.', 'success');
+};
+window.modalClearFolderPath = async function(did, tid) {
+  const found = findDoc(did, tid); if (!found) return;
+  const {proj, doc} = found;
+  doc.folderPath = null;
+  await dbSaveProject(proj); closeModal();
+  render(); requestAnimationFrame(()=>{ restoreExpanded(); });
+  showToast('Φάκελος εκκαθαρίστηκε.', 'success');
+};
 // Convert a stored Dropbox web URL to a local file:// URL when on localhost
 function _docHref(url) {
   if (!url) return url;
@@ -3131,6 +3387,20 @@ function closeModal() { const ov=el('modal-overlay'); if(ov) ov.remove(); }
 // MY ACCOUNT
 function showModalMyAccount() {
   const cu=state.cu; if(!cu) return;
+
+  if (isSupabaseAuthMode()) {
+    showModal(`<div class="modal-header"><div class="modal-title">Ο Λογαριασμός μου</div><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="ma-name" value="${esc(cu.name)}"></div>
+      <div class="form-group"><label class="form-label">Email σύνδεσης</label><input class="form-control" type="email" value="${esc(cu.email||'')}" readonly><div class="form-hint">Το email είναι συνδεδεμένο με Supabase Auth.</div></div>
+      <hr class="divider">
+      <div class="form-group"><label class="form-label">Νέος κωδικός <span class="text-muted" style="font-weight:400">(κενό = χωρίς αλλαγή)</span></label><input class="form-control" type="password" id="ma-pass" placeholder="••••••••" autocomplete="new-password"></div>
+      <div class="form-group"><label class="form-label">Επιβεβαίωση κωδικού</label><input class="form-control" type="password" id="ma-pass2" placeholder="••••••••" autocomplete="new-password"></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveMyAccount()">Αποθήκευση</button></div>`);
+    return;
+  }
+
   showModal(`<div class="modal-header"><div class="modal-title">Ο Λογαριασμός μου</div><button class="modal-close" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="ma-name" value="${esc(cu.name)}"></div>
@@ -3142,25 +3412,50 @@ function showModalMyAccount() {
   </div>
   <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveMyAccount()">Αποθήκευση</button></div>`);
 }
+
 window.modalSaveMyAccount=async function(){
   const cu=state.cu; if(!cu) return;
   const name=(el('ma-name')?.value||'').trim();
-  const username=(el('ma-user')?.value||'').trim().toLowerCase();
-  const email=(el('ma-email')?.value||'').trim();
   const pass=el('ma-pass')?.value||'';
   const pass2=el('ma-pass2')?.value||'';
+
+  if (!name) { alert('Το ονοματεπώνυμο είναι υποχρεωτικό.'); return; }
+  if (pass && pass!==pass2) { alert('Οι κωδικοί δεν ταιριάζουν.'); return; }
+
+  if (isSupabaseAuthMode()) {
+    if (pass && pass.length<10) { alert('Ο νέος κωδικός πρέπει να έχει τουλάχιστον 10 χαρακτήρες.'); return; }
+
+    const {data:newProfile,error:profileError}=await sb.rpc('app_update_my_name',{p_name:name});
+    if(profileError) throw profileError;
+
+    if(pass){
+      const {error}=await sb.auth.updateUser({password:pass});
+      if(error) throw error;
+    }
+
+    state.cu=newProfile||{...cu,name};
+    const idx=state.db.users.findIndex(u=>u.id===state.cu.id);
+    if(idx>=0) state.db.users[idx]=state.cu;
+
+    auditLog('Ενημέρωση λογαριασμού',state.cu.name);
+    closeModal(); render();
+    showToast('Ο λογαριασμός σας αποθηκεύτηκε.','success');
+    return;
+  }
+
+  const username=(el('ma-user')?.value||'').trim().toLowerCase();
+  const email=(el('ma-email')?.value||'').trim();
   if (!username) { alert('Το username είναι υποχρεωτικό.'); return; }
   if (username!==cu.username && state.db.users.find(u=>u.id!==cu.id&&u.username===username)) {
     alert('Το username χρησιμοποιείται ήδη από άλλο χρήστη.'); return;
   }
-  if (pass && pass!==pass2) { alert('Οι κωδικοί δεν ταιριάζουν.'); return; }
   if (pass && pass.length<4) { alert('Ο κωδικός πρέπει να έχει τουλάχιστον 4 χαρακτήρες.'); return; }
+
   const user=state.db.users.find(u=>u.id===cu.id); if(!user) return;
-  user.name=name||user.name;
+  user.name=name;
   user.username=username;
   user.email=email;
   if (pass) user.password=dcodeIO.bcrypt.hashSync(pass, 10);
-  // Update session
   state.cu={...user}; setCurrentUser(state.cu);
   auditLog('Ενημέρωση λογαριασμού',`${user.name} (@${user.username})`);
   await dbSaveUser(user);
@@ -4391,12 +4686,15 @@ window.modalSavePhase=async function(pid){
 // EDIT PHASE
 function showModalEditPhase(pid,phid) {
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); if(!ph) return;
-  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Φάσης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος Φάσης <sup>*</sup></label><input class="form-control" id="eph-name" value="${esc(ph.name)}"></div><div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Ημ. Έναρξης</label><input type="date" class="form-control" id="eph-start" value="${ph.startDate||''}"></div><div class="form-group"><label class="form-label">📅 Ημ. Λήξης</label><input type="date" class="form-control" id="eph-end" value="${ph.endDate||''}"></div></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdatePhase('${pid}','${phid}')">Αποθήκευση</button></div>`);
+  const _phPd = phasePlannedDates(ph);
+  const _phAd = phaseActualDates(ph);
+  const _fmtOrDash = d => d ? fmt(d) : '—';
+  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Φάσης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος Φάσης <sup>*</sup></label><input class="form-control" id="eph-name" value="${esc(ph.name)}"></div><div class="form-hint" style="margin-top:8px;padding:8px 12px;background:var(--slate-50,#f8fafc);border-radius:6px;font-size:.78rem;color:var(--steel)">📅 Προγραμματισμένο: ${_fmtOrDash(_phPd.start)} → ${_fmtOrDash(_phPd.end)}<br>✅ Πραγματικό: ${_fmtOrDash(_phAd.start)} → ${_fmtOrDash(_phAd.end)}<br><span style="opacity:.7">Οι ημερομηνίες υπολογίζονται αυτόματα από τις εργασίες.</span></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdatePhase('${pid}','${phid}')">Αποθήκευση</button></div>`);
 }
 window.modalUpdatePhase=async function(pid,phid){
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); if(!ph) return;
   const name=el('eph-name').value.trim(); if(!name){alert('Συμπληρώστε τίτλο.');return;}
-  ph.name=name; ph.startDate=el('eph-start')?.value||null; ph.endDate=el('eph-end')?.value||null;
+  ph.name=name;
   auditLog('Επεξεργασία φάσης',`"${name}" στο "${proj.name}"`);
   await dbSaveProject(proj); closeModal(); render(); showToast('Φάση ενημερώθηκε.','success');
 };
@@ -4408,13 +4706,13 @@ function showModalAddTask(pid,phid) {
   const otherTasks=ph?.tasks||[];
   const canAssignMembers = state.cu && ['admin','management'].includes(state.cu.role);
   const membersHtml = canAssignMembers ? `<div class="form-group"><label class="form-label">Μέλη Ομάδας</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${members.map(u=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-member" value="${u.id}"> ${esc(u.name)} <span class="text-muted" style="font-size:.75rem">(${ROLE_INFO[u.role]?.label||u.role})</span></label>`).join('')}</div><div class="form-hint">Επιλέξτε όσους συμμετέχουν στην εργασία</div></div>` : '';
-  showModal(`<div class="modal-header"><div class="modal-title">Νέα Εργασία – ${esc(ph?.name||'')}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="nt-name" placeholder="π.χ. Σύνταξη Σύμβασης"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="nt-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="nt-parallel" style="margin-right:6px">Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-dep-ck" value="${t.id}"> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-enforce-deps"> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="form-group"><label class="form-label">Ημερομηνία Έναρξης</label><input type="date" class="form-control" id="nt-start" value="${today()}"></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveTask('${pid}','${phid}')">Προσθήκη</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Νέα Εργασία – ${esc(ph?.name||'')}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="nt-name" placeholder="π.χ. Σύνταξη Σύμβασης"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="nt-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="nt-parallel" style="margin-right:6px">Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-dep-ck" value="${t.id}"> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-enforce-deps"> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="form-group"><label class="form-label">Ημερομηνία Έναρξης</label><input type="date" class="form-control" id="nt-start" value="${today()}"></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-mgmt-check" style="margin-right:2px">⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveTask('${pid}','${phid}')">Προσθήκη</button></div>`);
 }
 window.modalSaveTask=async function(pid,phid){
   const name=el('nt-name').value.trim(); if(!name){alert('Συμπληρώστε τίτλο.');return;}
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); if(!ph) return;
   const memberIds=Array.from(document.querySelectorAll('.nt-member:checked')).map(c=>c.value);
-  const task={id:'task_'+uid(),name,assigneeId:el('nt-assignee').value||null,memberIds,status:'not_started',parallel:el('nt-parallel')?.checked||false,dependsOn:Array.from(document.querySelectorAll('.nt-dep-ck:checked')).map(c=>c.value),enforceDeps:el('nt-enforce-deps')?.checked||false,startDate:el('nt-start')?.value||null,completedDate:null,subtasks:[],docs:[]};
+  const task={id:'task_'+uid(),name,assigneeId:el('nt-assignee').value||null,memberIds,status:'not_started',parallel:el('nt-parallel')?.checked||false,dependsOn:Array.from(document.querySelectorAll('.nt-dep-ck:checked')).map(c=>c.value),enforceDeps:el('nt-enforce-deps')?.checked||false,startDate:el('nt-start')?.value||null,completedDate:null,subtasks:[],docs:[],mgmtCheck:el('nt-mgmt-check')?.checked||false};
   ph.tasks.push(task);
   auditLog('Προσθήκη εργασίας',`"${name}" – ${ph.name}`);
   await dbSaveProject(proj); closeModal(); render(); showToast('Εργασία προστέθηκε.','success');
@@ -4430,7 +4728,7 @@ function showModalEditTask(pid,phid,tid) {
   const otherTasks=(ph.tasks||[]).filter(t=>t.id!==tid);
   const curDeps=task.dependsOn||[];
   window._editTaskCtx={pid,phid,tid};
-  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Εργασίας</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος</label><input class="form-control" id="et-name" value="${esc(task.name)}"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="et-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}"${u.id===task.assigneeId?' selected':''}>${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="et-parallel" style="margin-right:6px"${task.parallel?' checked':''}>Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="et-dep-ck" value="${t.id}"${curDeps.includes(t.id)?' checked':''}> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-enforce-deps"${task.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Προγρ. Έναρξη</label><input type="date" class="form-control" id="et-pstart" value="${task.plannedStart||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Έναρξης</label><input type="time" class="form-control" id="et-stime" value="${task.startTime||''}"></div><div class="form-group"><label class="form-label">📅 Προγρ. Λήξη</label><input type="date" class="form-control" id="et-pend" value="${task.plannedEnd||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Λήξης</label><input type="time" class="form-control" id="et-etime" value="${task.endTime||''}"></div><div class="form-group"><label class="form-label">Πραγμ. Έναρξη</label><input type="date" class="form-control" id="et-start" value="${task.startDate||''}"></div><div class="form-group"><label class="form-label">Πραγμ. Ολοκλήρωση</label><input type="date" class="form-control" id="et-comp" value="${task.completedDate||''}"></div></div><div class="form-group"><label class="form-label">Υποεργασίες</label><div id="et-sub-list">${(task.subtasks||[]).map(st=>`<div class="proc-tpl-item" id="str-${st.id}"><span>${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`).join('')}</div><div style="display:flex;gap:8px;margin-top:8px"><input class="form-control" id="et-sub" placeholder="Νέα υποεργασία"><button class="btn btn-secondary btn-sm" onclick="modalAddSubtask()">+ Προσθήκη</button></div></div><hr class="divider"><button class="btn btn-danger btn-sm" onclick="modalRemoveTask()">Αφαίρεση Εργασίας</button></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateTask()">Αποθήκευση</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Εργασίας</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος</label><input class="form-control" id="et-name" value="${esc(task.name)}"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="et-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}"${u.id===task.assigneeId?' selected':''}>${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="et-parallel" style="margin-right:6px"${task.parallel?' checked':''}>Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="et-dep-ck" value="${t.id}"${curDeps.includes(t.id)?' checked':''}> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-enforce-deps"${task.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Προγρ. Έναρξη</label><input type="date" class="form-control" id="et-pstart" value="${task.plannedStart||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Έναρξης</label><input type="time" class="form-control" id="et-stime" lang="en-GB" value="${task.startTime||'08:00'}"></div><div class="form-group"><label class="form-label">📅 Προγρ. Λήξη</label><input type="date" class="form-control" id="et-pend" value="${task.plannedEnd||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Λήξης</label><input type="time" class="form-control" id="et-etime" lang="en-GB" value="${task.endTime||'16:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Έναρξη</label><input type="date" class="form-control" id="et-start" value="${task.startDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Έναρξης</label><input type="time" class="form-control" id="et-atime" lang="en-GB" value="${task.actualStartTime||'08:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Ολοκλήρωση</label><input type="date" class="form-control" id="et-comp" value="${task.completedDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Ολοκλήρωσης</label><input type="time" class="form-control" id="et-ctime" lang="en-GB" value="${task.actualEndTime||'16:00'}"></div></div><div class="form-group"><label class="form-label">Υποεργασίες</label><div id="et-sub-list">${(task.subtasks||[]).map(st=>`<div class="proc-tpl-item" id="str-${st.id}"><span>${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`).join('')}</div><div style="display:flex;gap:8px;margin-top:8px"><input class="form-control" id="et-sub" placeholder="Νέα υποεργασία"><button class="btn btn-secondary btn-sm" onclick="modalAddSubtask()">+ Προσθήκη</button></div></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-mgmt-check" style="margin-right:2px"${task.mgmtCheck?' checked':''}>⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div><hr class="divider"><button class="btn btn-danger btn-sm" onclick="modalRemoveTask()">Αφαίρεση Εργασίας</button></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateTask()">Αποθήκευση</button></div>`);
 }
 window.modalAddSubtask=async function(){
   const name=el('et-sub')?.value.trim(); if(!name) return;
@@ -4454,7 +4752,8 @@ window.modalUpdateTask=async function(){
   task.enforceDeps=el('et-enforce-deps')?.checked||false;
   task.plannedStart=el('et-pstart')?.value||null; task.plannedEnd=el('et-pend')?.value||null;
   task.startTime=el('et-stime')?.value||null; task.endTime=el('et-etime')?.value||null;
-  task.startDate=el('et-start').value||null; task.completedDate=el('et-comp').value||null;
+  task.startDate=el('et-start').value||null; task.actualStartTime=el('et-atime')?.value||null; task.completedDate=el('et-comp').value||null; task.actualEndTime=el('et-ctime')?.value||null;
+  task.mgmtCheck=el('et-mgmt-check')?.checked||false;
   if(task.completedDate) task.status='completed';
   auditLog('Επεξεργασία εργασίας',`"${task.name}"`);
   await dbSaveProject(proj); closeModal(); render(); showToast('Εργασία αποθηκεύτηκε.','success');
@@ -4553,6 +4852,17 @@ window.modalSaveDoc=async function(pid,phid,tid){
 
 // ADD USER
 function showModalAddUser() {
+  if (isSupabaseAuthMode()) {
+    showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="login-err" style="display:block">
+          Η δημιουργία νέου χρήστη είναι προσωρινά απενεργοποιημένη στη μεταβατική Auth έκδοση.
+        </div>
+        <div class="form-hint">Οι υπάρχοντες χρήστες συνεχίζουν κανονικά. Η νέα ροή provisioning θα ενεργοποιηθεί στο τελικό cutover, ώστε να μη δημιουργούνται ασύνδετα application/Auth accounts.</div>
+      </div>
+      <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">OK</button></div>`);
+    return;
+  }
   showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο <sup>*</sup></label><input class="form-control" id="nu-name" placeholder="Γεώργιος Παπαδόπουλος"></div><div class="form-group"><label class="form-label">Username <sup>*</sup></label><input class="form-control" id="nu-user" placeholder="gpapadopoulos"></div><div class="form-group"><label class="form-label">Κωδικός <sup>*</sup></label><input class="form-control" type="password" id="nu-pass"></div><div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="nu-email"></div><div class="form-group"><label class="form-label">Ρόλος</label><select class="form-control" id="nu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">Κατηγορίες (για Υπ. Έργου)</label>${state.db.categories.map(c=>`<label style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" class="nu-catck" value="${c.id}"> ${esc(c.name)}</label>`).join('')}</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveUser()">Δημιουργία</button></div>`);
 }
 window.modalSaveUser=async function(){
@@ -5057,7 +5367,11 @@ function showModalEditUser(userId) {
     <div class="form-hint">✓ Ολόκληρη = πρόσβαση σε όλα τα έργα της κατηγορίας. Αποεπιλέξτε για να επιλέξετε συγκεκριμένα έργα.</div>
   </div>`;
 
-  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία – ${esc(user.name)}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="eu-name" value="${esc(user.name)}"></div><div class="form-group"><label class="form-label">Username</label><input class="form-control" id="eu-user" value="${esc(user.username)}" autocomplete="off"></div><div class="form-group"><label class="form-label">Νέος Κωδικός (κενό = χωρίς αλλαγή)</label><input class="form-control" type="password" id="eu-pass" placeholder="••••••••" autocomplete="new-password"></div><div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div><div class="form-group"><label class="form-label">Global Ρόλος</label><select class="form-control" id="eu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}"${k===user.role?' selected':''}>${v.label}</option>`).join('')}</select><div class="form-hint">Ισχύει όπου δεν υπάρχει ειδικός ρόλος κατηγορίας.</div></div>${catRolesHtml}${accessHtml}</div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateUser('${userId}')">Αποθήκευση</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία – ${esc(user.name)}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="eu-name" value="${esc(user.name)}"></div><div class="form-group"><label class="form-label">Username</label><input class="form-control" id="eu-user" value="${esc(user.username)}" autocomplete="off"></div>${isSupabaseAuthMode()
+    ? `<div class="form-hint" style="margin-bottom:12px">Ο κωδικός διαχειρίζεται από Supabase Auth και δεν αλλάζει από αυτή τη φόρμα.</div>
+       <div class="form-group"><label class="form-label">Email Auth</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}" readonly></div>`
+    : `<div class="form-group"><label class="form-label">Νέος Κωδικός (κενό = χωρίς αλλαγή)</label><input class="form-control" type="password" id="eu-pass" placeholder="••••••••" autocomplete="new-password"></div>
+       <div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div>`}<div class="form-group"><label class="form-label">Global Ρόλος</label><select class="form-control" id="eu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}"${k===user.role?' selected':''}>${v.label}</option>`).join('')}</select><div class="form-hint">Ισχύει όπου δεν υπάρχει ειδικός ρόλος κατηγορίας.</div></div>${catRolesHtml}${accessHtml}</div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateUser('${userId}')">Αποθήκευση</button></div>`);
 }
 window.euToggleCat=function(cb, cid){
   const list=document.getElementById('cap-'+cid); if(!list) return;
@@ -5066,13 +5380,16 @@ window.euToggleCat=function(cb, cid){
 };
 window.modalUpdateUser=async function(userId){
   const user=getUser(userId); if(!user) return;
-  user.name=el('eu-name').value.trim()||user.name; user.email=el('eu-email').value.trim(); user.role=el('eu-role').value;
+  user.name=el('eu-name').value.trim()||user.name;
+  if (!isSupabaseAuthMode()) user.email=el('eu-email').value.trim();
+  user.role=el('eu-role').value;
   const newUser=(el('eu-user')?.value||'').trim().toLowerCase();
   if (newUser && newUser!==user.username) {
     if (state.db.users.find(u=>u.id!==userId&&u.username===newUser)) { alert('Το username χρησιμοποιείται ήδη από άλλο χρήστη.'); return; }
     user.username=newUser;
   }
-  const np=el('eu-pass').value; if(np) user.password=dcodeIO.bcrypt.hashSync(np, 10);
+  const np=el('eu-pass')?.value||'';
+  if(!isSupabaseAuthMode() && np) user.password=dcodeIO.bcrypt.hashSync(np, 10);
   user.categoryIds=Array.from(document.querySelectorAll('.eu-catfull:checked')).map(c=>c.dataset.cid);
   const fullCatSet=new Set(user.categoryIds);
   user.projectIds=Array.from(document.querySelectorAll('.eu-proj:checked')).filter(c=>!fullCatSet.has(c.dataset.cid)).map(c=>c.value);
@@ -5150,7 +5467,14 @@ async function sendCommentNotifications(proj, ph, task, commentText) {
         target.notifications.unshift({...notifEntry});
         // Keep max 50 notifications per user
         if (target.notifications.length > 50) target.notifications = target.notifications.slice(0, 50);
-        dbSaveUser(target).catch(e => console.warn('Failed saving notif for', target.name, e));
+        if (isSupabaseAuthMode()) {
+          sb.rpc('app_add_notification',{
+            p_target_app_user_id:target.id,
+            p_notification:notifEntry
+          }).then(({error})=>{if(error)console.warn('Failed saving notif for',target.name,error);});
+        } else {
+          dbSaveUser(target).catch(e => console.warn('Failed saving notif for', target.name, e));
+        }
       }
     }
     // Email: everyone except commenter, EXCEPT admins always get email even if they're the commenter
@@ -5192,11 +5516,15 @@ function renderGantt(proj) {
   const phases=proj.phases||[];
   if (!phases.length) return '<div class="empty-state"><div class="es-icon">📊</div><h3>Δεν υπάρχουν φάσεις</h3></div>';
 
-  // Collect dates
+  // Collect dates from task plannedStart/plannedEnd (auto-computed per phase)
   const allDates=[];
   phases.forEach(ph=>{
-    if(ph.startDate) allDates.push(new Date(ph.startDate));
-    if(ph.endDate)   allDates.push(new Date(ph.endDate));
+    const _pd=phasePlannedDates(ph);
+    if(_pd.start) allDates.push(new Date(_pd.start));
+    if(_pd.end)   allDates.push(new Date(_pd.end));
+    const _ad=phaseActualDates(ph);
+    if(_ad.start) allDates.push(new Date(_ad.start));
+    if(_ad.end)   allDates.push(new Date(_ad.end));
   });
   let minDate,maxDate;
   if(allDates.length>=1){
@@ -5258,38 +5586,56 @@ function renderGantt(proj) {
   const todayPct=((new Date()-minDate)/rangeMs*100).toFixed(2);
   const todayLine=(todayPct>=0&&todayPct<=100)?`<div style="position:absolute;left:${todayPct}%;top:0;bottom:0;width:2px;background:var(--red);z-index:3;opacity:.65" title="Σήμερα"></div>`:'';
 
-  // Phase rows
+  // Phase rows — δύο γραμμές ανά φάση: Προγραμματισμένο + Πραγματικό
+  const _mkBar=(s,e,clr,label,opacity=1)=>{
+    if(!s&&!e) return '';
+    const effS=s||e, effE=e||s;
+    const sd=new Date(effS),ed=new Date(effE);
+    if(ed<sd) return '';
+    const lPct=Math.max(0,(sd-minDate)/rangeMs*100);
+    const wPct=Math.min(100-lPct,(ed-sd)/rangeMs*100);
+    return `<div style="position:absolute;left:${lPct.toFixed(2)}%;width:${wPct.toFixed(2)}%;min-width:6px;top:50%;transform:translateY(-50%);height:20px;background:${clr};border-radius:4px;padding:0 6px;display:flex;align-items:center;overflow:visible;box-shadow:0 1px 3px rgba(0,0,0,.15);opacity:${opacity}"><span style="font-size:.58rem;color:#fff;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${label}</span></div>`;
+  };
   const rows=phases.map((ph,idx)=>{
     const done=isPhaseComplete(ph);
-    const bar=ph.startDate&&ph.endDate?(()=>{
-      const s=new Date(ph.startDate),e=new Date(ph.endDate);
-      if(e<s) return '';
-      const lPct=Math.max(0,(s-minDate)/rangeMs*100);
-      const wPct=Math.min(100-lPct,(e-s)/rangeMs*100);
-      const clr=done?'var(--green)':'var(--orange)';
-      return `<div class="gantt-bar-wrap" style="position:absolute;left:${lPct.toFixed(2)}%;width:${wPct.toFixed(2)}%;top:50%;transform:translateY(-50%);height:24px;background:${clr};border-radius:5px;padding:0 8px;display:flex;align-items:center;overflow:visible;box-shadow:0 1px 4px rgba(0,0,0,.12)"><span style="font-size:.62rem;color:#fff;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%">${esc(ph.name)}</span><div class="gantt-tooltip">${esc(ph.name)}</div></div>`;
-    })():`<div style="padding:0 12px;font-size:.7rem;color:var(--muted);line-height:44px;white-space:nowrap">Χωρίς ημερομηνίες — ορίστε στην επεξεργασία φάσης ✏</div>`;
-    return `<div style="display:flex;align-items:stretch;border-bottom:1px solid var(--slate-100);min-height:44px">
-      <div style="width:200px;flex-shrink:0;font-size:.78rem;font-weight:600;color:var(--navy);padding:10px 14px;border-right:1px solid var(--navy-line);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(ph.name)}">${idx+1}. ${esc(ph.name)}</div>
-      <div style="flex:1;position:relative;min-height:44px">${todayLine}${bar}</div>
+    const pd=phasePlannedDates(ph);
+    const ad=phaseActualDates(ph);
+    const plannedClr='var(--orange)';
+    const actualClr ='var(--blue)';
+    const plannedBar=(pd.start||pd.end)
+      ? _mkBar(pd.start,pd.end,plannedClr,pd.start&&pd.end?fmt(pd.start)+' → '+fmt(pd.end):fmt(pd.start||pd.end))
+      : `<div style="padding:0 10px;font-size:.68rem;color:var(--muted);line-height:28px;white-space:nowrap">Δεν υπάρχουν planned dates στις εργασίες</div>`;
+    const actualBar=(ad.start||ad.end)
+      ? _mkBar(ad.start,ad.end,actualClr,ad.start&&ad.end?fmt(ad.start)+' → '+fmt(ad.end):fmt(ad.start||ad.end),0.75)
+      : '';
+    const labelCol=`<div style="width:200px;flex-shrink:0;font-size:.75rem;font-weight:600;color:var(--navy);padding:0 14px;border-right:1px solid var(--navy-line);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center" title="${esc(ph.name)}">${idx+1}. ${esc(ph.name)}</div>`;
+    return `<div style="border-bottom:1px solid var(--slate-100)">
+      <div style="display:flex;align-items:stretch;min-height:30px">
+        ${labelCol}
+        <div style="flex:1;position:relative;min-height:30px;padding:3px 0">${todayLine}${plannedBar}</div>
+      </div>
+      ${actualBar?`<div style="display:flex;align-items:stretch;min-height:24px;background:rgba(0,0,0,.02)">
+        <div style="width:200px;flex-shrink:0;padding:0 14px;border-right:1px solid var(--navy-line);font-size:.6rem;color:var(--muted);display:flex;align-items:center">↳ Πραγματικό</div>
+        <div style="flex:1;position:relative;min-height:24px;padding:2px 0">${todayLine}${actualBar}</div>
+      </div>`:''}
     </div>`;
   }).join('');
 
-  return `<div style="background:var(--white);border:1px solid var(--navy-line);border-radius:10px;overflow:hidden;margin-top:8px">
+  return `<div style="display:flex;justify-content:flex-end;gap:4px;margin-bottom:6px">
+    <button class="btn btn-sm" onclick="state.ganttScale='day';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='day'?'background:var(--navy);color:#fff':''}">Ημέρα</button>
+    <button class="btn btn-sm" onclick="state.ganttScale='week';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='week'?'background:var(--navy);color:#fff':''}">Εβδομάδα</button>
+    <button class="btn btn-sm" onclick="state.ganttScale='month';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='month'?'background:var(--navy);color:#fff':''}">Μήνας</button>
+  </div>
+  <div style="background:var(--white);border:1px solid var(--navy-line);border-radius:10px;overflow:hidden;margin-top:0">
     <div style="display:flex;align-items:center;border-bottom:2px solid var(--navy-line)">
       <div style="width:200px;flex-shrink:0;padding:8px 14px;font-size:.68rem;font-weight:800;color:var(--steel);text-transform:uppercase;letter-spacing:.06em;border-right:1px solid var(--navy-line)">Φάση</div>
       <div style="flex:1;position:relative;height:28px">${headerLabels}</div>
-      <div style="flex-shrink:0;padding:0 10px;display:flex;gap:4px">
-        <button class="btn btn-sm" onclick="state.ganttScale='day';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='day'?'background:var(--navy);color:#fff':''}">Ημέρα</button>
-        <button class="btn btn-sm" onclick="state.ganttScale='week';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='week'?'background:var(--navy);color:#fff':''}">Εβδομάδα</button>
-        <button class="btn btn-sm" onclick="state.ganttScale='month';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='month'?'background:var(--navy);color:#fff':''}">Μήνας</button>
-      </div>
     </div>
     ${rows}
     <div style="padding:8px 14px;font-size:.7rem;color:var(--muted);border-top:1px solid var(--slate-100)">
       <span style="color:var(--red);font-weight:700">│</span> Σήμερα &nbsp;
-      <span style="display:inline-block;width:12px;height:10px;background:var(--orange);border-radius:2px;vertical-align:middle"></span> Σε εξέλιξη &nbsp;
-      <span style="display:inline-block;width:12px;height:10px;background:var(--green);border-radius:2px;vertical-align:middle"></span> Ολοκληρωμένη
+      <span style="display:inline-block;width:12px;height:10px;background:var(--orange);border-radius:2px;vertical-align:middle"></span> Προγραμματισμένο &nbsp;
+      <span style="display:inline-block;width:12px;height:10px;background:var(--blue);border-radius:2px;vertical-align:middle;opacity:.75"></span> Πραγματικό
     </div>
   </div>`;
 }
@@ -6177,8 +6523,8 @@ function renderAssigned() {
         <thead>
           <tr>
             <th class="asgn-th" style="width:40px">#</th>
-            <th class="asgn-th">Έργο</th>
-            <th class="asgn-th" style="width:180px">Φάση</th>
+            <th class="asgn-th" style="width:360px">Έργο</th>
+            <th class="asgn-th" style="width:360px">Φάση</th>
             <th class="asgn-th">Εργασία</th>
             <th class="asgn-th">Κατάσταση</th>
             <th class="asgn-th">Έναρξη</th>
@@ -6845,25 +7191,85 @@ document.addEventListener('keydown', e => {
 });
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Show loading state
   const main=el('main-content');
-  if (main) main.innerHTML=`<div class="login-wrap"><div class="login-box" style="text-align:center"><div style="font-size:2rem;margin-bottom:16px">⏳</div><div style="font-weight:700;color:var(--navy)">Σύνδεση με βάση δεδομένων…</div><div class="text-sm text-muted" style="margin-top:6px">Παρακαλώ περιμένετε</div></div></div>`;
+  if (main) main.innerHTML=`<div class="login-wrap"><div class="login-box" style="text-align:center"><div style="font-size:2rem;margin-bottom:16px">⏳</div><div style="font-weight:700;color:var(--navy)">Έλεγχος συνεδρίας…</div><div class="text-sm text-muted" style="margin-top:6px">Παρακαλώ περιμένετε</div></div></div>`;
   document.body.style.background='var(--navy)';
   const sidebar=document.querySelector('.sidebar'); if(sidebar) sidebar.style.display='none';
 
-  await loadFromDB();
+  try {
+    const {data:{session},error:sessionError}=await sb.auth.getSession();
+    if(sessionError) throw sessionError;
 
-  // Re-validate session
-  const cu=getCurrentUser();
-  if (cu) {
-    const fresh=state.db.users.find(u=>u.id===cu.id);
-    if (fresh) { state.cu=fresh; state.view=fresh.role==='client'?'client':'dashboard'; }
-    else { clearCurrentUser(); state.cu=null; state.view='login'; }
-  } else {
-    state.cu=null; state.view='login';
+    if (session) {
+      // Only already-mapped transition roles use Auth at this stage.
+      const profile=await loadCurrentAppUser().catch(()=>null);
+      if (profile && TRANSITION_AUTH_ROLES.has(profile.role)) {
+        AUTH_MODE='supabase';
+        sessionStorage.removeItem('be_pm_user');
+        await loadFromDB();
+        state.cu=profile;
+        const idx=state.db.users.findIndex(u=>u.id===profile.id);
+        if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
+        state.view=profile.role==='client'?'client':'dashboard';
+        initPresence(); initProjectsRealtime();
+      } else {
+        // Orphan/unmapped/test Auth sessions must not break the legacy users.
+        await sb.auth.signOut({scope:'local'}).catch(()=>{});
+        AUTH_MODE='legacy';
+        state.cu=null;
+        await loadFromDB();
+
+        const legacy=getCurrentUser();
+        if (legacy && !TRANSITION_AUTH_ROLES.has(legacy.role)) {
+          const fresh=state.db.users.find(u=>u.id===legacy.id);
+          if(fresh){state.cu=fresh;state.view=fresh.role==='client'?'client':'dashboard';initPresence();initProjectsRealtime();}
+          else clearCurrentUser();
+        } else {
+          clearCurrentUser();
+        }
+      }
+    } else {
+      AUTH_MODE='legacy';
+      await loadFromDB();
+
+      // Never restore Admin/Management from the old sessionStorage login.
+      const legacy=getCurrentUser();
+      if (legacy && !TRANSITION_AUTH_ROLES.has(legacy.role)) {
+        const fresh=state.db.users.find(u=>u.id===legacy.id);
+        if(fresh){
+          state.cu=fresh;
+          state.view=fresh.role==='client'?'client':'dashboard';
+          initPresence(); initProjectsRealtime();
+        } else {
+          clearCurrentUser();
+          state.cu=null;
+          state.view='login';
+        }
+      } else {
+        clearCurrentUser();
+        state.cu=null;
+        state.view='login';
+      }
+    }
+  } catch(err) {
+    console.error('Transition init failed',err);
+    try { await sb.auth.signOut({scope:'local'}); } catch(e) {}
+    AUTH_MODE='legacy';
+    state.cu=null;
+    state.view='login';
+    try { await loadFromDB(); } catch(e) { state.db=emptyDbState(); }
+    showToast('Αποτυχία αρχικοποίησης: '+(err.message||err),'error');
   }
 
   if (sidebar) sidebar.style.display='';
-  if (state.cu) { initPresence(); initProjectsRealtime(); }
   render();
+
+  sb.auth.onAuthStateChange((event)=>{
+    if(event==='SIGNED_OUT' && isSupabaseAuthMode()){
+      AUTH_MODE='legacy';
+      state.cu=null;
+      state.view='login';
+    }
+  });
 });
+
