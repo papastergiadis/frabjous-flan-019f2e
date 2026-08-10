@@ -53,10 +53,12 @@ const DOC_TYPES = {
 
 // ── SUPABASE / TRANSITION AUTH ────────────────────────────────────
 // `sb` is initialized in index.html before this script loads.
-// During the transition, Admin + Management use Supabase Auth.
-// Other roles temporarily continue with the legacy username/password flow
-// until their Auth accounts are provisioned and the final cutover is complete.
-const TRANSITION_AUTH_ROLES = new Set(['admin','management']);
+// Phase 2F progressive Auth:
+// - every role may use Supabase Auth once an Auth account exists;
+// - Admin/Management MUST use Supabase Auth;
+// - Project Manager / Team Member / Client retain a temporary legacy fallback
+//   until the final organization-wide Auth cutover.
+const AUTH_REQUIRED_ROLES = new Set(['admin','management']);
 let AUTH_MODE = 'legacy'; // 'legacy' | 'supabase'
 
 function emptyDbState() {
@@ -188,6 +190,28 @@ async function dbSaveCategory(cat) {
   if (error) { showToast('Σφάλμα αποθήκευσης κατηγορίας.','error'); throw error; }
 }
 async function dbSaveProject(proj) {
+  if (isSupabaseAuthMode()) {
+    const role=state.cu?.role;
+
+    if (role==='project_manager') {
+      const {data,error}=await sb.rpc('app_project_save_managed',{
+        p_project_id:proj.id,
+        p_data:proj
+      });
+      if (error) {
+        showToast('Η ασφαλής αποθήκευση έργου απορρίφθηκε.','error');
+        throw error;
+      }
+      const idx=(state.db.projects||[]).findIndex(p=>p.id===proj.id);
+      if(idx>=0) state.db.projects[idx]=data; else state.db.projects.push(data);
+      return data;
+    }
+
+    if (!['admin','management'].includes(role)) {
+      throw new Error('Ο ρόλος σας δεν επιτρέπεται να αντικαταστήσει ολόκληρο έργο.');
+    }
+  }
+
   const {error} = await sb.from('be_projects').upsert({id:proj.id, data:proj});
   if (error) { showToast('Σφάλμα αποθήκευσης έργου.','error'); throw error; }
 }
@@ -227,7 +251,13 @@ async function dbDeleteTimesheet(entryId) {
   if (error) { showToast('Σφάλμα διαγραφής εγγραφής.','error'); throw error; }
 }
 async function dbDeleteProject(pid) {
-  await sb.from('be_projects').delete().eq('id', pid);
+  if (isSupabaseAuthMode()) {
+    const {error}=await sb.rpc('app_project_delete_managed',{p_project_id:pid});
+    if(error) throw error;
+    return;
+  }
+  const {error}=await sb.from('be_projects').delete().eq('id',pid);
+  if(error) throw error;
 }
 async function dbDeleteUser(uid) {
   if (isSupabaseAuthMode()) {
@@ -866,7 +896,7 @@ function getTemplate(id) { return (state.db.templates||[]).find(t=>t.id===id); }
 // backward compat: projects may have managerId (old) or managerIds (new)
 function projManagerIds(proj) { return proj.managerIds || (proj.managerId ? [proj.managerId] : []); }
 function projManagerNames(proj) { return projManagerIds(proj).map(id=>getUser(id)?.name||'—').join(', ') || '—'; }
-function canManageTemplates() { return state.cu && state.cu.role !== 'client'; }
+function canManageTemplates() { return state.cu && ['admin','management'].includes(state.cu.role); }
 function canViewTemplates()   { return state.cu && state.cu.role !== 'client'; }
 
 // Returns the effective role of a user for a given category.
@@ -887,10 +917,7 @@ function visibleProjects() {
   if (['admin','management'].includes(cu.role)) return state.db.projects;
   // Client: only projects explicitly assigned to them
   if (cu.role === 'client')
-    return state.db.projects.filter(p =>
-      (cu.projectIds||[]).includes(p.id) ||
-      p.clientId===cu.id
-    );
+    return state.db.projects.filter(p => p.clientId===cu.id);
   // project_manager / team_member: only projects where they are directly involved
   return state.db.projects.filter(p => {
     // Named project manager on this project
@@ -909,14 +936,14 @@ function visibleProjects() {
 function canAccessProject(proj) { return visibleProjects().some(p=>p.id===proj.id); }
 function canModifyProject(proj) {
   if (!state.cu) return false;
-  if (state.cu.role === 'client') return false;
   if (['admin','management'].includes(state.cu.role)) return true;
-  // Named project manager on this specific project
+  if (state.cu.role !== 'project_manager') return false;
+
   if (projManagerIds(proj).includes(state.cu.id)) return true;
-  // Any non-client user with category-level access (via categoryIds or categoryRoles)
-  const catId = proj.categoryId;
+
+  const catId=proj.categoryId;
   if ((state.cu.categoryIds||[]).includes(catId)) return true;
-  if ((state.cu.categoryRoles||{})[catId]) return true;
+  if ((state.cu.categoryRoles||{})[catId]==='project_manager') return true;
   return false;
 }
 
@@ -1209,7 +1236,7 @@ function getNotifications() {
     notifs.push({type:'reminder',title:`⏳ Υπενθύμιση προς πελάτη: ${r.clientName}`,sub:r.message,rid:r.id});
   });
   // Review requests (management only)
-  if (state.cu.role === 'management') {
+  if (['admin','management'].includes(state.cu.role)) {
     projs.forEach(proj => {
       (proj.phases||[]).forEach(ph => {
         if (ph.reviewStatus==='pending')
@@ -1308,7 +1335,7 @@ function renderLogin() {
       <div id="login-err" class="login-err" style="display:none"></div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-login">Σύνδεση</button>
       <div class="login-hint">
-        Μεταβατική έκδοση: Διαχειριστής/Διοίκηση → Supabase Auth · λοιποί χρήστες → προσωρινά παλιό login
+        Supabase Auth για ενεργοποιημένους λογαριασμούς · προσωρινό legacy fallback για χρήστες που δεν έχουν μεταφερθεί ακόμη
       </div>
     </div>
   </div>`;
@@ -1439,7 +1466,7 @@ function _dashFilteredProjs() {
   const f = state.dashFilter;
   if (!f) return '';
   const all = visibleProjects().filter(p=>!p.standing);
-  const isAdminMgmt = state.cu?.role === 'management';
+  const isAdminMgmt = ['admin','management'].includes(state.cu?.role);
   let projs, title;
   if (f==='all')          { projs=all; title='Όλα τα Έργα'; }
   else if (f==='in_progress') { projs=all.filter(p=>p.status==='in_progress'); title='Έργα σε Εξέλιξη'; }
@@ -1468,7 +1495,7 @@ function _dashFilteredProjs() {
 function renderDashboard() {
   const s=dashStats();
   const f=state.dashFilter;
-  const isAdminMgmt = state.cu?.role === 'management';
+  const isAdminMgmt = ['admin','management'].includes(state.cu?.role);
   const priorityWidget = ['project_manager','team_member'].includes(state.cu?.role) ? renderPriorityWidget() : '';
   const storageWidget  = renderStorageWidget();
 
@@ -1501,6 +1528,7 @@ function renderCategories() {
     visibleProjects().some(p=>p.categoryId===c.id) ||
     (state.cu.categoryRoles&&state.cu.categoryRoles[c.id])
   );
+  const canManageCats=!!state.cu && ['admin','management'].includes(state.cu.role);
   // Εφαρμογή αποθηκευμένης σειράς (drag & drop)
   const savedOrder = JSON.parse(localStorage.getItem('be_cat_order')||'[]');
   if (savedOrder.length) {
@@ -1512,12 +1540,12 @@ function renderCategories() {
   }
   const canDrag = isAdmin();
   return `
-  <div class="page-hd"><div><h1>Κατηγορίες Έργων</h1><div class="page-hd-sub">${cats.length} κατηγορίες${canDrag?' · <span style="font-size:.75rem;color:var(--muted)">σύρε για αναδιάταξη</span>':''}</div></div>${state.cu&&state.cu.role!=='client'?`<div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-category">+ Νέα Κατηγορία</button></div>`:''}</div>
+  <div class="page-hd"><div><h1>Κατηγορίες Έργων</h1><div class="page-hd-sub">${cats.length} κατηγορίες${canDrag?' · <span style="font-size:.75rem;color:var(--muted)">σύρε για αναδιάταξη</span>':''}</div></div>${canManageCats?`<div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-category">+ Νέα Κατηγορία</button></div>`:''}</div>
   <div class="projects-grid" id="cat-grid">
-    ${cats.map(cat=>{const projs=visibleProjects().filter(p=>p.categoryId===cat.id);const active=projs.filter(p=>p.status==='in_progress').length;const done=projs.filter(p=>p.status==='completed').length;const mgrIds=[...new Set([...(cat.managerIds||[]),...state.db.users.filter(u=>u.categoryRoles&&u.categoryRoles[cat.id]==='project_manager').map(u=>u.id)])];const mgrs=mgrIds.map(id=>getUser(id)?.name).filter(Boolean).join(', ');const init=cat.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();const canDelCat=(ROLE_INFO[state.cu?.role]?.level||0)>=2;
+    ${cats.map(cat=>{const projs=visibleProjects().filter(p=>p.categoryId===cat.id);const active=projs.filter(p=>p.status==='in_progress').length;const done=projs.filter(p=>p.status==='completed').length;const mgrIds=[...new Set([...(cat.managerIds||[]),...state.db.users.filter(u=>u.categoryRoles&&u.categoryRoles[cat.id]==='project_manager').map(u=>u.id)])];const mgrs=mgrIds.map(id=>getUser(id)?.name).filter(Boolean).join(', ');const init=cat.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();const canDelCat=canManageCats;
 const dragAttrs=canDrag?`draggable="true" ondragstart="catDragStart(event,'${cat.id}')" ondragover="catDragOver(event)" ondragleave="catDragLeave(event)" ondrop="catDrop(event,'${cat.id}')" ondragend="catDragEnd()"`:''
 return`<div class="project-card cat-card${canDrag?' cat-draggable':''}" data-action="open-category" data-cid="${cat.id}" ${dragAttrs}><div class="project-card-accent" style="background:${cat.color}"></div>${canDrag?`<div class="cat-drag-handle" title="Σύρε για αναδιάταξη">⠿</div>`:''}<div class="project-card-body"><div class="project-monogram" style="background:${cat.bgLight};color:${cat.color}">${init}</div><div class="project-card-name">${esc(cat.name)}</div></div><div class="project-card-stats"><div class="pstat"><div class="pstat-num">${projs.length}</div><div class="pstat-label">Έργα</div></div><div class="pstat"><div class="pstat-num" style="color:var(--orange)">${active}</div><div class="pstat-label">Ενεργά</div></div><div class="pstat"><div class="pstat-num" style="color:var(--green)">${done}</div><div class="pstat-label">Ολοκλ.</div></div></div><div class="project-card-footer" style="justify-content:space-between"><span class="text-sm text-muted">${(cat.template?.phases||[]).length} φάσεις στο πρότυπο</span>${canDelCat?`<button class="btn btn-danger btn-sm" data-action="delete-category" data-cid="${cat.id}">Διαγραφή</button>`:'<span class="text-sm text-muted">Προβολή →</span>'}</div></div>`;}).join('')}
-    ${state.cu&&state.cu.role!=='client'?`<div class="card-add" data-action="modal-add-category"><div class="card-add-icon">+</div><p>Νέα Κατηγορία</p></div>`:''}
+    ${canManageCats?`<div class="card-add" data-action="modal-add-category"><div class="card-add-icon">+</div><p>Νέα Κατηγορία</p></div>`:''}
   </div>`;
 }
 
@@ -1569,7 +1597,7 @@ function renderProjects() {
   if (state.filter.status) filtered=filtered.filter(p=>p.status===state.filter.status);
   // Ταξινόμηση βάσει πρώτης προγραμματισμένης ημερομηνίας ανοιχτής εργασίας
   filtered = [...filtered].sort((a,b) => earliestActiveTaskDate(a).localeCompare(earliestActiveTaskDate(b)));
-  const canCreate = state.cu && state.cu.role !== 'client';
+  const canCreate = state.cu && ['admin','management','project_manager'].includes(state.cu.role);
   const statusTabs=[{k:'',l:'Όλα',n:vis.length},{k:'in_progress',l:'Σε εξέλιξη',n:vis.filter(p=>p.status==='in_progress').length},{k:'completed',l:'Ολοκληρωμένα',n:vis.filter(p=>p.status==='completed').length}];
   const cols = '2fr 1fr 1.5fr 110px 110px 30px';
   return `
@@ -2592,8 +2620,6 @@ async function doLogin() {
       return;
     }
 
-    // At the login screen state.db is loaded through the legacy/anon path,
-    // allowing us to route only already-mapped high-privilege roles to Auth.
     const user=state.db.users.find(u =>
       (u.username||'').toLowerCase()===identifier ||
       (u.email||'').toLowerCase()===identifier
@@ -2604,78 +2630,103 @@ async function doLogin() {
       return;
     }
 
-    if (TRANSITION_AUTH_ROLES.has(user.role)) {
-      if (!user.email) {
-        if(errEl){errEl.textContent='Ο λογαριασμός δεν έχει email Auth.';errEl.style.display='block';}
-        return;
-      }
-
-      const {error:loginError}=await sb.auth.signInWithPassword({
+    // Phase 2F: every role is Auth-eligible. Try Supabase Auth first.
+    let authError=null;
+    if (user.email) {
+      const authResult=await sb.auth.signInWithPassword({
         email:user.email,
         password
       });
-      if (loginError) {
-        if(errEl){errEl.textContent='Αποτυχία Supabase Auth. Ελέγξτε τον νέο κωδικό.';errEl.style.display='block';}
+      authError=authResult.error||null;
+
+      if (!authError) {
+        AUTH_MODE='supabase';
+        sessionStorage.removeItem('be_pm_user');
+
+        let profile=await loadCurrentAppUser().catch(()=>null);
+        if (!profile) {
+          const {data:claimed,error:claimError}=await sb.rpc('app_claim_my_profile');
+          if (claimError) {
+            await sb.auth.signOut({scope:'local'}).catch(()=>{});
+            AUTH_MODE='legacy';
+            throw claimError;
+          }
+          profile=claimed||await loadCurrentAppUser();
+        }
+
+        if (!profile || profile.id!==user.id) {
+          await sb.auth.signOut({scope:'local'}).catch(()=>{});
+          AUTH_MODE='legacy';
+          throw new Error('Ο Auth λογαριασμός δεν αντιστοιχεί στο αναμενόμενο ενεργό προφίλ.');
+        }
+
+        await loadFromDB();
+        state.cu=profile;
+        const idx=state.db.users.findIndex(u=>u.id===profile.id);
+        if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
+        state.view=profile.role==='client'?'client':'dashboard';
+
+        sb.rpc('app_touch_last_login').then(({error})=>{
+          if(error) console.warn('touch last login:',error);
+        });
+
+        initPresence();
+        initProjectsRealtime();
+        auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
+        render();
         return;
       }
+    }
 
-      AUTH_MODE='supabase';
-      sessionStorage.removeItem('be_pm_user');
-
-      const profile=await loadCurrentAppUser();
-      if (!profile || profile.id!==user.id || !TRANSITION_AUTH_ROLES.has(profile.role)) {
-        await sb.auth.signOut({scope:'local'}).catch(()=>{});
-        AUTH_MODE='legacy';
-        throw new Error('Ο Auth λογαριασμός δεν αντιστοιχεί στο αναμενόμενο ενεργό προφίλ.');
+    if (AUTH_REQUIRED_ROLES.has(user.role)) {
+      if(errEl){
+        errEl.textContent='Αποτυχία Supabase Auth. Ελέγξτε τον νέο κωδικό.';
+        errEl.style.display='block';
       }
-
-      await loadFromDB();
-      state.cu=profile;
-      const idx=state.db.users.findIndex(u=>u.id===profile.id);
-      if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
-      state.view=profile.role==='client'?'client':'dashboard';
-
-      sb.rpc('app_touch_last_login').then(({error})=>{if(error)console.warn('touch last login:',error);});
-      initPresence();
-      initProjectsRealtime();
-      auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
-      render();
       return;
     }
 
-    // Temporary legacy path for users not yet provisioned in Supabase Auth.
-    const isHashed = user.password && user.password.startsWith('$2');
-    let passwordOk = false;
+    // Temporary lower-role fallback until final cutover.
+    const isHashed=user.password && user.password.startsWith('$2');
+    let passwordOk=false;
+
     if (isHashed) {
-      passwordOk = dcodeIO.bcrypt.compareSync(password, user.password);
+      passwordOk=dcodeIO.bcrypt.compareSync(password,user.password);
     } else {
-      passwordOk = user.password === password;
+      passwordOk=user.password===password;
       if (passwordOk) {
-        user.password = dcodeIO.bcrypt.hashSync(password, 10);
+        user.password=dcodeIO.bcrypt.hashSync(password,10);
         dbSaveUser(user).catch(()=>{});
       }
     }
 
     if (!passwordOk) {
-      if(errEl){errEl.textContent='Λάθος username ή password.';errEl.style.display='block';}
+      if(errEl){
+        errEl.textContent=authError
+          ? 'Λάθος στοιχεία σύνδεσης ή ο λογαριασμός Auth δεν έχει ενεργοποιηθεί.'
+          : 'Λάθος username ή password.';
+        errEl.style.display='block';
+      }
       return;
     }
 
     AUTH_MODE='legacy';
-    user.lastLogin = nowTS();
+    user.lastLogin=nowTS();
     dbSaveUser(user).catch(()=>{});
     setCurrentUser(user);
     state.cu=user;
-    state.view = user.role==='client' ? 'client' : 'dashboard';
+    state.view=user.role==='client'?'client':'dashboard';
     initPresence();
     initProjectsRealtime();
     auditLog('Σύνδεση',`Ο χρήστης ${user.name} συνδέθηκε (legacy transition)`);
     render();
   } catch(err) {
-    console.error('doLogin error:', err);
+    console.error('doLogin error:',err);
     const errEl=el('login-err');
-    if(errEl){errEl.textContent='Σφάλμα σύνδεσης: '+(err.message||err);errEl.style.display='block';}
-    else showToast('Σφάλμα σύνδεσης: ' + (err.message||err), 'error');
+    if(errEl){
+      errEl.textContent='Σφάλμα σύνδεσης: '+(err.message||err);
+      errEl.style.display='block';
+    } else showToast('Σφάλμα σύνδεσης: '+(err.message||err),'error');
   }
 }
 
@@ -4743,7 +4794,16 @@ window.modalSaveProject=async function(catId){
   }
   const clientId=el('np-clientid').value; const clientName=el('np-client').value.trim()||(clientId?getUser(clientId)?.name:'')||'';
   const proj={id:'proj_'+uid(),categoryId:catId,code:el('np-code').value.trim(),name,clientId:clientId||null,clientName,managerIds,memberIds:[],status:'in_progress',startDate:el('np-start').value||today(),endDate:el('np-end')?.value||null,completedDate:null,phases};
-  if (clientId) { const cu2=getUser(clientId); if(cu2){cu2.projectIds=cu2.projectIds||[];if(!cu2.projectIds.includes(proj.id)){cu2.projectIds.push(proj.id);await dbSaveUser(cu2);}}}
+  if (clientId && !isSupabaseAuthMode()) {
+    const cu2=getUser(clientId);
+    if(cu2){
+      cu2.projectIds=cu2.projectIds||[];
+      if(!cu2.projectIds.includes(proj.id)){
+        cu2.projectIds.push(proj.id);
+        await dbSaveUser(cu2);
+      }
+    }
+  }
   state.db.projects.push(proj);
   auditLog('Δημιουργία έργου',name+(tpl?` (πρότυπο: ${tpl.name})`:''));
   await dbSaveProject(proj);
@@ -6393,7 +6453,7 @@ function _crmExtrasCo(co) {
 
 // ── CRM — COMPANIES LIST ───────────────────────────────────────
 function renderCrmCompanies() {
-  const canEdit = state.cu && state.cu.role !== 'client';
+  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const q = (state.crmSearch||'').toLowerCase();
   let companies = (state.db.crmCompanies||[]).filter(co=>{
     if (!q) return true;
@@ -6458,7 +6518,7 @@ function renderCrmCompanies() {
 function renderCrmCompany() {
   const co = (state.db.crmCompanies||[]).find(x=>x.id===state.crmCompanyId);
   if (!co) return `<div class="empty-state"><h3>Εταιρεία δεν βρέθηκε</h3></div>`;
-  const canEdit = state.cu && state.cu.role !== 'client';
+  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const phones = _crmPhonesList(co);
   const emails = _crmEmailsList(co);
   const addrs  = _crmAddrsList(co);
@@ -6529,7 +6589,7 @@ function renderCrmCompany() {
 
 // ── CRM — CONTACTS LIST ───────────────────────────────────────
 function renderCrmContacts() {
-  const canEdit = state.cu && state.cu.role !== 'client';
+  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const q = (state.crmContactSearch||'').toLowerCase();
   let contacts = (state.db.crmContacts||[]).filter(ct=>{
     if (!q) return true;
@@ -6586,7 +6646,7 @@ function renderCrmContacts() {
 function renderCrmContact() {
   const ct = (state.db.crmContacts||[]).find(x=>x.id===state.crmContactId);
   if (!ct) return `<div class="empty-state"><h3>Επαφή δεν βρέθηκε</h3></div>`;
-  const canEdit = state.cu && state.cu.role !== 'client';
+  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const phones = _crmPhones(ct);
   const emails = _crmEmails(ct);
   const company = (state.db.crmCompanies||[]).find(co=>co.id===ct.company_id);
@@ -6898,7 +6958,7 @@ window.setTaskRankManual = async function(pid, phid, tid, total) {
 };
 
 function renderOffers() {
-  const canEdit = state.cu && state.cu.role !== 'client';
+  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const q = (state.offersSearch||'').toLowerCase();
   const stFilter = state.offersStatus||'';
   let offers = (state.db.offers||[]).filter(o=>{
@@ -7438,9 +7498,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     if(sessionError) throw sessionError;
 
     if (session) {
-      // Only already-mapped transition roles use Auth at this stage.
-      const profile=await loadCurrentAppUser().catch(()=>null);
-      if (profile && TRANSITION_AUTH_ROLES.has(profile.role)) {
+      let profile=await loadCurrentAppUser().catch(()=>null);
+
+      if (!profile) {
+        try {
+          const {data:claimed,error:claimError}=await sb.rpc('app_claim_my_profile');
+          if(!claimError) profile=claimed||await loadCurrentAppUser().catch(()=>null);
+        } catch(e) {}
+      }
+
+      if (profile) {
         AUTH_MODE='supabase';
         sessionStorage.removeItem('be_pm_user');
         await loadFromDB();
@@ -7448,35 +7515,37 @@ document.addEventListener('DOMContentLoaded', async () => {
         const idx=state.db.users.findIndex(u=>u.id===profile.id);
         if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
         state.view=profile.role==='client'?'client':'dashboard';
-        initPresence(); initProjectsRealtime();
+        initPresence();
+        initProjectsRealtime();
       } else {
-        // Orphan/unmapped/test Auth sessions must not break the legacy users.
         await sb.auth.signOut({scope:'local'}).catch(()=>{});
         AUTH_MODE='legacy';
         state.cu=null;
         await loadFromDB();
 
         const legacy=getCurrentUser();
-        if (legacy && !TRANSITION_AUTH_ROLES.has(legacy.role)) {
+        if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
           const fresh=state.db.users.find(u=>u.id===legacy.id);
-          if(fresh){state.cu=fresh;state.view=fresh.role==='client'?'client':'dashboard';initPresence();initProjectsRealtime();}
-          else clearCurrentUser();
-        } else {
-          clearCurrentUser();
-        }
+          if(fresh){
+            state.cu=fresh;
+            state.view=fresh.role==='client'?'client':'dashboard';
+            initPresence();
+            initProjectsRealtime();
+          } else clearCurrentUser();
+        } else clearCurrentUser();
       }
     } else {
       AUTH_MODE='legacy';
       await loadFromDB();
 
-      // Never restore Admin/Management from the old sessionStorage login.
       const legacy=getCurrentUser();
-      if (legacy && !TRANSITION_AUTH_ROLES.has(legacy.role)) {
+      if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
         const fresh=state.db.users.find(u=>u.id===legacy.id);
         if(fresh){
           state.cu=fresh;
           state.view=fresh.role==='client'?'client':'dashboard';
-          initPresence(); initProjectsRealtime();
+          initPresence();
+          initProjectsRealtime();
         } else {
           clearCurrentUser();
           state.cu=null;
