@@ -63,8 +63,8 @@ let AUTH_MODE = 'legacy'; // 'legacy' | 'supabase'
 
 function emptyDbState() {
   return {
-    users:[], categories:[], projects:[], auditLog:[],
-    templates:[], timesheets:[], projectTypes:[], clientCalendar:[],
+    users:[], categories:[], timesheetCategories:[], projects:[], auditLog:[],
+    templates:[], timesheets:[], clientCalendar:[],
     crmCompanies:[], crmContacts:[], offers:[]
   };
 }
@@ -79,17 +79,138 @@ async function loadCurrentAppUser() {
   return data || null;
 }
 
+async function fetchAllTimesheets() {
+  const pageSize = 5000;
+  let from = 0;
+  const rows = [];
+
+  while (true) {
+    const {data, error} = await sb
+      .from('be_timesheets')
+      .select('data')
+      .order('id', {ascending:false})
+      .range(from, from + pageSize - 1);
+
+    if (error) return {data:null, error};
+    const batch = data || [];
+    rows.push(...batch);
+
+    if (batch.length < pageSize) break;
+    from += pageSize;
+  }
+
+  return {data:rows, error:null};
+}
+
+async function fetchTimesheetCategoryDirectory() {
+  if (!isSupabaseAuthMode()) return {data:null, error:null};
+  return sb.rpc('app_timesheet_category_directory');
+}
+
+
+let _tsLoadToken=0;
+
+async function loadTimesheetPage(page=1) {
+  page=Math.max(1,parseInt(page||1,10));
+  if(!isSupabaseAuthMode()) {
+    state.tsPage=page; state.tsLoaded=true; state.tsLoading=false;
+    if(state.view==='timesheet') render();
+    return;
+  }
+
+  const token=++_tsLoadToken;
+  state.tsLoading=true;
+  if(state.view==='timesheet') render();
+
+  const {data,error}=await sb.rpc('app_timesheet_page',{
+    p_page:page,
+    p_page_size:100,
+    p_user_id:state.tsFilterUser||null,
+    p_project_id:state.tsFilterProj||null,
+    p_date_from:state.tsFilterFrom||null,
+    p_date_to:state.tsFilterTo||null,
+    p_sort_key:state.tsSortKey||'date',
+    p_sort_dir:state.tsSortDir||'desc'
+  });
+
+  if(token!==_tsLoadToken) return;
+  if(error) {
+    state.tsLoading=false; state.tsLoaded=true;
+    console.error('Timesheet page load:',error);
+    showToast('Σφάλμα φόρτωσης Timesheet: '+(error.message||error),'error');
+    if(state.view==='timesheet') render();
+    return;
+  }
+
+  const totalCount=Number(data?.totalCount||0);
+  const maxPage=Math.max(1,Math.ceil(totalCount/100));
+  if(page>maxPage && totalCount>0) {
+    state.tsLoading=false;
+    return loadTimesheetPage(maxPage);
+  }
+
+  state.db.timesheets=Array.isArray(data?.rows)?data.rows:[];
+  state.tsPage=page;
+  state.tsTotalCount=totalCount;
+  state.tsTotalHours=Number(data?.totalHours||0);
+  state.tsLoaded=true;
+  state.tsLoading=false;
+  if(state.view==='timesheet') render();
+}
+
+window.setTimesheetFilter=function(key,value){
+  const fields={user:'tsFilterUser',project:'tsFilterProj',from:'tsFilterFrom',to:'tsFilterTo'};
+  if(!fields[key]) return;
+  state[fields[key]]=value||'';
+  state.tsPage=1;
+  if(isSupabaseAuthMode()) loadTimesheetPage(1); else render();
+};
+
+window.clearTimesheetFilters=function(){
+  state.tsFilterUser=''; state.tsFilterProj=''; state.tsFilterFrom=''; state.tsFilterTo=''; state.tsPage=1;
+  if(isSupabaseAuthMode()) loadTimesheetPage(1); else render();
+};
+
+window.goTimesheetPage=function(page){
+  page=Math.max(1,parseInt(page||1,10));
+  if(isSupabaseAuthMode()) loadTimesheetPage(page); else {state.tsPage=page;render();}
+};
+
+async function refreshTimesheetAfterMutation(page=null){
+  if(isSupabaseAuthMode()) await loadTimesheetPage(page||state.tsPage||1); else render();
+}
+
+async function fetchTimesheetRowsForBilling(projectId,dateFrom,dateTo){
+  if(!isSupabaseAuthMode()) {
+    return (state.db.timesheets||[]).filter(e=>e.projectId===projectId&&e.date>=dateFrom&&e.date<=dateTo);
+  }
+  const all=[]; let page=1;
+  while(true){
+    const {data,error}=await sb.rpc('app_timesheet_page',{
+      p_page:page,p_page_size:500,p_user_id:null,p_project_id:projectId,
+      p_date_from:dateFrom,p_date_to:dateTo,p_sort_key:'date',p_sort_dir:'asc'
+    });
+    if(error) throw error;
+    const rows=Array.isArray(data?.rows)?data.rows:[];
+    all.push(...rows);
+    const total=Number(data?.totalCount||0);
+    if(all.length>=total||rows.length===0) break;
+    page++;
+  }
+  return all;
+}
+
 async function loadFromDB() {
   try {
     if (isSupabaseAuthMode()) {
-      const [u, c, p, a, t, ts, pt, cc, comp, cont, off] = await Promise.all([
+      const [u, c, p, a, t, ts, tc, cc, comp, cont, off] = await Promise.all([
         sb.rpc('app_user_directory'),
         sb.from('be_categories').select('data'),
         sb.from('be_projects').select('data'),
         sb.from('be_audit_log').select('data').order('ts', {ascending:false}).limit(200),
         sb.from('be_templates').select('data'),
-        sb.from('be_timesheets').select('data').order('id', {ascending:false}),
-        sb.from('be_project_types').select('data'),
+        Promise.resolve({data:[], error:null}),
+        fetchTimesheetCategoryDirectory(),
         sb.from('be_client_calendar').select('data').order('id', {ascending:false}),
         sb.rpc('app_crm_companies_safe'),
         sb.rpc('app_crm_contacts_safe'),
@@ -98,7 +219,7 @@ async function loadFromDB() {
 
       for (const [label,res] of Object.entries({
         users:u,categories:c,projects:p,audit:a,templates:t,
-        timesheets:ts,projectTypes:pt,clientCalendar:cc,companies:comp,contacts:cont,offers:off
+        timesheets:ts,timesheetCategories:tc,clientCalendar:cc,companies:comp,contacts:cont,offers:off
       })) {
         if (res?.error) throw new Error(`${label}: ${res.error.message||res.error}`);
       }
@@ -106,11 +227,11 @@ async function loadFromDB() {
       state.db = {
         users:           (u.data||[]).map(r=>r.data ?? r),
         categories:      (c.data||[]).map(r=>r.data),
+        timesheetCategories: (tc.data||[]).map(r=>({id:r.category_id, name:r.category_name})),
         projects:        (p.data||[]).map(r=>r.data),
         auditLog:        (a.data||[]).map(r=>r.data),
         templates:       (t.data||[]).map(r=>r.data),
         timesheets:      (ts.data||[]).map(r=>r.data),
-        projectTypes:    (pt.data||[]).map(r=>r.data).sort((a,b)=>(a.name||'').localeCompare(b.name||'','el')),
         clientCalendar:  (cc.data||[]).map(r=>r.data),
         crmCompanies:    (comp.data||[]).map(r=>r.data ?? r),
         crmContacts:     (cont.data||[]).map(r=>r.data ?? r),
@@ -118,14 +239,13 @@ async function loadFromDB() {
       };
     } else {
       // Temporary legacy loader for users not yet migrated to Supabase Auth.
-      const [u, c, p, a, t, ts, pt, cc, comp, cont, off] = await Promise.all([
+      const [u, c, p, a, t, ts, cc, comp, cont, off] = await Promise.all([
         sb.from('be_users').select('data'),
         sb.from('be_categories').select('data'),
         sb.from('be_projects').select('data'),
         sb.from('be_audit_log').select('data').order('ts', {ascending:false}).limit(200),
         sb.from('be_templates').select('data'),
-        sb.from('be_timesheets').select('data').order('id', {ascending:false}),
-        sb.from('be_project_types').select('data'),
+        fetchAllTimesheets(),
         sb.from('be_client_calendar').select('data').order('id', {ascending:false}),
         sb.from('companies').select('*').is('deleted_at', null).order('company_name').limit(10000),
         sb.from('contacts').select('*').is('deleted_at', null).order('last_name').limit(10000),
@@ -134,7 +254,7 @@ async function loadFromDB() {
 
       for (const [label,res] of Object.entries({
         users:u,categories:c,projects:p,audit:a,templates:t,
-        timesheets:ts,projectTypes:pt,clientCalendar:cc,companies:comp,contacts:cont,offers:off
+        timesheets:ts,clientCalendar:cc,companies:comp,contacts:cont,offers:off
       })) {
         if (res?.error) throw new Error(`${label}: ${res.error.message||res.error}`);
       }
@@ -142,11 +262,11 @@ async function loadFromDB() {
       state.db = {
         users:           (u.data||[]).map(r=>r.data),
         categories:      (c.data||[]).map(r=>r.data),
+        timesheetCategories: (c.data||[]).map(r=>r.data).map(cat=>({id:cat.id,name:cat.name})),
         projects:        (p.data||[]).map(r=>r.data),
         auditLog:        (a.data||[]).map(r=>r.data),
         templates:       (t.data||[]).map(r=>r.data),
         timesheets:      (ts.data||[]).map(r=>r.data),
-        projectTypes:    (pt.data||[]).map(r=>r.data).sort((a,b)=>(a.name||'').localeCompare(b.name||'','el')),
         clientCalendar:  (cc.data||[]).map(r=>r.data),
         crmCompanies:    comp.data||[],
         crmContacts:     cont.data||[],
@@ -760,6 +880,18 @@ const state = {
   offersStatus: '',
   ccalSort: 'date-asc',
   dashFilter: null, // 'all' | 'in_progress' | 'on_hold' | 'completed' | 'pending_docs'
+  tsPage: 1,
+  tsPageSize: 100,
+  tsTotalCount: 0,
+  tsTotalHours: 0,
+  tsLoaded: false,
+  tsLoading: false,
+  tsFilterUser: '',
+  tsFilterProj: '',
+  tsFilterFrom: '',
+  tsFilterTo: '',
+  tsSortKey: 'date',
+  tsSortDir: 'desc',
 };
 
 // ── PRESENCE ──────────────────────────────────────────────────────
@@ -888,11 +1020,16 @@ function sortByCode(projects) {
 function sortByName(arr, key='name') {
   return [...arr].sort((a,b) => (a[key]||'').localeCompare(b[key]||'', 'el'));
 }
-function buildTsProjectOptions(regularProjects, selectedId='') {
+function buildTsProjectOptions(regularProjects, selectedId='', selectedName='') {
   const standing = getStandingProjects(); // already sorted A-Z by name
   const regular  = sortByCode(regularProjects.filter(p=>!p.standing));
   const opt = p => `<option value="${p.id}" ${p.id===selectedId?'selected':''}>${p.code ? esc(p.code+' – '+p.name) : esc(p.name)}</option>`;
+  const knownSelected = [...standing,...regular].some(p=>p.id===selectedId);
+  const historical = selectedId && !knownSelected
+    ? `<optgroup label="── Ιστορικό Έργο ──"><option value="${esc(selectedId)}" selected>${esc(selectedName||selectedId)}</option></optgroup>`
+    : '';
   return `<option value="">— Επιλέξτε έργο —</option>`
+    + historical
     + (standing.length ? `<optgroup label="── Μόνιμα Έργα ──">${standing.map(opt).join('')}</optgroup>` : '')
     + `<optgroup label="── Ενεργά Έργα ──">${regular.map(opt).join('')}</optgroup>`;
 }
@@ -1061,6 +1198,11 @@ function navigate(view, opts={}) {
   if (opts.crmCompanyId!==undefined) state.crmCompanyId=opts.crmCompanyId;
   if (opts.crmContactId!==undefined) state.crmContactId=opts.crmContactId;
   render();
+  if(view==='timesheet' && isSupabaseAuthMode()) {
+    state.tsLoaded=false;
+    state.tsPage=1;
+    loadTimesheetPage(1);
+  }
   // Load storage stats for admin/management on dashboard
   if (view==='dashboard' && state.cu && ['admin','management'].includes(state.cu.role)) {
     loadStorageStats();
@@ -1073,6 +1215,7 @@ function render() {
     const main=el('main-content');
     if (!main) return;
     const loggedIn = !!state.cu;
+    main.classList.toggle('ts-fullwidth-page', loggedIn && state.view==='timesheet');
     const sidebar  = document.querySelector('.sidebar');
     const mainWrap = document.querySelector('.main-wrap');
 
@@ -1991,220 +2134,241 @@ function renderClientPortal() {
 }
 
 // ── VIEW: TIMESHEET ───────────────────────────────────────────────
-function getProjectType(typeId) {
-  return (state.db.projectTypes||[]).find(t=>t.id===typeId) || null;
-}
-
-function activeProjectTypes() {
-  return [...(state.db.projectTypes||[])]
-    .filter(t=>t.active!==false)
+function timesheetCategoryList() {
+  const source = (state.db.timesheetCategories||[]).length
+    ? state.db.timesheetCategories
+    : (state.db.categories||[]).map(c=>({id:c.id,name:c.name}));
+  return [...source]
+    .filter(c=>c?.id && c?.name)
     .sort((a,b)=>(a.name||'').localeCompare(b.name||'','el',{sensitivity:'base'}));
 }
 
-function buildProjectTypeOptions(selectedId='', allowBlank=true) {
-  const active = activeProjectTypes();
-  const selected = selectedId ? getProjectType(selectedId) : null;
-  let opts = allowBlank ? `<option value="">— Επιλογή Είδους Έργου —</option>` : '';
-  if (selected && selected.active===false) {
-    opts += `<option value="${selected.id}" selected>${esc(selected.name)} (ανενεργό)</option>`;
-  }
-  opts += active.map(t=>`<option value="${t.id}" ${t.id===selectedId?'selected':''}>${esc(t.name)}</option>`).join('');
-  return opts;
+function getTimesheetCategory(categoryId) {
+  return timesheetCategoryList().find(c=>c.id===categoryId) || null;
+}
+
+function buildTimesheetCategoryOptions(selectedId='', allowBlank=true) {
+  const cats=timesheetCategoryList();
+  let html=allowBlank ? `<option value="">— Επιλογή —</option>` : '';
+  html += cats.map(c=>`<option value="${c.id}" ${c.id===selectedId?'selected':''}>${esc(c.name)}</option>`).join('');
+  return html;
 }
 
 function timesheetProjectName(entry) {
-  const proj = getProject(entry?.projectId);
+  const proj=getProject(entry?.projectId);
   return proj?.name || entry?.projectName || '';
 }
 
-function timesheetTypeName(entry) {
-  const type = getProjectType(entry?.projectTypeId);
-  return type?.name || entry?.projectTypeName || '';
+function timesheetCategoryName(entry) {
+  const live=getTimesheetCategory(entry?.projectCategoryId);
+  return live?.name || entry?.projectCategoryName || '';
 }
 
-window.hydrateTimesheetTypeSelect = function(sel, selectedId='') {
-  if (!sel || sel.dataset.hydrated==='1') return;
-  sel.innerHTML = buildProjectTypeOptions(selectedId, true);
-  sel.value = selectedId || '';
+window.hydrateTimesheetCategorySelect = function(sel, selectedId='') {
+  if(!sel || sel.dataset.hydrated==='1') return;
+  sel.innerHTML=buildTimesheetCategoryOptions(selectedId,true);
+  sel.value=selectedId||'';
   sel.dataset.hydrated='1';
 };
 
-window.setTimesheetProjectType = async function(eid, typeId) {
-  const entry=(state.db.timesheets||[]).find(e=>e.id===eid);
+window.setTimesheetCategory = async function(entryId, categoryId) {
+  const entry=(state.db.timesheets||[]).find(e=>e.id===entryId);
   if(!entry) return;
-
   const cu=state.cu;
   const canEdit=['admin','management'].includes(cu?.role) || entry.userId===cu?.id;
-  if(!canEdit) {
+  if(!canEdit){
     showToast('Δεν έχετε δικαίωμα αλλαγής αυτής της εγγραφής.','error');
     render();
     return;
   }
 
-  const type=typeId ? getProjectType(typeId) : null;
-  entry.projectTypeId = type?.id || null;
-  entry.projectTypeName = type?.name || null;
+  const cat=categoryId ? getTimesheetCategory(categoryId) : null;
+  entry.projectCategoryId=cat?.id || null;
+  entry.projectCategoryName=cat?.name || null;
 
-  try {
+  try{
     await dbSaveTimesheet(entry);
-    showToast(type ? `Είδος έργου: ${type.name}` : 'Το είδος έργου αφαιρέθηκε.','success');
-  } catch(err) {
+    showToast(cat ? `Είδος έργου: ${cat.name}` : 'Το είδος έργου έμεινε κενό.','success');
+  }catch(err){
     console.error(err);
     await loadFromDB().catch(()=>{});
     render();
   }
 };
 
-window.setTimesheetSort = function(key) {
-  if (!['date','project'].includes(key)) return;
-  if (state.tsSortKey===key) {
-    state.tsSortDir = state.tsSortDir==='asc' ? 'desc' : 'asc';
-  } else {
-    state.tsSortKey=key;
-    state.tsSortDir=key==='date' ? 'desc' : 'asc';
-  }
-  render();
+window.syncTsCategoryFromProject = function(prefix) {
+  const projectId=el(prefix+'-projectId')?.value;
+  const select=el(prefix+'-categoryId');
+  if(!select) return;
+  const proj=getProject(projectId);
+  const categoryId=proj?.categoryId || '';
+  select.value=getTimesheetCategory(categoryId) ? categoryId : '';
 };
 
+window.setTimesheetSort = function(key) {
+  if(!['date','project'].includes(key)) return;
+  if(state.tsSortKey===key){
+    state.tsSortDir=state.tsSortDir==='asc'?'desc':'asc';
+  }else{
+    state.tsSortKey=key;
+    state.tsSortDir=key==='date'?'desc':'asc';
+  }
+  state.tsPage=1;
+  if(isSupabaseAuthMode()) loadTimesheetPage(1); else render();
+};
+
+function ensureTimesheetLayoutStyle() {
+  if(document.getElementById('be-timesheet-layout-style')) return;
+  const style=document.createElement('style');
+  style.id='be-timesheet-layout-style';
+  style.textContent=`
+    .page-content.ts-fullwidth-page{
+      max-width:none !important;
+      width:100% !important;
+      box-sizing:border-box;
+      padding-left:16px;
+      padding-right:16px;
+    }
+    .ts-table-wrap.ts-fluid-wrap{
+      width:100%;
+      overflow-x:auto;
+    }
+    .ts-table.ts-fluid-table{
+      width:100%;
+      table-layout:fixed;
+      border-collapse:collapse;
+    }
+    .ts-table.ts-fluid-table th{
+      padding:7px 8px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .ts-table.ts-fluid-table td{
+      padding:6px 8px;
+      line-height:1.22;
+      overflow:hidden;
+    }
+    .ts-two-line{
+      display:-webkit-box;
+      -webkit-box-orient:vertical;
+      -webkit-line-clamp:2;
+      line-clamp:2;
+      overflow:hidden;
+      line-height:1.22;
+      max-height:2.44em;
+      word-break:break-word;
+    }
+    .ts-category-select{
+      width:100%;
+      min-width:0;
+      height:30px;
+      padding:4px 22px 4px 6px;
+      font-size:.72rem;
+      text-overflow:ellipsis;
+    }
+    .ts-actions-cell{
+      display:flex;
+      gap:3px;
+      justify-content:flex-end;
+      align-items:center;
+      white-space:nowrap;
+    }
+    @media(max-width:900px){
+      .ts-table.ts-fluid-table{min-width:900px;}
+      .page-content.ts-fullwidth-page{padding-left:10px;padding-right:10px;}
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 function renderTimesheet() {
-  if (!state.cu || state.cu.role === 'client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
-  const cu = state.cu;
-  const isAdminOrMgmt = ['admin','management'].includes(cu.role);
+  ensureTimesheetLayoutStyle();
+  if(!state.cu || state.cu.role==='client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  const cu=state.cu;
+  const isAdminOrMgmt=['admin','management'].includes(cu.role);
 
-  let entries = (state.db.timesheets || []);
-  if (!isAdminOrMgmt) entries = entries.filter(e => e.userId === cu.id);
+  if(isSupabaseAuthMode() && !state.tsLoaded){
+    return `<div class="page-hd"><div><h1>Timesheet</h1><div class="page-hd-sub">Φόρτωση δεδομένων...</div></div></div>
+      <div style="padding:48px 20px;text-align:center;color:var(--muted);font-size:.9rem">Φόρτωση των πρώτων 100 εγγραφών…</div>`;
+  }
 
-  const filterUser = state.tsFilterUser || '';
-  const filterProj = state.tsFilterProj || '';
-  const filterFrom = state.tsFilterFrom || '';
-  const filterTo   = state.tsFilterTo   || '';
-  if (filterUser) entries = entries.filter(e => e.userId === filterUser);
-  if (filterProj) entries = entries.filter(e => e.projectId === filterProj);
-  if (filterFrom) entries = entries.filter(e => e.date >= filterFrom);
-  if (filterTo)   entries = entries.filter(e => e.date <= filterTo);
-
+  const filterUser=state.tsFilterUser||'';
+  const filterProj=state.tsFilterProj||'';
+  const filterFrom=state.tsFilterFrom||'';
+  const filterTo=state.tsFilterTo||'';
   const sortKey=state.tsSortKey||'date';
   const sortDir=state.tsSortDir||'desc';
-  const dir=sortDir==='asc'?1:-1;
-  const collator=new Intl.Collator('el',{sensitivity:'base',numeric:true});
+  const pageSize=100;
+  let page=state.tsPage||1;
+  let entries=[...(state.db.timesheets||[])];
+  let totalCount=0,totalHours=0;
 
-  entries=[...entries].sort((a,b)=>{
-    if(sortKey==='project'){
-      const p=collator.compare(timesheetProjectName(a),timesheetProjectName(b));
-      if(p!==0) return p*dir;
-      const d=String(b.date||'').localeCompare(String(a.date||''));
-      if(d!==0) return d;
-      return String(a.timeFrom||'').localeCompare(String(b.timeFrom||''));
-    }
-    const d=String(a.date||'').localeCompare(String(b.date||''));
-    if(d!==0) return d*dir;
-    const t=String(a.timeFrom||'').localeCompare(String(b.timeFrom||''));
-    if(t!==0) return t*dir;
-    return collator.compare(timesheetProjectName(a),timesheetProjectName(b));
-  });
+  if(isSupabaseAuthMode()){
+    totalCount=Number(state.tsTotalCount||0);
+    totalHours=Number(state.tsTotalHours||0);
+  }else{
+    if(!isAdminOrMgmt) entries=entries.filter(e=>e.userId===cu.id);
+    if(filterUser) entries=entries.filter(e=>e.userId===filterUser);
+    if(filterProj) entries=entries.filter(e=>e.projectId===filterProj);
+    if(filterFrom) entries=entries.filter(e=>e.date>=filterFrom);
+    if(filterTo) entries=entries.filter(e=>e.date<=filterTo);
+    const collator=new Intl.Collator('el',{sensitivity:'base',numeric:true});
+    const dir=sortDir==='asc'?1:-1;
+    entries.sort((a,b)=>{
+      if(sortKey==='project'){
+        const p=collator.compare(timesheetProjectName(a),timesheetProjectName(b));
+        if(p!==0) return p*dir;
+        return String(b.date||'').localeCompare(String(a.date||''));
+      }
+      const d=String(a.date||'').localeCompare(String(b.date||''));
+      if(d!==0) return d*dir;
+      return String(a.timeFrom||'').localeCompare(String(b.timeFrom||''))*dir;
+    });
+    totalCount=entries.length;
+    totalHours=entries.reduce((s,e)=>s+(parseFloat(e.hours)||0),0);
+    const maxPage=Math.max(1,Math.ceil(totalCount/pageSize));
+    page=Math.min(page,maxPage); state.tsPage=page;
+    entries=entries.slice((page-1)*pageSize,page*pageSize);
+  }
 
-  const totalHours = entries.reduce((s,e) => s + (parseFloat(e.hours)||0), 0);
-  const hasFilter = filterUser || filterProj || filterFrom || filterTo;
+  const totalPages=Math.max(1,Math.ceil(totalCount/pageSize));
+  const rangeFrom=totalCount?((page-1)*pageSize)+1:0;
+  const rangeTo=totalCount?Math.min(page*pageSize,totalCount):0;
+  const hasFilter=filterUser||filterProj||filterFrom||filterTo;
 
-  const userOpts = isAdminOrMgmt
-    ? `<select class="form-control" style="max-width:170px;font-size:.8rem" onchange="state.tsFilterUser=this.value;render()">
-        <option value="">Όλοι οι χρήστες</option>
-        ${sortByName(state.db.users.filter(u=>u.role!=='client')).map(u=>`<option value="${u.id}" ${filterUser===u.id?'selected':''}>${esc(u.name)}</option>`).join('')}
-      </select>` : '';
+  const userOpts=isAdminOrMgmt?`<select class="form-control" style="max-width:165px;font-size:.79rem" onchange="setTimesheetFilter('user',this.value)">
+    <option value="">Όλοι οι χρήστες</option>${sortByName(state.db.users.filter(u=>u.role!=='client')).map(u=>`<option value="${u.id}" ${filterUser===u.id?'selected':''}>${esc(u.name)}</option>`).join('')}</select>`:'';
 
-  const myProjects = isAdminOrMgmt ? state.db.projects : visibleProjects();
-  const standingProjs = getStandingProjects();
-  const regularProjs = sortByCode(myProjects.filter(p=>!p.standing));
-  const filterOpt = p => `<option value="${p.id}" ${filterProj===p.id?'selected':''}>${p.code ? esc(p.code+' – '+p.name) : esc(p.name)}</option>`;
-  const projOpts = `<select class="form-control" style="max-width:190px;font-size:.8rem" onchange="state.tsFilterProj=this.value;render()">
-    <option value="">Όλα τα έργα</option>
-    ${standingProjs.length ? `<optgroup label="── Μόνιμα Έργα ──">${standingProjs.map(filterOpt).join('')}</optgroup>` : ''}
-    <optgroup label="── Ενεργά Έργα ──">${regularProjs.map(filterOpt).join('')}</optgroup>
-  </select>`;
+  const myProjects=isAdminOrMgmt?state.db.projects:visibleProjects();
+  const standingProjs=getStandingProjects();
+  const regularProjs=sortByCode(myProjects.filter(p=>!p.standing));
+  const filterOpt=p=>`<option value="${p.id}" ${filterProj===p.id?'selected':''}>${p.code?esc(p.code+' – '+p.name):esc(p.name)}</option>`;
+  const projOpts=`<select class="form-control" style="max-width:215px;font-size:.79rem" onchange="setTimesheetFilter('project',this.value)">
+    <option value="">Όλα τα έργα</option>${standingProjs.length?`<optgroup label="── Μόνιμα Έργα ──">${standingProjs.map(filterOpt).join('')}</optgroup>`:''}<optgroup label="── Τρέχοντα Έργα ──">${regularProjs.map(filterOpt).join('')}</optgroup></select>`;
 
-  const dateOpts = `
-    <div style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap">
-      <span style="font-size:.78rem;color:var(--muted);white-space:nowrap">Από</span>
-      <input type="date" class="form-control" style="max-width:145px;font-size:.8rem" value="${filterFrom}" onchange="state.tsFilterFrom=this.value;render()">
-      <span style="font-size:.78rem;color:var(--muted);white-space:nowrap">Έως</span>
-      <input type="date" class="form-control" style="max-width:145px;font-size:.8rem" value="${filterTo}" onchange="state.tsFilterTo=this.value;render()">
-    </div>`;
+  const dateOpts=`<div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap"><span style="font-size:.76rem;color:var(--muted)">Από</span>
+    <input type="date" class="form-control" style="max-width:136px;font-size:.78rem" value="${filterFrom}" onchange="setTimesheetFilter('from',this.value)">
+    <span style="font-size:.76rem;color:var(--muted)">Έως</span><input type="date" class="form-control" style="max-width:136px;font-size:.78rem" value="${filterTo}" onchange="setTimesheetFilter('to',this.value)"></div>`;
 
-  const sortArrow=key=>{
-    if(sortKey!==key) return '<span style="opacity:.35;margin-left:4px">↕</span>';
-    return `<span style="margin-left:4px">${sortDir==='asc'?'▲':'▼'}</span>`;
-  };
+  const sortArrow=key=>sortKey!==key?'<span style="opacity:.35;margin-left:3px">↕</span>':`<span style="margin-left:3px">${sortDir==='asc'?'▲':'▼'}</span>`;
 
-  const rows = entries.map(e => {
-    const canDel = isAdminOrMgmt || e.userId === cu.id;
-    const canEditType = canDel;
-    const timeRange = e.timeFrom && e.timeTo ? `<div style="font-size:.74rem;color:var(--muted)">${e.timeFrom}–${e.timeTo}</div>` : '';
-    const projName = timesheetProjectName(e) || '—';
-    const typeName = timesheetTypeName(e);
-    const typeCell = canEditType
-      ? `<select class="form-control" style="min-width:160px;max-width:210px;font-size:.76rem;padding:5px 24px 5px 7px"
-            data-hydrated="0"
-            onfocus="hydrateTimesheetTypeSelect(this,'${esc(e.projectTypeId||'')}')"
-            onchange="setTimesheetProjectType('${e.id}',this.value)">
-          <option value="${esc(e.projectTypeId||'')}" selected>${esc(typeName||'— Επιλογή —')}</option>
-        </select>`
-      : `<span style="font-size:.78rem;color:var(--steel);font-weight:600">${esc(typeName||'—')}</span>`;
+  // Target proportions: 100 / 160 / 300 / 120 / 75 / 300 / 70 / 100 / 90.
+  const colgroup=isAdminOrMgmt?`<colgroup>
+    <col style="width:7.60%"><col style="width:12.17%"><col style="width:22.81%"><col style="width:9.13%"><col style="width:5.70%"><col style="width:22.81%"><col style="width:5.32%"><col style="width:7.60%"><col style="width:6.84%">
+    </colgroup>`:`<colgroup><col style="width:8.66%"><col style="width:25.97%"><col style="width:10.39%"><col style="width:6.49%"><col style="width:25.97%"><col style="width:6.06%"><col style="width:8.66%"><col style="width:7.79%"></colgroup>`;
 
-    return `<tr>
-      <td style="font-size:.82rem;white-space:nowrap">${esc(e.date)}${timeRange}</td>
-      ${isAdminOrMgmt ? `<td style="font-size:.82rem">${esc(e.userName||'—')}</td>` : ''}
-      <td style="font-size:.82rem">${esc(projName)}</td>
-      <td>${typeCell}</td>
-      <td style="font-size:.82rem;font-weight:700;color:var(--navy);text-align:center">${parseFloat(e.hours||0).toFixed(1)}h</td>
-      <td style="font-size:.78rem;color:var(--muted)">${esc(e.desc||'—')}</td>
-      <td style="font-size:.82rem;text-align:center;color:var(--navy)">${e.km ? `${e.km} χλμ.` : '<span style="color:var(--muted)">—</span>'}</td>
-      <td style="font-size:.78rem;color:var(--muted);max-width:200px;white-space:pre-wrap;word-break:break-word;max-height:80px;overflow-y:auto">${e.comments ? esc(e.comments) : '—'}</td>
-      <td style="text-align:right;white-space:nowrap;display:flex;gap:4px;justify-content:flex-end">
-        ${canDel ? `<button class="btn btn-ghost btn-sm" data-action="modal-edit-timesheet" data-eid="${e.id}">✏</button>` : ''}
-        ${canDel ? `<button class="btn btn-danger btn-icon btn-sm" data-action="delete-timesheet" data-eid="${e.id}">✕</button>` : ''}
-      </td>
-    </tr>`;
+  const rows=entries.map(e=>{
+    const canEdit=isAdminOrMgmt||e.userId===cu.id;
+    const timeRange=e.timeFrom&&e.timeTo?`<div style="font-size:.68rem;color:var(--muted);margin-top:2px">${esc(e.timeFrom)}–${esc(e.timeTo)}</div>`:'';
+    const projectName=timesheetProjectName(e)||'—';
+    const categoryName=timesheetCategoryName(e);
+    const categoryCell=canEdit?`<select class="form-control ts-category-select" data-hydrated="0" title="${esc(categoryName||'Επιλογή Είδους Έργου')}" onfocus="hydrateTimesheetCategorySelect(this,'${esc(e.projectCategoryId||'')}')" onchange="setTimesheetCategory('${e.id}',this.value)"><option value="${esc(e.projectCategoryId||'')}" selected>${esc(categoryName||'—')}</option></select>`:`<div class="ts-two-line" title="${esc(categoryName||'')}">${esc(categoryName||'—')}</div>`;
+    return `<tr><td style="font-size:.76rem;white-space:nowrap">${esc(e.date)}${timeRange}</td>${isAdminOrMgmt?`<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(e.userName||'')}">${esc(e.userName||'—')}</div></td>`:''}<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(projectName)}">${esc(projectName)}</div></td><td>${categoryCell}</td><td style="font-size:.76rem;font-weight:700;color:var(--navy);text-align:center">${parseFloat(e.hours||0).toFixed(1)}h</td><td style="font-size:.74rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.desc||'')}">${esc(e.desc||'—')}</div></td><td style="font-size:.75rem;text-align:center;color:var(--navy);white-space:nowrap">${e.km?`${e.km} χλμ.`:'—'}</td><td style="font-size:.72rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.comments||'')}">${esc(e.comments||'—')}</div></td><td><div class="ts-actions-cell">${canEdit?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-timesheet" data-eid="${e.id}">✏</button>`:''}${canEdit?`<button class="btn btn-danger btn-icon btn-sm" data-action="delete-timesheet" data-eid="${e.id}">✕</button>`:''}</div></td></tr>`;
   }).join('');
 
-  return `
-  <div class="page-hd">
-    <div>
-      <h1>Timesheet</h1>
-      <div class="page-hd-sub">${entries.length} εγγραφές · σύνολο <strong>${totalHours.toFixed(1)}h</strong></div>
-    </div>
-    <div class="page-hd-actions">
-      ${isAdminOrMgmt ? `<button class="btn btn-ghost btn-sm" data-action="modal-manage-project-types" style="font-size:.78rem">⚙ Είδη Έργου</button>` : ''}
-      ${isAdminOrMgmt ? `<button class="btn btn-ghost btn-sm" data-action="modal-manage-standing" style="font-size:.78rem">⚙ Μόνιμα Έργα</button>` : ''}
-      ${isAdminOrMgmt ? `<button class="btn btn-ghost btn-sm" data-action="modal-billing" style="font-size:.78rem">📊 Κοστολόγηση</button>` : ''}
-      <button class="btn btn-primary" data-action="modal-add-timesheet">+ Καταχώρηση</button>
-    </div>
-  </div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px;align-items:center">
-    ${userOpts}
-    ${projOpts}
-    ${dateOpts}
-    ${hasFilter?`<button class="btn btn-ghost btn-sm" onclick="state.tsFilterUser='';state.tsFilterProj='';state.tsFilterFrom='';state.tsFilterTo='';render()">✕ Καθαρισμός</button>`:''}
-  </div>
-  <div class="ts-table-wrap">
-    <table class="ts-table">
-      <thead>
-        <tr>
-          <th onclick="setTimesheetSort('date')" title="Ταξινόμηση κατά ημερομηνία" style="cursor:pointer;user-select:none;white-space:nowrap">Ημερομηνία${sortArrow('date')}</th>
-          ${isAdminOrMgmt ? '<th>Χρήστης</th>' : ''}
-          <th onclick="setTimesheetSort('project')" title="Ταξινόμηση κατά έργο" style="cursor:pointer;user-select:none;white-space:nowrap">Έργο${sortArrow('project')}</th>
-          <th style="white-space:nowrap">Είδος Έργου</th>
-          <th style="text-align:center">Ώρες</th>
-          <th>Περιγραφή</th>
-          <th style="text-align:center">Χλμ.</th>
-          <th>Σχόλια</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows || `<tr><td colspan="${isAdminOrMgmt?9:8}" style="text-align:center;padding:32px;color:var(--steel);font-size:.85rem">Δεν υπάρχουν εγγραφές.</td></tr>`}
-      </tbody>
-    </table>
-  </div>`;
+  const pagebar=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px;padding:8px 2px 2px;flex-wrap:wrap"><div style="font-size:.78rem;color:var(--muted)">${rangeFrom}–${rangeTo} από ${totalCount.toLocaleString('el-GR')} εγγραφές · σύνολο φίλτρου <strong>${totalHours.toFixed(1)}h</strong></div><div style="display:flex;gap:6px;align-items:center"><button class="btn btn-ghost btn-sm" onclick="goTimesheetPage(${page-1})" ${page<=1?'disabled':''}>‹ Προηγούμενη</button><span style="font-size:.78rem;color:var(--muted);min-width:90px;text-align:center">Σελίδα ${page} / ${totalPages}</span><button class="btn btn-ghost btn-sm" onclick="goTimesheetPage(${page+1})" ${page>=totalPages?'disabled':''}>Επόμενη ›</button></div></div>`;
+
+  return `<div class="page-hd"><div><h1>Timesheet</h1><div class="page-hd-sub">${rangeFrom}–${rangeTo} από <strong>${totalCount.toLocaleString('el-GR')}</strong> εγγραφές</div></div><div class="page-hd-actions">${isAdminOrMgmt?`<button class="btn btn-ghost btn-sm" data-action="modal-manage-standing" style="font-size:.78rem">⚙ Μόνιμα Έργα</button>`:''}${isAdminOrMgmt?`<button class="btn btn-ghost btn-sm" data-action="modal-billing" style="font-size:.78rem">📊 Κοστολόγηση</button>`:''}<button class="btn btn-primary" data-action="modal-add-timesheet">+ Καταχώρηση</button></div></div><div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px;align-items:center">${userOpts}${projOpts}${dateOpts}${hasFilter?`<button class="btn btn-ghost btn-sm" onclick="clearTimesheetFilters()">✕ Καθαρισμός</button>`:''}${state.tsLoading?`<span style="font-size:.76rem;color:var(--muted)">Φόρτωση…</span>`:''}</div><div class="ts-table-wrap ts-fluid-wrap"><table class="ts-table ts-fluid-table">${colgroup}<thead><tr><th onclick="setTimesheetSort('date')" style="cursor:pointer;user-select:none">Ημερομηνία${sortArrow('date')}</th>${isAdminOrMgmt?'<th>Χρήστης</th>':''}<th onclick="setTimesheetSort('project')" style="cursor:pointer;user-select:none">Έργο${sortArrow('project')}</th><th>Είδος Έργου</th><th style="text-align:center">Ώρες</th><th>Περιγραφή</th><th style="text-align:center">Χλμ.</th><th>Σχόλια</th><th></th></tr></thead><tbody>${rows||`<tr><td colspan="${isAdminOrMgmt?9:8}" style="text-align:center;padding:24px;color:var(--steel);font-size:.82rem">Δεν υπάρχουν εγγραφές.</td></tr>`}</tbody></table></div>${pagebar}`;
 }
 
 // ── VIEW: CALENDAR ────────────────────────────────────────────────
@@ -3017,7 +3181,6 @@ function handleClick(e) {
     case 'modal-add-timesheet':      showModalAddTimesheet();                       break;
     case 'modal-edit-timesheet':     showModalEditTimesheet(btn.dataset.eid);       break;
     case 'delete-timesheet':         deleteTimesheetEntry(btn.dataset.eid);         break;
-    case 'modal-manage-project-types': showModalManageProjectTypes();                  break;
     case 'modal-manage-standing':    showModalManageStanding();                     break;
     case 'modal-billing':            showModalBilling();                            break;
     case 'modal-add-template':       showModalAddTemplate();                        break;
@@ -3806,7 +3969,7 @@ function showModalBilling() {
     </div>`);
 }
 
-window.billingLoad = function() {
+window.billingLoad = async function() {
   const projId = el('bill-proj')?.value;
   const from   = el('bill-from')?.value;
   const to     = el('bill-to')?.value;
@@ -3815,9 +3978,17 @@ window.billingLoad = function() {
   if (!to)     { showToast('Επιλέξτε ημερομηνία λήξης.','error'); return; }
 
   const proj = getProject(projId);
-  const entries = (state.db.timesheets||[]).filter(e =>
-    e.projectId === projId && e.date >= from && e.date <= to
-  );
+  let entries=[];
+  try {
+    const resultEl=el('bill-results');
+    if(resultEl) resultEl.innerHTML='<p class="text-muted" style="margin-top:12px;font-size:.85rem">Φόρτωση δεδομένων…</p>';
+    entries=await fetchTimesheetRowsForBilling(projId,from,to);
+  } catch(err) {
+    console.error('Billing load:',err);
+    const resultEl=el('bill-results');
+    if(resultEl) resultEl.innerHTML='<p style="margin-top:12px;font-size:.85rem;color:var(--red)">Σφάλμα φόρτωσης δεδομένων κοστολόγησης.</p>';
+    return;
+  }
 
   // Group by user
   const byUser = {};
@@ -4142,88 +4313,6 @@ window.billingExportXlsx = async function() {
   showToast(`Αρχείο "${filename}" λήφθηκε.`, 'success');
 };
 
-// ── PROJECT TYPES (TIMESHEET) ─────────────────────────────────────
-function renderProjectTypeManagerList() {
-  const list=[...(state.db.projectTypes||[])].sort((a,b)=>(a.name||'').localeCompare(b.name||'','el',{sensitivity:'base'}));
-  if(!list.length) return `<p class="text-muted" style="font-size:.82rem;padding:8px 0">Δεν υπάρχουν είδη έργου ακόμη.</p>`;
-  return list.map(t=>`
-    <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid var(--slate-100)">
-      <input class="form-control" id="ptype-name-${t.id}" value="${esc(t.name)}" ${t.active===false?'style="opacity:.65"':''}>
-      <button class="btn btn-ghost btn-sm" onclick="renameProjectType('${t.id}')">Αποθήκευση</button>
-      <button class="btn ${t.active===false?'btn-primary':'btn-ghost'} btn-sm" onclick="toggleProjectType('${t.id}')">${t.active===false?'Ενεργοποίηση':'Απενεργοποίηση'}</button>
-    </div>`).join('');
-}
-
-function showModalManageProjectTypes() {
-  if(!state.cu || !['admin','management'].includes(state.cu.role)) {
-    showToast('Μόνο Admin ή Management μπορούν να διαχειριστούν τα είδη έργου.','error');
-    return;
-  }
-  showModal(`
-    <div class="modal-header">
-      <div class="modal-title">⚙ Είδη Έργου Timesheet</div>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-body">
-      <p style="font-size:.8rem;color:var(--muted);margin-bottom:12px">
-        Τα είδη έργου είναι κοινή λίστα για το Timesheet. Η απενεργοποίηση δεν αλλάζει τις παλιές εγγραφές.
-      </p>
-      <div id="project-type-list">${renderProjectTypeManagerList()}</div>
-      <div style="display:flex;gap:8px;margin-top:16px">
-        <input class="form-control" id="project-type-new-name" placeholder="Νέο είδος έργου" style="flex:1">
-        <button class="btn btn-primary btn-sm" onclick="addProjectType()">+ Προσθήκη</button>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-ghost btn-sm" onclick="closeModal()">Κλείσιμο</button>
-    </div>`);
-}
-
-window.addProjectType = async function() {
-  const inp=el('project-type-new-name');
-  const name=inp?.value?.trim();
-  if(!name){showToast('Εισάγετε όνομα είδους έργου.','error');return;}
-  const duplicate=(state.db.projectTypes||[]).find(t=>t.active!==false && (t.name||'').trim().toLowerCase()===name.toLowerCase());
-  if(duplicate){showToast('Υπάρχει ήδη ενεργό είδος έργου με αυτό το όνομα.','error');return;}
-
-  const type={id:'pt_'+uid(),name,active:true,createdAt:nowTS(),updatedAt:nowTS()};
-  const {error}=await sb.from('be_project_types').insert({id:type.id,data:type});
-  if(error){showToast('Σφάλμα προσθήκης είδους έργου: '+(error.message||error),'error');return;}
-  state.db.projectTypes=[...(state.db.projectTypes||[]),type];
-  if(inp) inp.value='';
-  const listEl=el('project-type-list');
-  if(listEl) listEl.innerHTML=renderProjectTypeManagerList();
-  showToast(`«${name}» προστέθηκε.`,'success');
-};
-
-window.renameProjectType = async function(typeId) {
-  const type=getProjectType(typeId); if(!type) return;
-  const name=el('ptype-name-'+typeId)?.value?.trim();
-  if(!name){showToast('Το όνομα δεν μπορεί να είναι κενό.','error');return;}
-  const duplicate=(state.db.projectTypes||[]).find(t=>t.id!==typeId && t.active!==false && (t.name||'').trim().toLowerCase()===name.toLowerCase());
-  if(duplicate){showToast('Υπάρχει ήδη ενεργό είδος έργου με αυτό το όνομα.','error');return;}
-  type.name=name; type.updatedAt=nowTS();
-  const {error}=await sb.from('be_project_types').update({data:type}).eq('id',typeId);
-  if(error){showToast('Σφάλμα ενημέρωσης: '+(error.message||error),'error');return;}
-
-  // Preserve the label snapshot on existing rows that use this type.
-  const affected=(state.db.timesheets||[]).filter(e=>e.projectTypeId===typeId);
-  affected.forEach(e=>e.projectTypeName=name);
-  showToast('Το είδος έργου ενημερώθηκε.','success');
-  render();
-};
-
-window.toggleProjectType = async function(typeId) {
-  const type=getProjectType(typeId); if(!type) return;
-  type.active=type.active===false ? true : false;
-  type.updatedAt=nowTS();
-  const {error}=await sb.from('be_project_types').update({data:type}).eq('id',typeId);
-  if(error){showToast('Σφάλμα ενημέρωσης: '+(error.message||error),'error');return;}
-  const listEl=el('project-type-list');
-  if(listEl) listEl.innerHTML=renderProjectTypeManagerList();
-  showToast(type.active?'Το είδος ενεργοποιήθηκε.':'Το είδος απενεργοποιήθηκε.','success');
-};
-
 // ── STANDING PROJECTS ─────────────────────────────────────────────
 function showModalManageStanding() {
   const renderList = () => {
@@ -4325,19 +4414,19 @@ window.updateTsPreview = function(prefix) {
 };
 
 function showModalAddTimesheet() {
-  const cu = state.cu;
-  const isAdminOrMgmt = ['admin','management'].includes(cu.role);
-  const accessibleProjects = isAdminOrMgmt ? state.db.projects : visibleProjects();
-  const myProjects = accessibleProjects.filter(p => p.standing || p.status === 'in_progress');
-  const today = new Date().toISOString().slice(0,10);
+  const cu=state.cu;
+  const isAdminOrMgmt=['admin','management'].includes(cu.role);
+  const accessibleProjects=isAdminOrMgmt ? state.db.projects : visibleProjects();
+  const myProjects=accessibleProjects.filter(p=>p.standing || p.status==='in_progress');
+  const today=new Date().toISOString().slice(0,10);
 
-  const userSel = isAdminOrMgmt
+  const userSel=isAdminOrMgmt
     ? `<div class="form-group">
         <label class="form-label">Χρήστης</label>
         <select class="form-control" id="ts-userId">
           ${sortByName(state.db.users.filter(u=>u.role!=='client')).map(u=>`<option value="${u.id}" data-name="${esc(u.name)}" ${u.id===cu.id?'selected':''}>${esc(u.name)}</option>`).join('')}
         </select>
-      </div>` : '';
+      </div>`:'';
 
   showModal(`
     <div class="modal-header">
@@ -4352,27 +4441,24 @@ function showModalAddTimesheet() {
       </div>
       <div class="form-group">
         <label class="form-label">Έργο</label>
-        <select class="form-control" id="ts-projectId">
+        <select class="form-control" id="ts-projectId" onchange="syncTsCategoryFromProject('ts')">
           ${buildTsProjectOptions(myProjects)}
         </select>
+        <div class="form-hint">Εμφανίζονται μόνο ενεργά έργα και Μόνιμα Έργα Timesheet.</div>
       </div>
       <div class="form-group">
         <label class="form-label">Είδος Έργου <sup>*</sup></label>
-        <select class="form-control" id="ts-projectTypeId">
-          ${buildProjectTypeOptions('', true)}
+        <select class="form-control" id="ts-categoryId">
+          ${buildTimesheetCategoryOptions('',true)}
         </select>
-        ${activeProjectTypes().length ? '' : `<div class="form-hint" style="color:var(--red)">Δεν υπάρχουν ενεργά είδη έργου. Admin/Management πρέπει πρώτα να τα προσθέσει.</div>`}
+        <div class="form-hint">Συμπληρώνεται από την κατηγορία του έργου και μπορεί να αλλάξει χειροκίνητα.</div>
       </div>
       <div class="form-group">
         <label class="form-label">Ώρα</label>
         <div style="display:flex;gap:8px;align-items:center">
-          <select class="form-control" id="ts-timeFrom" onchange="updateTsPreview('ts')" style="flex:1">
-            ${buildTimeOptions('09:00')}
-          </select>
+          <select class="form-control" id="ts-timeFrom" onchange="updateTsPreview('ts')" style="flex:1">${buildTimeOptions('09:00')}</select>
           <span style="color:var(--muted);font-size:.85rem">έως</span>
-          <select class="form-control" id="ts-timeTo" onchange="updateTsPreview('ts')" style="flex:1">
-            ${buildTimeOptions('10:00')}
-          </select>
+          <select class="form-control" id="ts-timeTo" onchange="updateTsPreview('ts')" style="flex:1">${buildTimeOptions('10:00')}</select>
         </div>
         <div id="ts-preview" style="margin-top:6px;min-height:20px"></div>
       </div>
@@ -4393,22 +4479,24 @@ function showModalAddTimesheet() {
       <button class="btn btn-ghost btn-sm" onclick="closeModal()">Ακύρωση</button>
       <button class="btn btn-primary btn-sm" onclick="saveTimesheetEntry()">Αποθήκευση</button>
     </div>`);
-  // trigger initial preview
-  setTimeout(()=>updateTsPreview('ts'), 50);
+  setTimeout(()=>{
+    updateTsPreview('ts');
+    syncTsCategoryFromProject('ts');
+  },50);
 }
 
 function showModalEditTimesheet(eid) {
-  const entry = (state.db.timesheets||[]).find(e=>e.id===eid); if(!entry) return;
-  const cu = state.cu;
-  const isAdminOrMgmt = ['admin','management'].includes(cu.role);
-  const myProjects = isAdminOrMgmt ? state.db.projects : visibleProjects();
+  const entry=(state.db.timesheets||[]).find(e=>e.id===eid); if(!entry) return;
+  const cu=state.cu;
+  const isAdminOrMgmt=['admin','management'].includes(cu.role);
+  const accessibleProjects=isAdminOrMgmt ? state.db.projects : visibleProjects();
+  const myProjects=accessibleProjects.filter(p=>p.standing || p.status==='in_progress' || p.id===entry.projectId);
 
-  // For old entries without timeFrom/timeTo, derive approximate times
-  const existFrom = entry.timeFrom || '09:00';
-  const existMins = Math.round((parseFloat(entry.hours||1)) * 60);
-  const [fh,fm] = existFrom.split(':').map(Number);
-  const toMins = fh*60 + fm + existMins;
-  const existTo = entry.timeTo || `${String(Math.floor(toMins/60)%24).padStart(2,'0')}:${String(toMins%60).padStart(2,'0')}`;
+  const existFrom=entry.timeFrom||'09:00';
+  const existMins=Math.round((parseFloat(entry.hours||1))*60);
+  const [fh,fm]=existFrom.split(':').map(Number);
+  const toMins=fh*60+fm+existMins;
+  const existTo=entry.timeTo||`${String(Math.floor(toMins/60)%24).padStart(2,'0')}:${String(toMins%60).padStart(2,'0')}`;
 
   showModal(`
     <div class="modal-header">
@@ -4422,26 +4510,22 @@ function showModalEditTimesheet(eid) {
       </div>
       <div class="form-group">
         <label class="form-label">Έργο</label>
-        <select class="form-control" id="tse-projectId">
-          ${buildTsProjectOptions(myProjects, entry.projectId)}
+        <select class="form-control" id="tse-projectId" onchange="syncTsCategoryFromProject('tse')">
+          ${buildTsProjectOptions(myProjects,entry.projectId,entry.projectName||'')}
         </select>
       </div>
       <div class="form-group">
         <label class="form-label">Είδος Έργου <sup>*</sup></label>
-        <select class="form-control" id="tse-projectTypeId">
-          ${buildProjectTypeOptions(entry.projectTypeId||'', true)}
+        <select class="form-control" id="tse-categoryId">
+          ${buildTimesheetCategoryOptions(entry.projectCategoryId||'',true)}
         </select>
       </div>
       <div class="form-group">
         <label class="form-label">Ώρα</label>
         <div style="display:flex;gap:8px;align-items:center">
-          <select class="form-control" id="tse-timeFrom" onchange="updateTsPreview('tse')" style="flex:1">
-            ${buildTimeOptions(existFrom)}
-          </select>
+          <select class="form-control" id="tse-timeFrom" onchange="updateTsPreview('tse')" style="flex:1">${buildTimeOptions(existFrom)}</select>
           <span style="color:var(--muted);font-size:.85rem">έως</span>
-          <select class="form-control" id="tse-timeTo" onchange="updateTsPreview('tse')" style="flex:1">
-            ${buildTimeOptions(existTo)}
-          </select>
+          <select class="form-control" id="tse-timeTo" onchange="updateTsPreview('tse')" style="flex:1">${buildTimeOptions(existTo)}</select>
         </div>
         <div id="tse-preview" style="margin-top:6px;min-height:20px"></div>
       </div>
@@ -4462,97 +4546,107 @@ function showModalEditTimesheet(eid) {
       <button class="btn btn-ghost btn-sm" onclick="closeModal()">Ακύρωση</button>
       <button class="btn btn-primary btn-sm" onclick="updateTimesheetEntry('${eid}')">Αποθήκευση</button>
     </div>`);
-  setTimeout(()=>updateTsPreview('tse'), 50);
+  setTimeout(()=>updateTsPreview('tse'),50);
 }
 
 window.updateTimesheetEntry = async function(eid) {
-  const entry = (state.db.timesheets||[]).find(e=>e.id===eid); if(!entry) return;
-  const date      = el('tse-date')?.value?.trim();
-  const projectId = el('tse-projectId')?.value;
-  const projectTypeId = el('tse-projectTypeId')?.value;
-  const timeFrom  = el('tse-timeFrom')?.value;
-  const timeTo    = el('tse-timeTo')?.value;
-  const desc      = el('tse-desc')?.value?.trim();
-  const kmRaw     = el('tse-km')?.value?.trim();
-  const comments  = el('tse-comments')?.value?.trim();
-  if (!date)      { showToast('Επιλέξτε ημερομηνία.','error'); return; }
-  if (!projectId) { showToast('Επιλέξτε έργο.','error'); return; }
-  if (!projectTypeId) { showToast('Επιλέξτε είδος έργου.','error'); return; }
-  if (!timeFrom)  { showToast('Επιλέξτε ώρα έναρξης.','error'); return; }
-  if (!timeTo)    { showToast('Επιλέξτε ώρα λήξης.','error'); return; }
-  const mins = calcTsMins(timeFrom, timeTo);
-  if (!mins || mins <= 0) { showToast('Η ώρα λήξης πρέπει να είναι μετά την έναρξη.','error'); return; }
-  const proj = getProject(projectId);
-  entry.date = date;
-  entry.projectId = projectId;
-  entry.projectName = proj?.name || entry.projectName;
-  const projectType=getProjectType(projectTypeId);
-  entry.projectTypeId=projectType?.id || null;
-  entry.projectTypeName=projectType?.name || null;
-  entry.timeFrom = timeFrom;
-  entry.timeTo   = timeTo;
-  entry.hours    = parseFloat((mins/60).toFixed(2));
-  entry.desc     = desc;
-  entry.km       = kmRaw ? parseInt(kmRaw, 10) : null;
-  entry.comments = comments || null;
-  closeModal(); render();
+  const entry=(state.db.timesheets||[]).find(e=>e.id===eid); if(!entry) return;
+  const date=el('tse-date')?.value?.trim();
+  const projectId=el('tse-projectId')?.value;
+  const categoryId=el('tse-categoryId')?.value;
+  const timeFrom=el('tse-timeFrom')?.value;
+  const timeTo=el('tse-timeTo')?.value;
+  const desc=el('tse-desc')?.value?.trim();
+  const kmRaw=el('tse-km')?.value?.trim();
+  const comments=el('tse-comments')?.value?.trim();
+
+  if(!date){showToast('Επιλέξτε ημερομηνία.','error');return;}
+  if(!projectId){showToast('Επιλέξτε έργο.','error');return;}
+  if(!categoryId){showToast('Επιλέξτε είδος έργου.','error');return;}
+  if(!timeFrom){showToast('Επιλέξτε ώρα έναρξης.','error');return;}
+  if(!timeTo){showToast('Επιλέξτε ώρα λήξης.','error');return;}
+
+  const mins=calcTsMins(timeFrom,timeTo);
+  if(!mins||mins<=0){showToast('Η ώρα λήξης πρέπει να είναι μετά την έναρξη.','error');return;}
+
+  const proj=getProject(projectId);
+  const cat=getTimesheetCategory(categoryId);
+  entry.date=date;
+  entry.projectId=projectId;
+  entry.projectName=proj?.name || entry.projectName;
+  entry.projectCategoryId=cat?.id || null;
+  entry.projectCategoryName=cat?.name || null;
+  entry.timeFrom=timeFrom;
+  entry.timeTo=timeTo;
+  entry.hours=parseFloat((mins/60).toFixed(2));
+  entry.desc=desc;
+  entry.km=kmRaw ? parseInt(kmRaw,10) : null;
+  entry.comments=comments||null;
+
+  closeModal();
   await dbSaveTimesheet(entry);
+  await refreshTimesheetAfterMutation(state.tsPage||1);
   showToast('Η καταχώρηση ενημερώθηκε.','success');
 };
 
 window.saveTimesheetEntry = async function() {
-  const cu = state.cu;
-  const isAdminOrMgmt = ['admin','management'].includes(cu.role);
-  const date      = el('ts-date')?.value?.trim();
-  const projectId = el('ts-projectId')?.value;
-  const projectTypeId = el('ts-projectTypeId')?.value;
-  const timeFrom  = el('ts-timeFrom')?.value;
-  const timeTo    = el('ts-timeTo')?.value;
-  const desc      = el('ts-desc')?.value?.trim();
-  const kmRaw     = el('ts-km')?.value?.trim();
-  const comments  = el('ts-comments')?.value?.trim();
-  let userId = cu.id, userName = cu.name;
-  if (isAdminOrMgmt) {
-    const sel = el('ts-userId');
-    if (sel) {
-      userId = sel.value;
-      userName = sel.options[sel.selectedIndex]?.dataset?.name || sel.options[sel.selectedIndex]?.text || cu.name;
+  const cu=state.cu;
+  const isAdminOrMgmt=['admin','management'].includes(cu.role);
+  const date=el('ts-date')?.value?.trim();
+  const projectId=el('ts-projectId')?.value;
+  const categoryId=el('ts-categoryId')?.value;
+  const timeFrom=el('ts-timeFrom')?.value;
+  const timeTo=el('ts-timeTo')?.value;
+  const desc=el('ts-desc')?.value?.trim();
+  const kmRaw=el('ts-km')?.value?.trim();
+  const comments=el('ts-comments')?.value?.trim();
+
+  let userId=cu.id,userName=cu.name;
+  if(isAdminOrMgmt){
+    const sel=el('ts-userId');
+    if(sel){
+      userId=sel.value;
+      userName=sel.options[sel.selectedIndex]?.dataset?.name || sel.options[sel.selectedIndex]?.text || cu.name;
     }
   }
-  if (!date)      { showToast('Επιλέξτε ημερομηνία.','error'); return; }
-  if (!projectId) { showToast('Επιλέξτε έργο.','error'); return; }
-  if (!projectTypeId) { showToast('Επιλέξτε είδος έργου.','error'); return; }
-  if (!timeFrom)  { showToast('Επιλέξτε ώρα έναρξης.','error'); return; }
-  if (!timeTo)    { showToast('Επιλέξτε ώρα λήξης.','error'); return; }
-  const mins = calcTsMins(timeFrom, timeTo);
-  if (!mins || mins <= 0) { showToast('Η ώρα λήξης πρέπει να είναι μετά την έναρξη.','error'); return; }
-  const proj = getProject(projectId);
-  const projectType=getProjectType(projectTypeId);
-  const entry = {
-    id: 'ts_' + Date.now(),
-    userId, userName,
-    projectId, projectName: proj?.name || '',
-    projectTypeId: projectType?.id || null,
-    projectTypeName: projectType?.name || null,
-    date,
-    timeFrom, timeTo,
-    hours: parseFloat((mins/60).toFixed(2)),
+
+  if(!date){showToast('Επιλέξτε ημερομηνία.','error');return;}
+  if(!projectId){showToast('Επιλέξτε έργο.','error');return;}
+  if(!categoryId){showToast('Επιλέξτε είδος έργου.','error');return;}
+  if(!timeFrom){showToast('Επιλέξτε ώρα έναρξης.','error');return;}
+  if(!timeTo){showToast('Επιλέξτε ώρα λήξης.','error');return;}
+
+  const mins=calcTsMins(timeFrom,timeTo);
+  if(!mins||mins<=0){showToast('Η ώρα λήξης πρέπει να είναι μετά την έναρξη.','error');return;}
+
+  const proj=getProject(projectId);
+  const cat=getTimesheetCategory(categoryId);
+  const entry={
+    id:'ts_'+Date.now(),
+    userId,userName,
+    projectId,projectName:proj?.name||'',
+    projectCategoryId:cat?.id||null,
+    projectCategoryName:cat?.name||null,
+    date,timeFrom,timeTo,
+    hours:parseFloat((mins/60).toFixed(2)),
     desc,
-    km:       kmRaw ? parseInt(kmRaw, 10) : null,
-    comments: comments || null,
-    createdAt: new Date().toISOString(),
+    km:kmRaw ? parseInt(kmRaw,10) : null,
+    comments:comments||null,
+    createdAt:nowTS()
   };
-  state.db.timesheets = [entry, ...(state.db.timesheets||[])];
-  closeModal(); render();
+
+  closeModal();
   await dbSaveTimesheet(entry);
+  if(isSupabaseAuthMode()) await loadTimesheetPage(1);
+  else { state.db.timesheets.push(entry); state.tsPage=1; render(); }
   showToast('Η καταχώρηση αποθηκεύτηκε.','success');
 };
 
 async function deleteTimesheetEntry(eid) {
-  if (!confirm('Διαγραφή εγγραφής;')) return;
-  state.db.timesheets = (state.db.timesheets||[]).filter(e=>e.id!==eid);
-  render();
+  if(!confirm('Διαγραφή εγγραφής;')) return;
   await dbDeleteTimesheet(eid);
+  if(isSupabaseAuthMode()) await loadTimesheetPage(state.tsPage||1);
+  else { state.db.timesheets=(state.db.timesheets||[]).filter(e=>e.id!==eid); render(); }
   showToast('Η εγγραφή διαγράφηκε.','success');
 }
 
