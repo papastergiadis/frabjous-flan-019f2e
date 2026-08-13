@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>B&amp;E Solutions – Auth Transition Test</title>
+  <title>B&amp;E Solutions – Project Management</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="logo.jpg">
   <!-- Supabase JS -->
@@ -11,7 +11,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bcryptjs@2.4.3/dist/bcrypt.min.js"></script>
-  <script src="https://accounts.google.com/gsi/client" async onload="gsiLoaded()"></script>
+  <script src="https://accounts.google.com/gsi/client" defer onload="gsiLoaded()"></script>
   <script>
     const sb = supabase.createClient(
       'https://ilxvoghrbjeogporyfkp.supabase.co',
@@ -22,7 +22,6 @@
     .nav-icon { width:16px; height:16px; flex-shrink:0; opacity:.75; }
     .nav-link.active .nav-icon { opacity:1; }
   </style>
-  <meta name="be-transition-mode" content="hybrid-auth-test">
 </head>
 <body>
 
