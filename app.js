@@ -2201,10 +2201,10 @@ function earliestActiveTaskDate(proj) {
 
 function _dashProjTable(projs) {
   if (!projs.length) return `<div class="empty-state" style="padding:32px 0"><div class="es-icon" style="font-size:2rem">—</div><p>Δεν υπάρχουν έργα σε αυτή την κατηγορία.</p></div>`;
-  const cols = '2fr 1fr 1fr 1.5fr 110px 110px 30px';
+  const cols = '2fr 1fr 1fr 1.5fr 110px 110px 130px 30px';
   return `<div class="cases-table">
     <div class="cases-table-head" style="grid-template-columns:${cols}">
-      <div>Έργο</div><div>Κατηγορία</div><div>Υπεύθυνος</div><div>Επόμενη Φάση</div><div>Έναρξη</div><div>Λήξη</div><div></div>
+      <div>Έργο</div><div>Κατηγορία</div><div>Υπεύθυνος</div><div>Επόμενη Φάση</div><div>Έναρξη</div><div>Λήξη</div><div>Ποσοστό</div><div></div>
     </div>
     ${projs.map(p=>{
       const cat  = getCategory(p.categoryId);
@@ -2214,6 +2214,8 @@ function _dashProjTable(projs) {
       const phStart = phDates2?.start ? fmt(phDates2.start) : '—';
       const phEnd   = phDates2?.end   ? fmt(phDates2.end)   : '—';
       const inactive = !userHasActionInProject(p, state.cu?.id);
+      const pct = projectProgress(p).total.pct;
+      const pctColor = pct===100 ? 'var(--green)' : 'var(--orange)';
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
         <div class="case-row-title">${esc(p.name)}</div>
         <div class="text-sm">${esc(cat?.name||'—')}</div>
@@ -2221,6 +2223,7 @@ function _dashProjTable(projs) {
         <div class="text-sm">${phName}</div>
         <div class="text-sm text-muted">${phStart}</div>
         <div class="text-sm text-muted">${phEnd}</div>
+        <div class="case-row-prog"><div class="row-prog-bar"><div class="row-prog-fill" style="width:${pct}%;background:${pctColor}"></div></div><span class="row-prog-pct">${pct}%</span></div>
         <div class="row-arrow">${inactive?'<span style="font-size:.65rem;color:var(--muted)">αναμονή</span>':'›'}</div>
       </div>`;
     }).join('')}
@@ -2459,7 +2462,7 @@ function renderProjects() {
   filtered = [...filtered].sort((a,b) => earliestActiveTaskDate(a).localeCompare(earliestActiveTaskDate(b)));
   const canCreate = state.cu && ['admin','management','project_manager'].includes(state.cu.role);
   const statusTabs=[{k:'',l:'Όλα',n:vis.length},{k:'in_progress',l:'Σε εξέλιξη',n:vis.filter(p=>p.status==='in_progress').length},{k:'completed',l:'Ολοκληρωμένα',n:vis.filter(p=>p.status==='completed').length}];
-  const cols = '2fr 1fr 1.5fr 110px 110px 30px';
+  const cols = '2fr 1fr 1.5fr 110px 110px 130px 30px';
   return `
   <div class="page-hd"><div><h1>${esc(cat.name)}</h1><div class="page-hd-sub">${esc(cat.desc)}</div></div><div class="page-hd-actions">${canCreate?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-category" data-cid="${cat.id}" title="Επεξεργασία κατηγορίας">✏ Επεξεργασία</button>`:''}<button class="btn btn-secondary btn-sm" data-action="export-category" data-cid="${cat.id}" title="Εξαγωγή κατηγορίας σε Excel">⬇ Excel</button>${canCreate?`<button class="btn btn-primary" data-action="modal-add-project" data-cid="${cat.id}">+ Νέο Έργο</button>`:''}</div></div>
   <div class="filter-bar mb-12">
@@ -2469,7 +2472,7 @@ function renderProjects() {
   ${filtered.length?`
   <div class="cases-table">
     <div class="cases-table-head" style="grid-template-columns:${cols}">
-      <div>Έργο</div><div>Υπεύθυνος</div><div>Επόμενη Φάση</div><div>Έναρξη</div><div>Λήξη</div><div></div>
+      <div>Έργο</div><div>Υπεύθυνος</div><div>Επόμενη Φάση</div><div>Έναρξη</div><div>Λήξη</div><div>Ποσοστό</div><div></div>
     </div>
     ${filtered.map(p=>{
       const mgrNames = projManagerNames(p);
@@ -2479,12 +2482,15 @@ function renderProjects() {
       const phStart = phDates?.start ? fmt(phDates.start) : '—';
       const phEnd   = phDates?.end   ? fmt(phDates.end)   : '—';
       const inactive = !userHasActionInProject(p, state.cu?.id);
+      const pct = projectProgress(p).total.pct;
+      const pctColor = pct===100 ? 'var(--green)' : 'var(--orange)';
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" data-proj-id="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
         <div class="case-row-title">${esc(p.name)}</div>
         <div class="text-sm">${esc(mgrNames)}</div>
         <div class="text-sm">${phName}</div>
         <div class="text-sm text-muted">${phStart}</div>
         <div class="text-sm text-muted">${phEnd}</div>
+        <div class="case-row-prog"><div class="row-prog-bar"><div class="row-prog-fill" style="width:${pct}%;background:${pctColor}"></div></div><span class="row-prog-pct">${pct}%</span></div>
         <div class="row-arrow">${inactive?'<span style="font-size:.65rem;color:var(--muted)">αναμονή</span>':'›'}</div>
       </div>`;}).join('')}
   </div>`:`<div class="empty-state"><div class="es-icon">—</div><h3>Δεν βρέθηκαν έργα</h3><p>${canCreate?'Δημιουργήστε το πρώτο έργο.':'Δεν υπάρχουν ορατά έργα.'}</p>${canCreate?`<button class="btn btn-primary" data-action="modal-add-project" data-cid="${cat.id}">+ Νέο Έργο</button>`:''}</div>`}`;
@@ -2547,7 +2553,7 @@ function renderProjectProgressChart(proj, prog) {
         const _phPDM = phasePlannedDates(ph);
         const phStarts = [_phPDM.start, ...(ph.tasks||[]).map(t=>t.plannedStart)].filter(Boolean).sort();
         const phEnds   = [_phPDM.end,   ...(ph.tasks||[]).map(t=>t.plannedEnd)].filter(Boolean).sort();
-        const active   = (ph.tasks||[]).filter(t=>t.status!=='cancelled');
+        const active   = (ph.tasks||[]).filter(t=>t.status!=='cancelled'&&t.status!=='not_required');
         const pct      = active.length===0 ? 0 : Math.round(active.filter(t=>t.status==='completed').length/active.length*100);
         const isDone   = pct === 100;
 
@@ -2577,7 +2583,7 @@ function renderProjectProgressChart(proj, prog) {
       // ── No dates: equal-width sequential bars ──
       const n = phases.length;
       phases.forEach((ph, i) => {
-        const active = (ph.tasks||[]).filter(t=>t.status!=='cancelled');
+        const active = (ph.tasks||[]).filter(t=>t.status!=='cancelled'&&t.status!=='not_required');
         const pct    = active.length===0 ? 0 : Math.round(active.filter(t=>t.status==='completed').length/active.length*100);
         const isDone = pct === 100;
         const left   = Math.round(i / n * 100);
@@ -2819,6 +2825,7 @@ function renderProject() {
             <span class="task-status-badge ${stInfo.cls}">${stInfo.label}</span>
             <div class="mini-prog"><div class="mini-bar"><div class="mini-fill" style="width:${dp.pct}%;background:${t.status==='completed'?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${dp.done}/${dp.total}</span></div>
             ${!unlocked?'<span class="badge badge-amber" style="font-size:.58rem">Κλειδωμένη</span>':''}
+            ${canMod&&!isComp?`<button class="btn btn-ghost btn-sm" data-action="duplicate-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" title="Αντιγραφή εργασίας" style="font-size:.7rem;padding:3px 8px">⧉</button>`:''}
             ${phaseMoveButtons}
             <span class="expand-icon${isExp?' ei-open':''}" id="ei-${t.id}">▼</span>
           </div>
@@ -2968,7 +2975,7 @@ function renderClientPortal() {
   if (!state.clientProjectId || !projs.find(p=>p.id===state.clientProjectId)) state.clientProjectId=projs[0].id;
   const proj=projs.find(p=>p.id===state.clientProjectId)||projs[0]; const cat=getCategory(proj.categoryId); const mgrNames=projManagerNames(proj); const prog=projectProgress(proj);
   const projSelector=projs.length>1?`<div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--navy-line)"><div style="font-size:.7rem;font-weight:700;color:var(--steel);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px">Επιλογή Έργου</div><div style="display:flex;flex-wrap:wrap;gap:6px">${projs.map(p=>{const pc=getCategory(p.categoryId);return`<button onclick="state.clientProjectId='${p.id}';render()" style="padding:7px 14px;font-size:.78rem;font-weight:700;border:1px solid ${p.id===proj.id?'var(--orange)':'var(--navy-line)'};background:${p.id===proj.id?'var(--orange)':'var(--white)'};color:${p.id===proj.id?'var(--white)':'var(--ink)'};cursor:pointer;border-radius:2px;transition:all .15s">${esc(p.name)}<span style="font-size:.65rem;opacity:.7;margin-left:5px">${esc(pc?.name||'')}</span></button>`;}).join('')}</div></div>`:'';
-  const phases=(proj.phases||[]).map((ph,i)=>{const done=isPhaseComplete(ph);const unlocked=isPhaseUnlocked(proj,i);const phPct=ph.tasks.length===0?0:Math.round(ph.tasks.filter(t=>t.status==='completed').length/ph.tasks.length*100);
+  const phases=(proj.phases||[]).map((ph,i)=>{const done=isPhaseComplete(ph);const unlocked=isPhaseUnlocked(proj,i);const phActive=ph.tasks.filter(t=>t.status!=='cancelled'&&t.status!=='not_required');const phPct=phActive.length===0?0:Math.round(phActive.filter(t=>t.status==='completed').length/phActive.length*100);
     return `<div class="client-phase${done?' cph-done':''}"><div class="client-phase-head"><div class="phase-num${done?' pn-done':unlocked?' pn-active':' pn-locked'}" style="width:30px;height:30px;font-size:.72rem">${done?'✓':i+1}</div><div><div style="font-weight:700;font-size:.88rem">${esc(ph.name)}</div><div class="text-sm text-muted">${ph.tasks.filter(t=>t.status!=='cancelled').length} εργασίες</div></div><div class="mini-prog" style="margin-left:auto"><div class="mini-bar" style="width:80px"><div class="mini-fill" style="width:${phPct}%;background:${done?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div></div>${ph.tasks.filter(t=>t.status!=='cancelled').map(t=>{const cst=CLIENT_STATUSES[t.status]||CLIENT_STATUSES.not_started;const statusColors={ts_ns:'#64748b','ts-ns':'#64748b','ts-ip':'#1d4ed8','ts-wc':'#b45309','ts-done':'#059669','ts-canc':'#dc2626'};const dotColor=t.status==='completed'?'var(--green)':t.status==='waiting_client'?'var(--amber)':'var(--blue)';const dp=taskDocProgress(t);const clientDocs=(t.docs||[]).filter(d=>d.type==='client');const pendDocs=clientDocs.filter(d=>!d.done&&d.required).length;const isExp=!!(state.clientExpanded||{})[t.id];const docsHtml=isExp?`<div class="client-task-docs">${clientDocs.length===0?'<div style="padding:8px 0;font-size:.75rem;color:var(--muted)">Δεν απαιτούνται έγγραφα από εσάς.</div>':clientDocs.map(d=>{if(d.done)return`<div class="client-doc-row client-doc-done"><span style="color:var(--green)">✓</span><span style="flex:1;font-size:.78rem">${esc(d.name)}</span><span style="font-size:.65rem;color:var(--muted)">${d.file?esc(d.file):''}</span></div>`;return`<div class="client-doc-row"><span style="color:var(--red);flex-shrink:0">✱</span><span style="flex:1;font-size:.78rem">${esc(d.name)}</span><label class="btn btn-primary btn-sm" style="cursor:pointer;flex-shrink:0">⬆ Ανέβασμα<input type="file" style="display:none" accept=".pdf,.jpg,.jpeg,.png,.doc,.docx" onchange="clientUploadDoc('${d.id}','${t.id}','${proj.id}',this)"></label></div>`;}).join('')}</div>`:'';return`<div class="client-task" style="flex-direction:column;align-items:stretch;padding:10px 16px;gap:0"><div style="display:flex;align-items:center;gap:10px"><div class="task-status-dot" style="background:${dotColor};width:10px;height:10px;flex-shrink:0"></div><div style="flex:1"><div style="font-size:.82rem;font-weight:600">${esc(t.name)}</div><span class="task-status-badge ${cst.cls}" style="font-size:.62rem">${cst.label}</span></div>${pendDocs>0?`<span style="font-size:.72rem;color:var(--red);font-weight:700">${pendDocs} εκκρ.</span>`:''}<span class="text-sm text-muted">${dp.done}/${dp.total} έγγρ.</span>${clientDocs.length?`<button class="btn btn-ghost btn-sm" data-action="client-toggle-task" data-tid="${t.id}" style="padding:2px 6px;font-size:.7rem">${isExp?'▲':'▼'}</button>`:''}</div>${docsHtml}</div>`;}).join('')}</div>`;
   }).join('');
   return `<div class="client-wrap">${hdr}<div class="client-body">${projSelector}<div class="client-proj-title">${esc(proj.name)}</div><div class="client-proj-sub">${esc(cat?.name||'')}${mgrNames?' · Υπεύθυνος Έργου: '+esc(mgrNames):''}</div><div style="margin:16px 0"><div style="display:flex;justify-content:space-between;margin-bottom:6px"><span class="text-sm fw-700">Συνολική Πρόοδος</span><span class="text-sm fw-700">${prog.tasks.pct}%</span></div><div style="height:8px;background:var(--slate-200);border-radius:999px;overflow:hidden"><div style="height:100%;width:${prog.tasks.pct}%;background:${proj.status==='completed'?'var(--green)':'var(--orange)'};border-radius:999px;transition:width .4s"></div></div></div><div class="client-phases">${phases}</div></div></div>`;
@@ -2986,7 +2993,8 @@ function renderClientPortalFix8() {
 
   const phases=(proj.phases||[]).map((ph,i)=>{
     const done=isPhaseComplete(ph);
-    const phPct=(ph.tasks||[]).length?Math.round(ph.tasks.filter(t=>t.status==='completed').length/ph.tasks.length*100):0;
+    const phActive=(ph.tasks||[]).filter(t=>t.status!=='cancelled'&&t.status!=='not_required');
+    const phPct=phActive.length?Math.round(phActive.filter(t=>t.status==='completed').length/phActive.length*100):0;
     const tasks=(ph.tasks||[]).filter(t=>t.status!=='cancelled').map(t=>{
       const cst=CLIENT_STATUSES[t.status]||CLIENT_STATUSES.not_started;
       const requested=(t.docs||[]).filter(d=>d.type==='client');
@@ -4145,6 +4153,7 @@ function handleClick(e) {
     case 'modal-edit-phase':    showModalEditPhase(pid,phid);               break;
     case 'modal-add-task':      showModalAddTask(pid,phid);                 break;
     case 'modal-edit-task':     showModalEditTask(pid,phid,tid);            break;
+    case 'duplicate-task':      duplicateTask(pid,phid,tid);                break;
     case 'modal-add-doc':      showModalAddDoc(pid,phid,tid);               break;
     case 'modal-add-user':          showModalAddUser();                     break;
     case 'modal-edit-user':         showModalEditUser(uidVal);              break;
@@ -6402,6 +6411,35 @@ window.modalSaveTask=async function(pid,phid){
   }
   closeModal(); render(); showToast('Εργασία προστέθηκε.','success');
 };
+
+// DUPLICATE TASK — full copy (incl. documents), status reset to "not_started"
+// so the repeated task starts fresh and can be corrected independently.
+async function duplicateTask(pid,phid,tid) {
+  const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const src=ph?.tasks.find(t=>t.id===tid);
+  if(!src) return;
+  const idx=ph.tasks.indexOf(src);
+  const newTask={
+    ...src,
+    id:'task_'+uid(),
+    name:src.name+' (Αντίγραφο)',
+    status:'not_started',
+    startDate:null,
+    completedDate:null,
+    actualStartTime:null,
+    actualEndTime:null,
+    reviewStatus:null,
+    urgent:false,
+    memberIds:[...(src.memberIds||[])],
+    dependsOn:[...(src.dependsOn||[])],
+    subtasks:(src.subtasks||[]).map(st=>({...st,id:'st_'+uid(),done:false,reviewStatus:null})),
+    docs:(src.docs||[]).map(d=>({...d,id:'d_'+uid()})), // πλήρης αντιγραφή εγγράφων, με τα ίδια αρχεία
+  };
+  ph.tasks.splice(idx+1,0,newTask);
+  auditLog('Αντιγραφή εργασίας',`"${src.name}" → "${newTask.name}" – ${ph.name}`);
+  await dbSaveProject(proj);
+  render();
+  showToast(`Δημιουργήθηκε αντίγραφο: «${newTask.name}»`,'success');
+}
 
 // EDIT TASK
 function showModalEditTask(pid,phid,tid) {
