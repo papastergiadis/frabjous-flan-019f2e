@@ -2100,7 +2100,7 @@ function renderLogin() {
       <div id="login-err" class="login-err" style="display:none"></div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-login">Σύνδεση</button>
       <div class="login-hint">
-        Supabase Auth για ενεργοποιημένους λογαριασμούς · προσωρινό legacy fallback για χρήστες που δεν έχουν μεταφερθεί ακόμη
+        Η σύνδεση γίνεται αποκλειστικά μέσω ασφαλούς λογαριασμού (Supabase Auth)
       </div>
     </div>
   </div>`;
@@ -3825,106 +3825,63 @@ async function doLogin() {
       return;
     }
 
-    const user=state.db.users.find(u =>
-      (u.username||'').toLowerCase()===identifier ||
-      (u.email||'').toLowerCase()===identifier
-    );
+    // Final cutover: resolve the login email via a safe RPC (no anon table
+    // read of be_users needed) and authenticate exclusively via Supabase Auth.
+    const {data:resolvedEmail, error:resolveError}=await sb.rpc('app_resolve_login_email',{p_identifier:identifier});
+    if (resolveError) {
+      if(errEl){errEl.textContent='Σφάλμα σύνδεσης: '+(resolveError.message||resolveError);errEl.style.display='block';}
+      return;
+    }
 
-    if (!user) {
+    const email=resolvedEmail||(identifier.includes('@')?identifier:null);
+    if (!email) {
       if(errEl){errEl.textContent='Λάθος στοιχεία σύνδεσης.';errEl.style.display='block';}
       return;
     }
 
-    // Phase 2F: every role is Auth-eligible. Try Supabase Auth first.
-    let authError=null;
-    if (user.email) {
-      const authResult=await sb.auth.signInWithPassword({
-        email:user.email,
-        password
-      });
-      authError=authResult.error||null;
-
-      if (!authError) {
-        AUTH_MODE='supabase';
-        sessionStorage.removeItem('be_pm_user');
-
-        let profile=await loadCurrentAppUser().catch(()=>null);
-        if (!profile) {
-          const {data:claimed,error:claimError}=await sb.rpc('app_claim_my_profile');
-          if (claimError) {
-            await sb.auth.signOut({scope:'local'}).catch(()=>{});
-            AUTH_MODE='legacy';
-            throw claimError;
-          }
-          profile=claimed||await loadCurrentAppUser();
-        }
-
-        if (!profile || profile.id!==user.id) {
-          await sb.auth.signOut({scope:'local'}).catch(()=>{});
-          AUTH_MODE='legacy';
-          throw new Error('Ο Auth λογαριασμός δεν αντιστοιχεί στο αναμενόμενο ενεργό προφίλ.');
-        }
-
-        await loadFromDB();
-        state.cu=profile;
-        const idx=state.db.users.findIndex(u=>u.id===profile.id);
-        if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
-        state.view=profile.role==='client'?'client':'dashboard';
-
-        sb.rpc('app_touch_last_login').then(({error})=>{
-          if(error) console.warn('touch last login:',error);
-        });
-
-        initPresence();
-        initProjectsRealtime();
-        startNotificationPolling();
-        auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
-        render();
-        return;
-      }
-    }
-
-    if (AUTH_REQUIRED_ROLES.has(user.role)) {
+    const {error:authError}=await sb.auth.signInWithPassword({email,password});
+    if (authError) {
       if(errEl){
-        errEl.textContent='Αποτυχία Supabase Auth. Ελέγξτε τον νέο κωδικό.';
+        errEl.textContent='Λάθος στοιχεία σύνδεσης ή ο λογαριασμός Auth δεν έχει ενεργοποιηθεί.';
         errEl.style.display='block';
       }
       return;
     }
 
-    // Temporary lower-role fallback until final cutover.
-    const isHashed=user.password && user.password.startsWith('$2');
-    let passwordOk=false;
+    AUTH_MODE='supabase';
+    sessionStorage.removeItem('be_pm_user');
 
-    if (isHashed) {
-      passwordOk=dcodeIO.bcrypt.compareSync(password,user.password);
-    } else {
-      passwordOk=user.password===password;
-      if (passwordOk) {
-        user.password=dcodeIO.bcrypt.hashSync(password,10);
-        dbSaveUser(user).catch(()=>{});
+    let profile=await loadCurrentAppUser().catch(()=>null);
+    if (!profile) {
+      const {data:claimed,error:claimError}=await sb.rpc('app_claim_my_profile');
+      if (claimError) {
+        await sb.auth.signOut({scope:'local'}).catch(()=>{});
+        AUTH_MODE='legacy';
+        throw claimError;
       }
+      profile=claimed||await loadCurrentAppUser();
     }
 
-    if (!passwordOk) {
-      if(errEl){
-        errEl.textContent=authError
-          ? 'Λάθος στοιχεία σύνδεσης ή ο λογαριασμός Auth δεν έχει ενεργοποιηθεί.'
-          : 'Λάθος username ή password.';
-        errEl.style.display='block';
-      }
-      return;
+    if (!profile) {
+      await sb.auth.signOut({scope:'local'}).catch(()=>{});
+      AUTH_MODE='legacy';
+      throw new Error('Δεν βρέθηκε ενεργό προφίλ για αυτόν τον λογαριασμό.');
     }
 
-    AUTH_MODE='legacy';
-    user.lastLogin=nowTS();
-    dbSaveUser(user).catch(()=>{});
-    setCurrentUser(user);
-    state.cu=user;
-    state.view=user.role==='client'?'client':'dashboard';
+    await loadFromDB();
+    state.cu=profile;
+    const idx=state.db.users.findIndex(u=>u.id===profile.id);
+    if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
+    state.view=profile.role==='client'?'client':'dashboard';
+
+    sb.rpc('app_touch_last_login').then(({error})=>{
+      if(error) console.warn('touch last login:',error);
+    });
+
     initPresence();
     initProjectsRealtime();
-    auditLog('Σύνδεση',`Ο χρήστης ${user.name} συνδέθηκε (legacy transition)`);
+    startNotificationPolling();
+    auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
     render();
   } catch(err) {
     console.error('doLogin error:',err);
