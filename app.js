@@ -1602,6 +1602,15 @@ function render() {
     const sidebar  = document.querySelector('.sidebar');
     const mainWrap = document.querySelector('.main-wrap');
 
+    if (state.view==='reset-password') {
+      if (sidebar) sidebar.style.display='none';
+      if (mainWrap) { mainWrap.style.marginLeft='0'; mainWrap.style.minHeight=''; }
+      document.body.style.background='var(--navy)';
+      main.innerHTML=renderResetPassword();
+      _updateSidebarFooter();
+      bindEvents(); return;
+    }
+
     if (!loggedIn || state.view==='login') {
       if (sidebar) sidebar.style.display='none';
       if (mainWrap) { mainWrap.style.marginLeft='0'; mainWrap.style.minHeight=''; }
@@ -2083,6 +2092,24 @@ window.dismissReminder=function(rid){
 
 // ── VIEW: LOGIN ───────────────────────────────────────────────────
 function renderLogin() {
+  if (state.loginMode === 'forgot') {
+    return `
+    <div class="login-wrap">
+      <div class="login-box">
+        <div class="login-logo"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'"></div>
+        <h2 class="login-title">Επαναφορά Κωδικού</h2>
+        <p class="login-sub">Καταχωρήστε το email σας — θα σας στείλουμε σύνδεσμο επαναφοράς</p>
+        <div class="form-group">
+          <label class="form-label">Email</label>
+          <input class="form-control" type="email" id="forgot-email" placeholder="email@example.com" autocomplete="email">
+        </div>
+        <div id="forgot-err" class="login-err" style="display:none"></div>
+        <div id="forgot-ok" class="login-hint" style="display:none;color:var(--green);font-family:inherit;font-size:.78rem"></div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-forgot-password">Αποστολή Συνδέσμου</button>
+        <div class="login-hint"><span style="cursor:pointer;text-decoration:underline" data-action="show-login-form">← Επιστροφή στη σύνδεση</span></div>
+      </div>
+    </div>`;
+  }
   return `
   <div class="login-wrap">
     <div class="login-box">
@@ -2099,9 +2126,31 @@ function renderLogin() {
       </div>
       <div id="login-err" class="login-err" style="display:none"></div>
       <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-login">Σύνδεση</button>
+      <div class="login-hint"><span style="cursor:pointer;text-decoration:underline" data-action="show-forgot-password">Ξέχασα τον κωδικό μου</span></div>
       <div class="login-hint">
         Η σύνδεση γίνεται αποκλειστικά μέσω ασφαλούς λογαριασμού (Supabase Auth)
       </div>
+    </div>
+  </div>`;
+}
+
+function renderResetPassword() {
+  return `
+  <div class="login-wrap">
+    <div class="login-box">
+      <div class="login-logo"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'"></div>
+      <h2 class="login-title">Νέος Κωδικός Πρόσβασης</h2>
+      <p class="login-sub">Ορίστε τον νέο σας κωδικό για να συνεχίσετε</p>
+      <div class="form-group">
+        <label class="form-label">Νέος Κωδικός</label>
+        <input class="form-control" type="password" id="reset-pass" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Επιβεβαίωση Κωδικού</label>
+        <input class="form-control" type="password" id="reset-pass2" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <div id="reset-err" class="login-err" style="display:none"></div>
+      <button class="btn btn-primary" style="width:100%;justify-content:center;padding:11px 0;font-size:.9rem" data-action="do-reset-password">Αποθήκευση Νέου Κωδικού</button>
     </div>
   </div>`;
 }
@@ -3901,6 +3950,58 @@ async function doLogin() {
   }
 }
 
+async function doForgotPassword() {
+  const email=(el('forgot-email')?.value||'').trim().toLowerCase();
+  const errEl=el('forgot-err');
+  const okEl=el('forgot-ok');
+  if (errEl) errEl.style.display='none';
+  if (okEl) okEl.style.display='none';
+  if (!email || !email.includes('@')) {
+    if(errEl){errEl.textContent='Καταχωρήστε ένα έγκυρο email.';errEl.style.display='block';}
+    return;
+  }
+  try {
+    const redirectTo = window.location.origin + window.location.pathname;
+    const {error} = await sb.auth.resetPasswordForEmail(email, {redirectTo});
+    if (error) throw error;
+    if (okEl) { okEl.textContent='Αν υπάρχει λογαριασμός με αυτό το email, στάλθηκε σύνδεσμος επαναφοράς. Ελέγξτε τα εισερχόμενά σας.'; okEl.style.display='block'; }
+  } catch(err) {
+    console.error('resetPasswordForEmail error:',err);
+    if(errEl){errEl.textContent='Σφάλμα αποστολής: '+(err.message||err);errEl.style.display='block';}
+  }
+}
+
+window.submitPasswordReset = async function() {
+  const pass=el('reset-pass')?.value||'';
+  const pass2=el('reset-pass2')?.value||'';
+  const errEl=el('reset-err');
+  if (errEl) errEl.style.display='none';
+  if (!pass || pass.length<6) {
+    if(errEl){errEl.textContent='Ο νέος κωδικός πρέπει να έχει τουλάχιστον 6 χαρακτήρες.';errEl.style.display='block';}
+    return;
+  }
+  if (pass!==pass2) {
+    if(errEl){errEl.textContent='Οι κωδικοί δεν ταιριάζουν.';errEl.style.display='block';}
+    return;
+  }
+  try {
+    const {error} = await sb.auth.updateUser({password:pass});
+    if (error) throw error;
+    window.__passwordRecoveryPending = false;
+    await sb.auth.signOut({scope:'local'}).catch(()=>{});
+    state.cu=null;
+    AUTH_MODE='legacy';
+    state.view='login';
+    state.loginMode=null;
+    render();
+    showToast('Ο κωδικός σας άλλαξε. Συνδεθείτε με τον νέο σας κωδικό.','success');
+  } catch(err) {
+    console.error('password reset error:',err);
+    if(errEl){errEl.textContent='Σφάλμα: '+(err.message||err);errEl.style.display='block';}
+    else showToast('Σφάλμα: '+(err.message||err),'error');
+  }
+};
+
 async function doLogout() {
   cleanupNotificationCenter();
   try { auditLog('Αποσύνδεση',`Ο χρήστης ${state.cu?.name} αποσυνδέθηκε`); } catch(e){}
@@ -4011,6 +4112,10 @@ function handleClick(e) {
   const a=btn.dataset.action; const {pid,cid,phid,tid,did,uid:uidVal}=btn.dataset;
   switch(a){
     case 'do-login':           doLogin();                                   break;
+    case 'show-forgot-password': state.loginMode='forgot'; render();        break;
+    case 'show-login-form':      state.loginMode=null; render();            break;
+    case 'do-forgot-password': doForgotPassword();                          break;
+    case 'do-reset-password':  submitPasswordReset();                       break;
     case 'logout':             doLogout();                                  break;
     case 'my-account':         showModalMyAccount();                        break;
     case 'nav-dashboard':      navigate('dashboard'); state.dashFilter=null; break;
@@ -9186,6 +9291,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (main) main.innerHTML=`<div class="login-wrap"><div class="login-box" style="text-align:center"><div style="font-size:2rem;margin-bottom:16px">⏳</div><div style="font-weight:700;color:var(--navy)">Έλεγχος συνεδρίας…</div><div class="text-sm text-muted" style="margin-top:6px">Παρακαλώ περιμένετε</div></div></div>`;
   document.body.style.background='var(--navy)';
   const sidebar=document.querySelector('.sidebar'); if(sidebar) sidebar.style.display='none';
+
+  // A "forgot password" email link landed here — Supabase already parsed the
+  // recovery token from the URL and fired PASSWORD_RECOVERY (see index.html).
+  // Skip the normal session/profile bootstrap entirely and force the user to
+  // set a new password before they can do anything else in the app.
+  if (window.__passwordRecoveryPending) {
+    AUTH_MODE='supabase';
+    state.cu=null;
+    state.view='reset-password';
+    render();
+    return;
+  }
 
   try {
     const {data:{session},error:sessionError}=await sb.auth.getSession();

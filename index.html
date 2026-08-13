@@ -17,6 +17,14 @@
       'https://ilxvoghrbjeogporyfkp.supabase.co',
       'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlseHZvZ2hyYmplb2dwb3J5ZmtwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MTYwMzEsImV4cCI6MjEwMDE5MjAzMX0.7_P3FiSEUfQ1vjBKivMPJBB31C0HR2l7MP8oQJjhxps'
     );
+    // Registered as early as possible (before app.js's own listener) so we
+    // never miss the PASSWORD_RECOVERY event fired when a user lands here
+    // via a "forgot password" email link — Supabase parses the recovery
+    // token from the URL almost immediately after the client is created.
+    window.__passwordRecoveryPending = false;
+    sb.auth.onAuthStateChange((event) => {
+      if (event === 'PASSWORD_RECOVERY') window.__passwordRecoveryPending = true;
+    });
   </script>
   <style>
     .nav-icon { width:16px; height:16px; flex-shrink:0; opacity:.75; }
