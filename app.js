@@ -2765,11 +2765,8 @@ function renderProject() {
         :`<div class="docs-grid docs-grid-compact">${Object.entries(docGroups).map(([cat2,docs])=>`<div class="doc-category-head-compact"><div class="doc-category-label">${esc(cat2)}</div></div>${docs.map(d=>{
           const dropboxSources = _dropboxDocumentSources(d.url);
           const hasOpenSource = !!(d.file || d.url || d.folderPath);
-          const docLocalHref = d.done ? _resolveDocLocalHref(d) : null;
           const docOpenBtn = d.done&&hasOpenSource
-            ? (docLocalHref
-                ? `<a class="btn btn-secondary btn-sm" href="${esc(docLocalHref)}" target="_blank" rel="noopener" style="text-decoration:none" data-action="open-task-document-local" data-did="${d.id}" data-tid="${t.id}" title="Άνοιγμα του εγγράφου (τοπικά — χρειάζεται την επέκταση Local Explorer)">📄 Άνοιγμα</a>`
-                : `<button class="btn btn-secondary btn-sm" data-action="open-task-document" data-did="${d.id}" data-tid="${t.id}" title="Άνοιγμα του εγγράφου">📄 Άνοιγμα</button>`)
+            ? `<button class="btn btn-secondary btn-sm" data-action="open-task-document" data-did="${d.id}" data-tid="${t.id}" title="Άνοιγμα του εγγράφου">📄 Άνοιγμα</button>`
             : '';
           const docDropboxBtn = d.done&&dropboxSources.localPath&&dropboxSources.onlineUrl
             ? `<button class="btn btn-ghost btn-sm" data-action="open-task-document-online" data-did="${d.id}" data-tid="${t.id}" title="Άνοιγμα του επίσημου αρχείου online στο Dropbox">☁ Dropbox</button>`
@@ -4048,7 +4045,6 @@ function handleClick(e) {
     case 'doc-manual-check':   docManualCheck(did,tid);                    break;
     case 'remove-doc-url':     removeDocUrl(did,tid);                      break;
     case 'open-task-document': openTaskDocument(did,tid);                  break;
-    case 'open-task-document-local': auditLocalDocOpen(did,tid);           break;
     case 'open-task-document-online': openTaskDocumentOnline(did,tid);     break;
     case 'client-delivery': showModalClientDelivery(did,tid);              break;
     case 'open-client-delivery': openClientDelivery(btn.dataset.deliveryId,false); break;
@@ -4510,7 +4506,7 @@ window.modalSaveLocalPath = async function(did,tid) {
 window.showFolderPathModal = function(did, tid) {
   const found = findDoc(did, tid); if (!found) return;
   const {doc} = found;
-  showModal(`<div class="modal-header"><div class="modal-title">📂 Φάκελος Εγγράφου</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div style="margin-bottom:12px;padding:10px 12px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.78rem;color:#92400e;line-height:1.5"><strong>Πώς να βρείτε τη διαδρομή:</strong><br>Στον Explorer, <strong>Shift + δεξί κλικ</strong> πάνω στον φάκελο → <strong>"Αντιγραφή ως διαδρομή"</strong> → επικολλήστε παρακάτω.</div><div class="form-group"><label class="form-label">Τοπική διαδρομή φακέλου</label><input class="form-control" id="folder-path-inp" placeholder="T:\\B&E SOLUTIONS Dropbox\\03. SOLUTIONS-PROJECTS\\..." value="${esc(doc.folderPath||'')}" style="font-size:.82rem"></div><div style="margin-top:10px;padding:8px 12px;background:rgba(29,78,216,.06);border:1px solid rgba(29,78,216,.15);border-radius:6px;font-size:.72rem;color:var(--steel);line-height:1.6">💡 Το κουμπί <strong>📄 Άνοιγμα</strong> ανοίγει τον φάκελο απευθείας στον Explorer (και από το Netlify) αν έχετε εγκατεστημένη την επέκταση Chrome «Local Explorer» μαζί με το Integration Module της. Χωρίς αυτά, λειτουργεί μόνο όταν η εφαρμογή ανοίγεται τοπικά από το <strong>index.html</strong>.</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button>${doc.folderPath?`<button class="btn btn-danger btn-sm" onclick="modalClearFolderPath('${did}','${tid}')" style="margin-right:auto">Εκκαθάριση</button>`:''}<button class="btn btn-primary" onclick="modalSaveFolderPath('${did}','${tid}')">Αποθήκευση</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">📂 Φάκελος Εγγράφου</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div style="margin-bottom:12px;padding:10px 12px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;font-size:.78rem;color:#92400e;line-height:1.5"><strong>Πώς να βρείτε τη διαδρομή:</strong><br>Στον Explorer, <strong>Shift + δεξί κλικ</strong> πάνω στον φάκελο → <strong>"Αντιγραφή ως διαδρομή"</strong> → επικολλήστε παρακάτω.</div><div class="form-group"><label class="form-label">Τοπική διαδρομή φακέλου</label><input class="form-control" id="folder-path-inp" placeholder="T:\\B&E SOLUTIONS Dropbox\\03. SOLUTIONS-PROJECTS\\..." value="${esc(doc.folderPath||'')}" style="font-size:.82rem"></div><div style="margin-top:10px;padding:8px 12px;background:rgba(29,78,216,.06);border:1px solid rgba(29,78,216,.15);border-radius:6px;font-size:.72rem;color:var(--steel);line-height:1.6">💡 Το κουμπί <strong>📄 Άνοιγμα</strong> ανοίγει τον φάκελο στον Explorer μόνο όταν η εφαρμογή ανοίγεται τοπικά από το <strong>index.html</strong>, όχι από το Netlify.</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button>${doc.folderPath?`<button class="btn btn-danger btn-sm" onclick="modalClearFolderPath('${did}','${tid}')" style="margin-right:auto">Εκκαθάριση</button>`:''}<button class="btn btn-primary" onclick="modalSaveFolderPath('${did}','${tid}')">Αποθήκευση</button></div>`);
 };
 window.modalSaveFolderPath = async function(did, tid) {
   const raw = (el('folder-path-inp')?.value||'').trim().replace(/^"|"$/g,'').trim();
@@ -4610,27 +4606,6 @@ function _localFileHref(rawPath) {
 }
 function _canOpenLocalDocuments() {
   return window.location?.protocol==='file:';
-}
-// Επιστρέφει synchronous file:// href αν το έγγραφο έχει άμεσα υπολογίσιμο τοπικό προορισμό
-// (τοπική διαδρομή Dropbox ή folderPath) — ΧΩΡΙΣ async Storage κλήσεις. Χρησιμοποιείται για να
-// φτιάξουμε πραγματικό <a href="file://..."> σύνδεσμο (αντί για window.open() μέσα από JS), ώστε
-// επεκτάσεις όπως το "Local Explorer" να μπορούν να τον εντοπίσουν και να τον ανοίξουν στον Explorer,
-// ακόμη κι όταν η εφαρμογή τρέχει από το Netlify (https), όχι μόνο τοπικά (file:).
-function _resolveDocLocalHref(doc) {
-  if (!doc || doc.file) return null; // Storage αρχείο -> χρειάζεται async signed URL, όχι static href
-  if (doc.url) {
-    const sources=_dropboxDocumentSources(doc.url);
-    if (sources.localPath) return _localFileHref(sources.localPath);
-    if (_isLocalDocumentUrl(doc.url)) return _localFileHref(doc.url);
-    return null; // μόνο online link
-  }
-  if (doc.folderPath) return _localFileHref(doc.folderPath);
-  return null;
-}
-function auditLocalDocOpen(did,tid){
-  const found=findDoc(did,tid); if(!found) return;
-  const {doc,task}=found;
-  auditLog('Άνοιγμα εγγράφου',`"${doc.name}" – ${task.name}`);
 }
 // Build clean Dropbox URL from a raw path string
 function _dbxBuildUrl(rawPath) {
