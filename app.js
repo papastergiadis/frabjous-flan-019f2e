@@ -8930,6 +8930,7 @@ function showModalCrmCompany(id) {
 window.modalSaveCrmCompany = async function(id) {
   const name = (document.getElementById('co-name')?.value||'').trim();
   if (!name) { alert('Η επωνυμία είναι υποχρεωτική.'); return; }
+  if (!isSupabaseAuthMode()) { showToast('Η αποθήκευση στοιχείων CRM απαιτεί σύνδεση μέσω Supabase (κρυπτογράφηση κωδικών).', 'error'); return; }
   // collect phones
   const phones=[]; document.querySelectorAll('input[id^="co-ph-"]').forEach(inp=>{if(inp.value.trim())phones.push(inp.value.trim());});
   const emails=[]; document.querySelectorAll('input[id^="co-em-"]').forEach(inp=>{if(inp.value.trim())emails.push(inp.value.trim());});
@@ -8950,6 +8951,19 @@ window.modalSaveCrmCompany = async function(id) {
     if(cat) extras.push({category:cat,username:u,password:p});
     ei++;
   }
+  // encrypt extras' passwords server-side before they ever leave the DB round-trip in cleartext
+  let encExtras = extras;
+  if (extras.length) {
+    try {
+      const {data: encData, error: encErr} = await sb.rpc('app_crm_encrypt_extra_creds', {p_items: extras});
+      if (encErr) throw encErr;
+      encExtras = encData || extras;
+    } catch(err) {
+      console.error('app_crm_encrypt_extra_creds error:', err);
+      showToast('Σφάλμα κρυπτογράφησης στοιχείων: ' + (err?.message||JSON.stringify(err)), 'error');
+      return;
+    }
+  }
   const existing = id ? (state.db.crmCompanies||[]).find(x=>x.id===id) : null;
   const data = Object.assign({}, existing||{}, {
     company_name: name,
@@ -8966,7 +8980,7 @@ window.modalSaveCrmCompany = async function(id) {
     phones_json: phones.length>1?JSON.stringify(phones):null,
     emails_json: emails.length>1?JSON.stringify(emails):null,
     addresses_json: addrs.length>1?JSON.stringify(addrs):null,
-    extra_creds_json: extras.length?JSON.stringify(extras):null,
+    extra_creds_json: encExtras.length?JSON.stringify(encExtras):null,
     created_at: existing?.created_at||new Date().toISOString(),
   });
   // clear legacy credential columns to avoid confusion
@@ -9081,6 +9095,7 @@ function showModalCrmContact(id) {
 }
 
 window.modalSaveCrmContact = async function(id) {
+  if (!isSupabaseAuthMode()) { showToast('Η αποθήκευση στοιχείων CRM απαιτεί σύνδεση μέσω Supabase (κρυπτογράφηση κωδικών).', 'error'); return; }
   const existing = id?(state.db.crmContacts||[]).find(x=>x.id===id):null;
   // collect phones
   const phones=[],phoneLbls=[]; let pi=0;
@@ -9096,6 +9111,22 @@ window.modalSaveCrmContact = async function(id) {
     const l=document.getElementById('ct-em-lbl-'+ei)?.value||'Work';
     if(v){emails.push(v);emailLbls.push(l);}
     ei++;
+  }
+  // encrypt taxisnet/hpm/hma passwords server-side before saving
+  const rawCreds = {
+    taxisnet_password: document.getElementById('ct-tx-p')?.value.trim()||null,
+    hpm_password: document.getElementById('ct-hpm-p')?.value.trim()||null,
+    hma_password: document.getElementById('ct-hma-p')?.value.trim()||null,
+  };
+  let encCreds = rawCreds;
+  try {
+    const {data: encData, error: encErr} = await sb.rpc('app_crm_encrypt_credentials', {p_fields: rawCreds});
+    if (encErr) throw encErr;
+    encCreds = encData || rawCreds;
+  } catch(err) {
+    console.error('app_crm_encrypt_credentials error:', err);
+    showToast('Σφάλμα κρυπτογράφησης κωδικών: ' + (err?.message||JSON.stringify(err)), 'error');
+    return;
   }
   const data = Object.assign({},existing||{},{
     first_name: document.getElementById('ct-fn')?.value.trim()||null,
@@ -9119,11 +9150,11 @@ window.modalSaveCrmContact = async function(id) {
     amka:       document.getElementById('ct-amka')?.value.trim()||null,
     id_number:  document.getElementById('ct-adt')?.value.trim()||null,
     taxisnet_username: document.getElementById('ct-tx-u')?.value.trim()||null,
-    taxisnet_password: document.getElementById('ct-tx-p')?.value.trim()||null,
+    taxisnet_password: encCreds.taxisnet_password ?? null,
     hpm_username: document.getElementById('ct-hpm-u')?.value.trim()||null,
-    hpm_password: document.getElementById('ct-hpm-p')?.value.trim()||null,
+    hpm_password: encCreds.hpm_password ?? null,
     hma_username: document.getElementById('ct-hma-u')?.value.trim()||null,
-    hma_password: document.getElementById('ct-hma-p')?.value.trim()||null,
+    hma_password: encCreds.hma_password ?? null,
     notes: document.getElementById('ct-notes')?.value.trim()||null,
     created_at: existing?.created_at||new Date().toISOString(),
   });
