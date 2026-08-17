@@ -4,6 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>B&amp;E Solutions – Project Management</title>
+  <script>
+    // Apply saved theme before first paint to avoid a light-mode flash.
+    (function(){
+      try {
+        var t = localStorage.getItem('bne_theme');
+        if (!t && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) t = 'dark';
+        if (t === 'dark') document.documentElement.classList.add('theme-dark');
+      } catch(e){}
+    })();
+  </script>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="logo.jpg">
   <!-- Supabase JS -->
@@ -159,6 +169,7 @@
     </nav>
     <div class="header-spacer"></div>
     <button class="btn btn-ghost btn-sm" id="header-search-btn" style="display:none" onclick="showGlobalSearch()" title="Αναζήτηση (Ctrl+K)">🔍</button>
+    <button class="btn btn-ghost btn-sm theme-toggle-btn" id="theme-toggle-btn" onclick="toggleTheme()" title="Εναλλαγή σκούρου θέματος">🌙</button>
     <div id="header-user"></div>
     <button class="btn btn-ghost btn-sm" id="header-logout-btn" style="display:none" onclick="doLogout()">Αποσύνδεση</button>
   </header>
@@ -174,6 +185,9 @@
 
 <!-- Toast -->
 <div class="toast-wrap" id="toast-wrap"></div>
+
+<!-- Hidden print area, populated by exportXToPDF() then printed via window.print() -->
+<div id="print-area"></div>
 
 <script>
   function toggleSidebar() {
