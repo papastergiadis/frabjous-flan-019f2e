@@ -762,7 +762,10 @@ function clearCurrentUser() {
   sessionStorage.removeItem('be_pm_user');
 }
 
-function isAdmin()  { return ['admin','management'].includes(state.cu?.role); }
+// Admin/Management share several operational capabilities, but user
+// administration and the global audit trail are reserved for Admin only.
+function isAdmin()      { return ['admin','management'].includes(state.cu?.role); }
+function isAdminOnly()  { return state.cu?.role === 'admin'; }
 function isPM()     { return state.cu?.role === 'project_manager'; }
 function isClient() { return state.cu?.role === 'client'; }
 function canEdit()  { return ['admin','management','project_manager','team_member'].includes(state.cu?.role); }
@@ -1564,6 +1567,11 @@ function findDoc(did, tid) {
 // ── NAVIGATION ────────────────────────────────────────────────────
 function navigate(view, opts={}) {
   if (view!=='login' && !state.cu) { state.view='login'; render(); return; }
+  if (['users','audit'].includes(view) && !isAdminOnly()) {
+    state.view='dashboard';
+    render();
+    return;
+  }
   state.view=view;
   if (opts.categoryId  !==undefined) state.categoryId  =opts.categoryId;
   if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) state.ganttView=false; state.projectId=opts.projectId; }
@@ -1694,7 +1702,7 @@ function _updateSidebarFooter() {
 
 function updateNav() {
   document.querySelectorAll('.nav-link[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.view));
-  document.querySelectorAll('[data-admin-only]').forEach(e2=>{ e2.style.display=isAdmin()?'':'none'; });
+  document.querySelectorAll('[data-admin-only]').forEach(e2=>{ e2.style.display=isAdminOnly()?'':'none'; });
   document.querySelectorAll('[data-mgmt-only]').forEach(e2=>{ e2.style.display=canViewTemplates()?'':'none'; });
   document.querySelectorAll('[data-noClient-only]').forEach(e2=>{ e2.style.display=(state.cu&&state.cu.role!=='client')?'':'none'; });
   const ni=el('nav-count'); if(ni) ni.textContent=visibleProjects().filter(p=>p.status==='in_progress').length;
@@ -3130,7 +3138,7 @@ function renderProject() {
 
 // ── VIEW: USERS ───────────────────────────────────────────────────
 function renderUsers() {
-  if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if (!isAdminOnly()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
   const onlineCount = state.db.users.filter(u => state.onlineUsers.has(u.id)).length;
   const rows = state.db.users.map(u => {
     const ri = ROLE_INFO[u.role] || {};
@@ -3240,7 +3248,7 @@ function renderProjectAuditTimeline(proj) {
 
 // ── VIEW: AUDIT ───────────────────────────────────────────────────
 function renderAudit() {
-  if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if (!isAdminOnly()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
   const log=state.db.auditLog.slice(0,100);
   return `
   <div class="page-hd"><div><h1>Ιστορικό Αλλαγών</h1><div class="page-hd-sub">${log.length} εγγραφές</div></div><div class="page-hd-actions"><button class="btn btn-danger btn-sm" data-action="clear-audit">Εκκαθάριση</button></div></div>
