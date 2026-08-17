@@ -207,10 +207,6 @@ async function fetchTimesheetRowsForBilling(projectId,dateFrom,dateTo){
 }
 
 async function loadFromDB() {
-     if (!isSupabaseAuthMode()) {
-    state.db = emptyDbState();
-    return;
-  }
   try {
     if (isSupabaseAuthMode()) {
       const [u, c, p, a, t, ts, tc, cc, comp, cont, off, notif, deliveries] = await Promise.all([
@@ -514,9 +510,9 @@ async function dbClearAudit() {
 }
 
 // Fire-and-forget audit (never blocks UI)
-function auditLog(action, details='') {
+function auditLog(action, details='', projectId=null) {
   if (!state.cu || !sb) return;
-  const entry = { id:uid(), userId:state.cu.id, userName:state.cu.name, role:state.cu.role, timestamp:nowTS(), action, details };
+  const entry = { id:uid(), userId:state.cu.id, userName:state.cu.name, role:state.cu.role, timestamp:nowTS(), action, details, projectId };
   state.db.auditLog = state.db.auditLog || [];
   state.db.auditLog.unshift(entry);
   if (state.db.auditLog.length > 500) state.db.auditLog = state.db.auditLog.slice(0,500);
@@ -776,6 +772,10 @@ const state = {
   sortByPriority: false,
   ganttView:    false,
   ganttScale:   'month',
+  dashSortMode: 'deadline',
+  dashSortOpen: false,
+  asgnSortMode: 'smart',
+  asgnSortOpen: false,
   calViewMode:  'month',
   calYear:      null,
   calMonth:     null,
@@ -785,6 +785,7 @@ const state = {
   clientExpanded:  {},
   notifOpen:    false,
   notificationFilter: 'all',
+  notifSearch:  '',
   onlineUsers:  new Set(),
   storageStats: null, // { usedBytes, fileCount } loaded async
   offersSearch: '',
@@ -803,6 +804,7 @@ const state = {
   tsFilterTo: '',
   tsSortKey: 'date',
   tsSortDir: 'desc',
+  bulkSelected: new Set(),
 };
 
 // ── PRESENCE ──────────────────────────────────────────────────────
@@ -1038,6 +1040,13 @@ function getStandingProjects() {
   return (state.db.projects||[]).filter(p=>p.standing===true)
     .sort((a,b)=>(a.name||'').localeCompare(b.name||'','el'));
 }
+// Τα Μόνιμα Έργα Timesheet (standing) δεν έχουν φάσεις/μέλη/PM, οπότε το
+// visibleProjects() (που φιλτράρει με βάση ανάθεση) τα αποκλείει πάντα για
+// project_manager/team_member. Πρέπει όμως να εμφανίζονται σε όλους.
+function unionStandingProjects(projects) {
+  const ids=new Set(projects.map(p=>p.id));
+  return [...projects, ...getStandingProjects().filter(sp=>!ids.has(sp.id))];
+}
 function sortByCode(projects) {
   return [...projects].sort((a,b) => {
     const ca = (a.code||'').toLowerCase(), cb = (b.code||'').toLowerCase();
@@ -1062,6 +1071,13 @@ function buildTsProjectOptions(regularProjects, selectedId='', selectedName='') 
     + historical
     + (standing.length ? `<optgroup label="── Μόνιμα Έργα ──">${standing.map(opt).join('')}</optgroup>` : '')
     + `<optgroup label="── Ενεργά Έργα ──">${regular.map(opt).join('')}</optgroup>`;
+}
+function buildTsTaskOptions(projectId, selectedId='') {
+  const proj = getProject(projectId);
+  if(!proj) return '<option value="">— Επιλέξτε εργασία (προαιρετικό) —</option>';
+  const tasks = (proj.phases||[]).flatMap(ph=>(ph.tasks||[]).filter(t=>t.status!=='cancelled').map(t=>({id:t.id,name:`[${ph.name}] ${t.name}`})));
+  if(!tasks.length) return '<option value="">Δεν υπάρχουν εργασίες</option>';
+  return `<option value="">— Χωρίς συγκεκριμένη εργασία —</option>${tasks.map(t=>`<option value="${t.id}"${t.id===selectedId?' selected':''}>${esc(t.name)}</option>`).join('')}`;
 }
 function getTemplate(id) { return (state.db.templates||[]).find(t=>t.id===id); }
 // backward compat: projects may have managerId (old) or managerIds (new)
@@ -1175,6 +1191,29 @@ function assignedProjectOrder(projects, user) {
     if(pa!==pb) return pa-pb;
     return (a.name||'').localeCompare(b.name||'','el');
   });
+}
+
+// Κριτήρια ταξινόμησης της λίστας εργασιών στο Assigned To.
+// 'smart' (προεπιλογή): πρώτα οι επείγουσες εργασίες, μετά όσες έχουν την
+// πλησιέστερη προθεσμία λήξης· χωρίς προθεσμία πάνε τελευταία· ισοπαλία → αλφαβητικά έργου.
+const ASGN_SORT_OPTIONS = {
+  smart:    'Έξυπνη Σειρά (Επείγον + Προθεσμία)',
+  urgent:   'Επείγοντα Πρώτα',
+  deadline: 'Πλησιέστερη Προθεσμία',
+  category: 'Κατηγορία Έργου',
+  name:     'Αλφαβητικά (Α–Ω)',
+};
+function _asgnSortRows(rows, mode) {
+  const m = mode || state.asgnSortMode || 'smart';
+  if (m==='category') return rows; // ήδη σε σειρά κατηγορίας/προτίμησης από το assignedProjectOrder
+  const byName = (a,b) => (a.proj.name||'').localeCompare(b.proj.name||'','el');
+  const byDeadline = (a,b) => (a.task.plannedEnd||'9999-99-99').localeCompare(b.task.plannedEnd||'9999-99-99');
+  const byUrgent = (a,b) => (b.task.urgent?1:0) - (a.task.urgent?1:0);
+  if (m==='name')     return [...rows].sort((a,b) => byName(a,b) || byDeadline(a,b));
+  if (m==='deadline') return [...rows].sort((a,b) => byDeadline(a,b) || byName(a,b));
+  if (m==='urgent')   return [...rows].sort((a,b) => byUrgent(a,b));
+  // 'smart'
+  return [...rows].sort((a,b) => byUrgent(a,b) || byDeadline(a,b) || byName(a,b));
 }
 
 function canSetTaskUrgent(proj,task) {
@@ -1385,6 +1424,49 @@ async function notifyPhaseActivation(proj, previousPhaseId) {
   await emitProjectNotification('action_scan',proj,null,null,null,'');
 }
 
+function checkDeadlineAlerts() {
+  if(!state.cu||state.cu.role==='client') return;
+  const _today=today();
+  const seenKey='be_deadline_alerted_'+state.cu.id+'_'+_today;
+  if(sessionStorage.getItem(seenKey)) return; // only once per day
+  sessionStorage.setItem(seenKey,'1');
+  const uid_=state.cu.id;
+  const projs=visibleProjects().filter(p=>p.status==='in_progress');
+  const overdueTasks=[];
+  projs.forEach(p=>(p.phases||[]).forEach(ph=>(ph.tasks||[]).forEach(t=>{
+    if(t.status==='completed'||t.status==='cancelled'||t.status==='not_required') return;
+    if(!t.plannedEnd||t.plannedEnd>=_today) return;
+    const isAssigned=t.assigneeId===uid_||(t.memberIds||[]).includes(uid_);
+    if(isAssigned||['admin','management'].includes(state.cu.role)){
+      overdueTasks.push({proj:p,ph,t});
+    }
+  })));
+  if(!overdueTasks.length) return;
+  // Create local notifications for overdue tasks (not persisted, just in-session)
+  const now=nowTS();
+  overdueTasks.slice(0,5).forEach(({proj,ph,t})=>{
+    const nid='deadline_'+t.id;
+    const already=(state.db.notifications||[]).find(n=>n.id===nid);
+    if(already) return;
+    const notif={
+      id:nid,source:'legacy',
+      type:'deadline_alert',
+      title:`⚠ Εκπρόθεσμο: ${t.name}`,
+      sub:`${proj.name} · ${ph.name} · Έληξε: ${fmt(t.plannedEnd)}`,
+      projId:proj.id,tid:t.id,
+      at:now,read:false,readAt:null,
+      projectId:proj.id,taskId:t.id
+    };
+    state.db.notifications=(state.db.notifications||[]);
+    state.db.notifications.unshift(notif);
+    if(state.cu.notifications) state.cu.notifications=(state.cu.notifications||[]);
+    (state.cu.notifications||[]).unshift({...notif,read:false});
+  });
+  if(overdueTasks.length>0){
+    updateHeaderUser();
+    showToast(`⚠ ${overdueTasks.length} εκπρόθεσμ${overdueTasks.length===1?'η':'ες'} εργασί${overdueTasks.length===1?'α':'ες'} χρειάζονται προσοχή!`,'error');
+  }
+}
 
 function taskDocProgress(task) {
   const total=task.docs.length, done=task.docs.filter(d=>d.done).length;
@@ -1424,18 +1506,44 @@ function projectProgress(proj) {
     total:{ pct:tasksPct },
   };
 }
+function projectHealthScore(proj) {
+  if(proj.status==='completed') return {level:'green',label:'✅ Ολοκληρώθηκε',color:'var(--green)'};
+  const prog=projectProgress(proj);
+  const _today=today();
+  const allTasks=(proj.phases||[]).flatMap(ph=>ph.tasks||[]);
+  const activeTasks=allTasks.filter(t=>t.status!=='cancelled'&&t.status!=='not_required');
+  const overdue=activeTasks.filter(t=>t.plannedEnd&&t.plannedEnd<_today&&t.status!=='completed').length;
+  const overdueRatio=activeTasks.length>0?overdue/activeTasks.length:0;
+  let score=100-Math.round(overdueRatio*60);
+  if(proj.endDate&&proj.startDate){
+    const span=new Date(proj.endDate)-new Date(proj.startDate);
+    const elapsed=(new Date()-new Date(proj.startDate))/span;
+    if(elapsed>0.5&&prog.total.pct<Math.max(0,elapsed*80)) score-=20;
+  }
+  score=Math.max(0,score);
+  if(score>=70) return{level:'green',label:'🟢 Καλή',color:'var(--green)'};
+  if(score>=40) return{level:'amber',label:'🟡 Προσοχή',color:'var(--amber)'};
+  return{level:'red',label:'🔴 Κρίσιμο',color:'var(--red)'};
+}
 function dashStats() {
   const projs=visibleProjects().filter(p=>!p.standing);
-  let pendingDocs=0, pendingReviews=0;
-  projs.forEach(p=>(p.phases||[]).forEach(ph=>{
-    (ph.tasks||[]).forEach(t=>(t.docs||[]).forEach(d=>{ if(!d.done) pendingDocs++; }));
-    if(ph.reviewStatus==='pending') pendingReviews++;
-    (ph.tasks||[]).forEach(t=>{
-      if(t.reviewStatus==='pending') pendingReviews++;
-      (t.subtasks||[]).forEach(st=>{ if(st.reviewStatus==='pending') pendingReviews++; });
+  let pendingDocs=0, pendingReviews=0, overdueTasks=0, totalProg=0;
+  const _today=today();
+  projs.forEach(p=>{
+    (p.phases||[]).forEach(ph=>{
+      (ph.tasks||[]).forEach(t=>{
+        (t.docs||[]).forEach(d=>{ if(!d.done) pendingDocs++; });
+        if(t.reviewStatus==='pending') pendingReviews++;
+        (t.subtasks||[]).forEach(st=>{ if(st.reviewStatus==='pending') pendingReviews++; });
+        if(t.plannedEnd && t.plannedEnd<_today && t.status!=='completed' && t.status!=='cancelled' && t.status!=='not_required')
+          overdueTasks++;
+      });
+      if(ph.reviewStatus==='pending') pendingReviews++;
     });
-  }));
-  return { total:projs.length, active:projs.filter(p=>p.status==='in_progress').length, onHold:projs.filter(p=>p.status==='on_hold').length, done:projs.filter(p=>p.status==='completed').length, pendingDocs, pendingReviews };
+    totalProg += projectProgress(p).total.pct;
+  });
+  const avgProgress = projs.length===0 ? 0 : Math.round(totalProg/projs.length);
+  return { total:projs.length, active:projs.filter(p=>p.status==='in_progress').length, onHold:projs.filter(p=>p.status==='on_hold').length, done:projs.filter(p=>p.status==='completed').length, pendingDocs, pendingReviews, overdueTasks, avgProgress };
 }
 function findDoc(did, tid) {
   for (const proj of state.db.projects)
@@ -1530,7 +1638,7 @@ function render() {
       case 'crm-contacts':     main.innerHTML=renderCrmContacts();   break;
       case 'crm-company':      main.innerHTML=renderCrmCompany();    break;
       case 'crm-contact':      main.innerHTML=renderCrmContact();    break;
-      case 'offers':           main.innerHTML=renderOffers();        break;
+      case 'offers':           main.innerHTML=renderOffers(); setTimeout(_initOffersTopScroll,0); break;
       case 'assigned':         main.innerHTML=renderAssigned();      break;
       default:                 main.innerHTML=renderDashboard();
     }
@@ -1673,41 +1781,13 @@ function getNotifications() {
   });
 }
 
-function ensureNotificationCenterStyles() {
-  if(document.getElementById('notification-center-fix2-styles')) return;
-  const style=document.createElement('style');
-  style.id='notification-center-fix2-styles';
-  style.textContent=`
-    .notification-center-page{max-width:1180px;margin:0 auto}
-    .notification-center-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0 12px}
-    .notification-filter-tabs{display:flex;gap:8px;flex-wrap:wrap}
-    .notification-filter-tab{border:1px solid var(--slate-200);background:#fff;color:var(--slate-600);border-radius:7px;padding:7px 12px;font-size:.75rem;font-weight:700;cursor:pointer}
-    .notification-filter-tab.active{background:var(--navy);border-color:var(--navy);color:#fff}
-    .notification-list-card{background:#fff;border:1px solid var(--slate-200);border-radius:10px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04)}
-    .notification-list-scroll{max-height:calc(100vh - 285px);min-height:230px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
-    .notification-center-row{display:grid;grid-template-columns:42px minmax(0,1fr) 24px;gap:13px;align-items:start;padding:17px 18px;border-bottom:1px solid var(--slate-200);background:#fff;transition:background .15s ease}
-    .notification-center-row:last-child{border-bottom:0}
-    .notification-center-row.is-unread{background:#fffdfa}
-    .notification-center-row.is-clickable{cursor:pointer}
-    .notification-center-row.is-clickable:hover{background:#f8fafc}
-    .notification-center-icon{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.78rem;color:#fff;margin-top:1px}
-    .notification-center-icon.urgent{background:#ef4444}
-    .notification-center-icon.action{background:#f97316}
-    .notification-center-icon.info{background:#2563eb}
-    .notification-center-title{display:flex;align-items:center;gap:8px;color:var(--navy);font-size:.85rem;font-weight:800;line-height:1.35}
-    .notification-unread-dot{width:7px;height:7px;border-radius:50%;background:#2563eb;flex:0 0 auto}
-    .notification-center-message{color:var(--slate-600);font-size:.75rem;line-height:1.45;margin-top:3px}
-    .notification-center-time{color:var(--slate-400);font-size:.67rem;margin-top:7px}
-    .notification-center-arrow{color:#f97316;font-size:1.45rem;line-height:1;margin-top:7px;text-align:right}
-    .notification-center-empty{padding:58px 20px;text-align:center;color:var(--slate-400)}
-    @media(max-width:700px){
-      .notification-center-toolbar{align-items:flex-start;flex-direction:column}
-      .notification-center-row{grid-template-columns:36px minmax(0,1fr) 18px;padding:14px 12px;gap:10px}
-      .notification-list-scroll{max-height:calc(100vh - 330px)}
-    }
-  `;
-  document.head.appendChild(style);
-}
+// Notification Center + bell-dropdown CSS used to live only in this
+// JS-injected <style> tag, which was only ever added once the user opened
+// the full Notifications page — so the bell dropdown rendered unstyled
+// (no card, no positioning) everywhere else until that happened. All of
+// these rules now live permanently in style.css, so this is a no-op kept
+// only so the existing call site doesn't need to change.
+function ensureNotificationCenterStyles() {}
 
 function notificationCategory(n) {
   if((n.priority||'normal')==='urgent') return 'urgent';
@@ -1719,16 +1799,45 @@ function renderNotifications() {
   ensureNotificationCenterStyles();
   const all=getNotifications();
   const filter=state.notificationFilter||'all';
+  const search=(state.notifSearch||'').trim().toLocaleLowerCase('el');
   const counts={
     all:all.length,
     action:all.filter(n=>notificationCategory(n)==='action').length,
     urgent:all.filter(n=>notificationCategory(n)==='urgent').length,
-    info:all.filter(n=>notificationCategory(n)==='info').length
+    info:all.filter(n=>notificationCategory(n)==='info').length,
+    unread:all.filter(n=>!n.read).length
   };
-  const shown=filter==='all'?all:all.filter(n=>notificationCategory(n)===filter);
-  const filters=[['all','Όλες'],['action','Ενέργεια'],['urgent','Επείγον'],['info','Ενημέρωση']];
-  const tabs=filters.map(([key,label])=>`<button class="notification-filter-tab${filter===key?' active':''}" data-action="filter-notifications" data-val="${key}">${label} <span>${counts[key]}</span></button>`).join('');
-  const rows=shown.map(n=>{
+  // --- βελτίωση #1: tab Αδιάβαστα ---
+  const filters=[['all','Όλες'],['unread','Αδιάβαστα'],['action','Ενέργεια'],['urgent','Επείγον'],['info','Ενημέρωση']];
+  const tabs=filters.map(([key,label])=>`<button class="notification-filter-tab${filter===key?' active':''}" data-action="filter-notifications" data-val="${key}">${label} <span>${counts[key]||0}</span></button>`).join('');
+
+  // φίλτρο κατηγορίας
+  let shown=filter==='all'?all
+    :filter==='unread'?all.filter(n=>!n.read)
+    :all.filter(n=>notificationCategory(n)===filter);
+
+  // --- βελτίωση #6: search ---
+  if(search) shown=shown.filter(n=>{
+    const hay=`${n.title||''} ${n.sub||''} ${n.message||''}`.toLocaleLowerCase('el');
+    return hay.includes(search);
+  });
+
+  // --- βελτίωση #4: date dividers ---
+  function dateBucket(ts){
+    if(!ts) return 'older';
+    const d=new Date(ts); const now=new Date();
+    const diffMs=now-d; const diffDays=Math.floor(diffMs/86400000);
+    if(diffDays<1 && d.getDate()===now.getDate()) return 'today';
+    if(diffDays<2 && d.getDate()===now.getDate()-1) return 'yesterday';
+    if(diffDays<7) return 'week';
+    return 'older';
+  }
+  const bucketLabel={today:'Σήμερα',yesterday:'Χθες',week:'Αυτή την εβδομάδα',older:'Παλαιότερα'};
+  const bucketOrder=['today','yesterday','week','older'];
+  const grouped={today:[],yesterday:[],week:[],older:[]};
+  shown.forEach(n=>{ const b=dateBucket(n.createdAt); (grouped[b]||(grouped['older'])).push(n); });
+
+  function renderRow(n){
     const category=notificationCategory(n);
     const icon=category==='urgent'?'!':category==='action'?'⚡':'i';
     const hasTarget=!!(n.projId||n.tid);
@@ -1751,13 +1860,30 @@ function renderNotifications() {
       </div>
       <div class="notification-center-arrow">${hasTarget&&!isReminder?'›':''}</div>
     </div>`;
-  }).join('');
+  }
+
+  let rows='';
+  bucketOrder.forEach(b=>{
+    if(!grouped[b]||!grouped[b].length) return;
+    rows+=`<div class="notif-date-divider">${bucketLabel[b]}</div>`;
+    rows+=grouped[b].map(renderRow).join('');
+  });
+
+  const hasRead=all.some(n=>n.read);
+  const hasUnread=all.some(n=>!n.read);
+
   return `<div class="notification-center-page">
     <div class="page-hd">
       <div><h1>Ειδοποιήσεις</h1><div class="page-hd-sub">Όλες οι ενημερώσεις και οι ενέργειες που απαιτούν την προσοχή σας.</div></div>
-      <div class="page-hd-actions"><button class="btn btn-ghost btn-sm" data-action="mark-all-notifications-read" ${!all.some(n=>!n.read)?'disabled':''}>✓ Όλα διαβασμένα</button></div>
+      <div class="page-hd-actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" data-action="mark-all-notifications-read" ${!hasUnread?'disabled':''}>✓ Όλα διαβασμένα</button>
+        <button class="btn btn-ghost btn-sm" data-action="clear-read-notifications" ${!hasRead?'disabled':''} title="Διαγραφή όλων των διαβασμένων ειδοποιήσεων">🗑 Εκκαθάριση</button>
+      </div>
     </div>
-    <div class="notification-center-toolbar"><div class="notification-filter-tabs">${tabs}</div></div>
+    <div class="notification-center-toolbar">
+      <div class="notification-filter-tabs">${tabs}</div>
+      <div class="notif-search-wrap"><input class="notif-search-input" type="search" placeholder="Αναζήτηση…" value="${esc(state.notifSearch||'')}" oninput="state.notifSearch=this.value;render()"></div>
+    </div>
     <div class="notification-list-card"><div class="notification-list-scroll">${rows||'<div class="notification-center-empty">Δεν υπάρχουν ειδοποιήσεις σε αυτή την κατηγορία.</div>'}</div></div>
   </div>`;
 }
@@ -1767,7 +1893,13 @@ async function markOneNotificationRead(nid, source='table') {
     const {error}=await sb.rpc('app_notifications_mark_read',{p_notification_ids:[nid]});
     if(error) console.warn('notification read:',error);
     const n=(state.db.notifications||[]).find(x=>x.id===String(nid));
-    if(n) n.readAt=nowTS();
+    if(n){
+      n.readAt=nowTS();
+      // βελτίωση #3: ειδοποιήσεις χωρίς target αφαιρούνται αμέσως από τη λίστα
+      if(!n.projectId && !n.taskId && !n.projId && !n.tid){
+        state.db.notifications=state.db.notifications.filter(x=>x.id!==String(nid));
+      }
+    }
     updateHeaderUser();
     if(state.view==='notifications') render();
     return;
@@ -1776,9 +1908,13 @@ async function markOneNotificationRead(nid, source='table') {
   if(source==='legacy'){
     const arr=state.cu?.notifications||[];
     const n=arr.find(x=>String(x.id)===String(nid));
-    if(n) n.read=true;
+    if(n){
+      n.read=true;
+      // βελτίωση #3: ειδοποιήσεις χωρίς target αφαιρούνται αμέσως
+      if(!n.projId && !n.tid) state.cu.notifications=arr.filter(x=>String(x.id)!==String(nid));
+    }
     const dbu=(state.db.users||[]).find(u=>u.id===state.cu?.id);
-    if(dbu) dbu.notifications=arr;
+    if(dbu) dbu.notifications=state.cu.notifications||arr;
 
     if(isSupabaseAuthMode()){
       // Transitional legacy JSON RPC marks the small legacy array read.
@@ -1809,6 +1945,24 @@ window.markAllProjectNotificationsRead = async function() {
   }
   updateHeaderUser();
   if(state.view==='notifications') render();
+};
+
+// βελτίωση #2: Εκκαθάριση διαβασμένων
+window.clearReadNotifications = async function() {
+  const readIds=(state.db.notifications||[]).filter(n=>!!n.readAt).map(n=>n.id);
+  if(!readIds.length){ showToast('Δεν υπάρχουν διαβασμένες ειδοποιήσεις.',''); return; }
+  if(isSupabaseAuthMode()){
+    // Καλούμε delete για τις διαβασμένες αν υπάρχει RPC, αλλιώς μόνο τοπική αφαίρεση
+    await Promise.resolve(
+      sb.from('be_notifications').delete().in('id', readIds.map(id=>Number(id)||id))
+    ).catch(()=>{});
+  }
+  state.db.notifications=(state.db.notifications||[]).filter(n=>!n.readAt);
+  // legacy
+  if(state.cu.notifications) state.cu.notifications=state.cu.notifications.filter(n=>!n.read);
+  updateHeaderUser();
+  if(state.view==='notifications') render();
+  showToast(`${readIds.length} ειδοποιήσεις διαγράφηκαν.`,'success');
 };
 
 function notificationTargetValue(notification, keys) {
@@ -1897,6 +2051,9 @@ window.openNotificationTarget = async function(nid, source, pid, phid, tid) {
   const notification=findNotificationForOpen(nid,source);
   const target=findNotificationTarget(notification,pid,phid,tid);
 
+  // βελτίωση #3: mark-as-read ΠΡΙΝ navigation (fire-and-forget)
+  markOneNotificationRead(nid,source).catch(e=>console.warn('notification mark-read:',e));
+
   if(target.resolvedPid && target.proj){
     if(target.resolvedPhid) state.expandedPhases={...(state.expandedPhases||{}),[target.resolvedPhid]:true};
     if(target.resolvedTid){
@@ -1904,8 +2061,6 @@ window.openNotificationTarget = async function(nid, source, pid, phid, tid) {
       if(!state.commentsOpen) state.commentsOpen={};
       state.commentsOpen[target.resolvedTid]=true;
     }
-
-    // Navigation must never wait for the database mark-read request.
     state.notifOpen=false;
     navigate('project',{projectId:target.resolvedPid});
     requestAnimationFrame(()=>requestAnimationFrame(()=>{
@@ -1920,12 +2075,6 @@ window.openNotificationTarget = async function(nid, source, pid, phid, tid) {
     showToast('Το σχετικό έργο ή task δεν είναι πλέον διαθέσιμο.','error');
   }
 
-  try{
-    await markOneNotificationRead(nid,source);
-  }catch(error){
-    console.warn('notification click mark-read:',error);
-  }
-
   return !!(target.resolvedPid && target.proj);
 };
 
@@ -1937,7 +2086,37 @@ function updateHeaderUser() {
   const nc=unread.length;
   const isClient=state.cu.role==='client';
   const roleAndName=isClient?'':`<span class="role-badge ${ri.cls}">${ri.label}</span>&nbsp;<strong>${esc(state.cu.name)}</strong>`;
-  const bellHtml=isClient?'':`<div class="notif-wrap" style="position:relative;display:inline-block"><button class="notif-bell${nc?' notif-has':''}" data-action="nav-notifications" title="Ειδοποιήσεις">${nc?`<span class="notif-count">${nc}</span>`:''}🔔</button></div>`;
+
+  // βελτίωση #5: bell dropdown με preview 5 αδιάβαστων
+  let bellHtml='';
+  if(!isClient){
+    const preview=unread.slice(0,5);
+    const dropRows=preview.map(n=>{
+      const hasTarget=!!(n.projId||n.tid||n.projectId||n.taskId);
+      const cat=notificationCategory(n);
+      const icon=cat==='urgent'?'!':cat==='action'?'⚡':'i';
+      const actionAttr=hasTarget
+        ? `data-action="open-notification" data-nid="${esc(n.id)}" data-source="${esc(n.source||'table')}" data-pid="${esc(n.projId||n.projectId||'')}" data-phid="${esc(n.phid||n.phaseId||'')}" data-tid="${esc(n.tid||n.taskId||'')}"`
+        : `data-action="mark-notification-read" data-nid="${esc(n.id)}" data-source="${esc(n.source||'table')}"`;
+      return `<div class="notif-drop-row" ${actionAttr}>
+        <span class="notif-drop-icon ${cat}">${icon}</span>
+        <div class="notif-drop-body">
+          <div class="notif-drop-title">${esc(n.title)}</div>
+          <div class="notif-drop-sub">${esc(n.sub||n.message||'')}</div>
+          <div class="notif-drop-time">${fmtDT(n.createdAt)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    const dropFooter=`<div class="notif-drop-footer"><button data-action="notif-drop-all">Προβολή όλων${nc?` (${nc})`:''}→</button></div>`;
+    const dropHtml=`<div class="notif-dropdown${state.notifOpen?' is-open':''}">
+      ${preview.length?dropRows:'<div class="notif-drop-empty">Δεν υπάρχουν αδιάβαστες ειδοποιήσεις</div>'}
+      ${dropFooter}
+    </div>`;
+    bellHtml=`<div class="notif-wrap" style="position:relative;display:inline-block">
+      <button class="notif-bell${nc?' notif-has':''}" data-action="toggle-notif-drop" title="Ειδοποιήσεις">${nc?`<span class="notif-count">${nc}</span>`:''}🔔</button>
+      ${dropHtml}
+    </div>`;
+  }
   hui.innerHTML=`${bellHtml}${roleAndName}`;
 }
 
@@ -2140,7 +2319,7 @@ function _dashProjTable(projs) {
       const pct = projectProgress(p).total.pct;
       const pctColor = pct===100 ? 'var(--green)' : 'var(--orange)';
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
-        <div class="case-row-title">${esc(p.name)}</div>
+        <div class="case-row-title">${esc(p.name)} ${(()=>{const hs=projectHealthScore(p);return p.status==='in_progress'?`<span style="font-size:.65rem;padding:1px 6px;border-radius:3px;background:${hs.color}20;color:${hs.color};font-weight:700">${hs.label}</span>`:''})()}</div>
         <div class="text-sm">${esc(cat?.name||'—')}</div>
         <div class="text-sm">${esc(projManagerNames(p))}</div>
         <div class="text-sm">${phName}</div>
@@ -2249,6 +2428,39 @@ window.openPendingReview = function(pid,phid,tid) {
   }));
 };
 
+// Κριτήρια ταξινόμησης της λίστας έργων στο dashboard.
+// 'deadline' (προεπιλογή): επόμενη προθεσμία (ημ/νία έναρξης επόμενης ενεργής
+// φάσης) πρώτα· έργα χωρίς ημερομηνία πάνε τελευταία· ισοπαλία → αλφαβητικά.
+const DASH_SORT_OPTIONS = {
+  deadline: 'Επόμενη Προθεσμία',
+  name:     'Αλφαβητικά (Α–Ω)',
+  health:   'Κατάσταση Έργου',
+  progress: 'Πρόοδος (χαμηλότερη πρώτα)',
+};
+function _dashSortProjects(projs, mode) {
+  const m = mode || state.dashSortMode || 'deadline';
+  const byName = (a,b) => (a.name||'').localeCompare(b.name||'','el');
+  if (m==='name') return [...projs].sort(byName);
+  if (m==='health') {
+    const rank = {red:0, amber:1, green:2};
+    return [...projs].sort((a,b) => {
+      const ra = rank[projectHealthScore(a).level] ?? 3;
+      const rb = rank[projectHealthScore(b).level] ?? 3;
+      return ra-rb || byName(a,b);
+    });
+  }
+  if (m==='progress') {
+    return [...projs].sort((a,b) => projectProgress(a).total.pct - projectProgress(b).total.pct || byName(a,b));
+  }
+  // 'deadline'
+  return [...projs].sort((a,b) => {
+    const ph_a = nextActivePhase(a), ph_b = nextActivePhase(b);
+    const da = (ph_a ? phasePlannedDates(ph_a).start : null) || '9999-99-99';
+    const db = (ph_b ? phasePlannedDates(ph_b).start : null) || '9999-99-99';
+    return da.localeCompare(db) || byName(a,b);
+  });
+}
+
 function _dashFilteredProjs() {
   const f = state.dashFilter;
   if (!f) return '';
@@ -2267,17 +2479,69 @@ function _dashFilteredProjs() {
     if(!isAdminMgmt) return '';
     return renderPendingReviewQueue();
   }
-  // Ταξινόμηση βάσει ημερομηνίας έναρξης επόμενης ενεργής φάσης (nulls τελευταία)
-  projs = [...projs].sort((a,b) => {
-    const da = nextActivePhase(a)?.startDate || '9999-99-99';
-    const db = nextActivePhase(b)?.startDate || '9999-99-99';
-    return da.localeCompare(db);
-  });
+  else if (f==='overdue_tasks'){
+    const _today=today();
+    projs=all.filter(p=>(p.phases||[]).some(ph=>(ph.tasks||[]).some(t=>
+      t.plannedEnd&&t.plannedEnd<_today&&t.status!=='completed'&&t.status!=='cancelled'&&t.status!=='not_required'
+    )));
+    title='Έργα με Εκπρόθεσμες Εργασίες';
+  }
+  else if (f==='avg_progress'){
+    projs=all.filter(p=>p.status==='in_progress');
+    projs=[...projs].sort((a,b)=>projectProgress(b).total.pct-projectProgress(a).total.pct);
+    title='Έργα Ταξινομημένα κατά Πρόοδο';
+  }
+  // Το "avg_progress" widget έχει ήδη το δικό του νόημα ταξινόμησης (κλικ σε
+  // ένα συγκεκριμένο KPI) — τα υπόλοιπα σέβονται την επιλογή ταξινόμησης.
+  const sortable = f!=='avg_progress';
+  if (sortable) projs = _dashSortProjects(projs);
 
-  return `<div class="section-hd mb-12" style="margin-top:24px"><h3>${esc(title)}</h3><button class="btn btn-secondary btn-sm" data-action="nav-categories">Όλες οι Κατηγορίες</button></div>
+  const sortDropdown = sortable ? `<div class="dash-sort-wrap">
+    <button class="btn btn-secondary btn-sm" data-action="toggle-dash-sort" title="Ταξινόμηση">↕ ${esc(DASH_SORT_OPTIONS[state.dashSortMode||'deadline'])}</button>
+    <div class="dash-sort-dropdown${state.dashSortOpen?' is-open':''}">
+      ${Object.entries(DASH_SORT_OPTIONS).map(([k,label])=>`<div class="dash-sort-opt${(state.dashSortMode||'deadline')===k?' is-active':''}" data-action="set-dash-sort" data-val="${k}">${(state.dashSortMode||'deadline')===k?'✓ ':''}${esc(label)}</div>`).join('')}
+    </div>
+  </div>` : '';
+
+  return `<div class="section-hd mb-12" style="margin-top:24px"><h3>${esc(title)}</h3><div style="display:flex;align-items:center;gap:8px">${sortDropdown}<button class="btn btn-secondary btn-sm" data-action="nav-categories">Όλες οι Κατηγορίες</button></div></div>
   ${_dashProjTable(projs)}`;
 }
 
+function renderWorkloadWidget() {
+  const isAdminMgmt=['admin','management'].includes(state.cu?.role);
+  if(!isAdminMgmt) return '';
+  const _today=today();
+  const projs=visibleProjects().filter(p=>!p.standing&&p.status==='in_progress');
+  const userMap={};
+  projs.forEach(p=>(p.phases||[]).forEach(ph=>(ph.tasks||[]).forEach(t=>{
+    if(t.status==='cancelled'||t.status==='not_required'||t.status==='completed') return;
+    const uids=[t.assigneeId,...(t.memberIds||[])].filter(Boolean);
+    const isOvd=t.plannedEnd&&t.plannedEnd<_today;
+    uids.forEach(uid=>{
+      if(!userMap[uid]) userMap[uid]={name:getUser(uid)?.name||uid,open:0,overdue:0};
+      userMap[uid].open++;
+      if(isOvd) userMap[uid].overdue++;
+    });
+  })));
+  const rows=Object.values(userMap).sort((a,b)=>b.open-a.open);
+  if(!rows.length) return '';
+  const maxOpen=Math.max(...rows.map(r=>r.open),1);
+  return `<div class="card mt-16" style="margin-top:24px">
+    <div class="section-hd"><h3>👥 Φόρτος Εργασίας Ομάδας</h3><span class="text-sm text-muted">Ενεργές εργασίες ανά μέλος</span></div>
+    <div style="padding:0 4px">
+      ${rows.map(r=>`<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--slate-100)">
+        <div style="min-width:130px;font-size:.82rem;font-weight:600;color:var(--ink)">${esc(r.name)}</div>
+        <div style="flex:1;background:var(--slate-100);border-radius:4px;height:8px;overflow:hidden">
+          <div style="height:100%;width:${Math.round(r.open/maxOpen*100)}%;background:${r.overdue>0?'var(--red)':'var(--orange)'};border-radius:4px;transition:width .3s"></div>
+        </div>
+        <div style="min-width:60px;font-size:.8rem;text-align:right">
+          <span style="font-weight:700;color:var(--heading)">${r.open}</span>
+          ${r.overdue?`<span style="color:var(--red);font-size:.72rem;margin-left:4px">(${r.overdue} εκπρ.)</span>`:''}
+        </div>
+      </div>`).join('')}
+    </div>
+  </div>`;
+}
 function renderDashboard() {
   const s=dashStats();
   const f=state.dashFilter;
@@ -2301,9 +2565,12 @@ function renderDashboard() {
     ${card('completed','Ολοκληρωμένα',`<div class="stat-card-icon" style="background:var(--green-bg)"><svg width="16" height="16" viewBox="0 0 20 20" fill="var(--green)"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg></div>`,s.done,'var(--green)','Επιτυχώς κλεισμένα')}
     ${card('pending_docs','Εκκρεμή Έγγραφα',`<div class="stat-card-icon" style="background:var(--red-bg)"><svg width="16" height="16" viewBox="0 0 20 20" fill="var(--red)"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/></svg></div>`,s.pendingDocs,'var(--red)','Σε όλα τα έργα')}
     ${isAdminMgmt?card('pending_reviews','Εκκρεμή Ελέγχου',`<div class="stat-card-icon" style="background:#fdf2ff"><svg width="16" height="16" viewBox="0 0 20 20" fill="#9333ea"><path fill-rule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.841 8.841 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9H5v2h2V9zm8 0h-2v2h2V9zM9 9h2v2H9V9z" clip-rule="evenodd"/></svg></div>`,s.pendingReviews,'#9333ea','Αιτήματα ελέγχου'):''}
+    ${card('overdue_tasks','Εκπρόθεσμα',`<div class="stat-card-icon" style="background:${s.overdueTasks>0?'var(--red-bg)':'var(--green-bg)'}"><svg width="16" height="16" viewBox="0 0 20 20" fill="${s.overdueTasks>0?'var(--red)':'var(--green)'}"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v4a1 1 0 00.293.707l3 3a1 1 0 001.414-1.414L11 8.586V5z" clip-rule="evenodd"/></svg></div>`,s.overdueTasks,s.overdueTasks>0?'var(--red)':'var(--green)','Εργασίες εκτός χρονοδιαγράμματος')}
+    ${card('avg_progress','Μ.Ο. Προόδου',`<div class="stat-card-icon" style="background:var(--amber-bg)"><svg width="16" height="16" viewBox="0 0 20 20" fill="var(--amber)"><path fill-rule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11 4a1 1 0 10-2 0v4a1 1 0 102 0V7zm-3 1a1 1 0 10-2 0v3a1 1 0 102 0V8zM8 9a1 1 0 00-2 0v2a1 1 0 102 0V9z" clip-rule="evenodd"/></svg></div>`,s.avgProgress+'%','var(--orange)','Μέσος όρος προόδου ενεργών έργων')}
   </div>
   ${_dashFilteredProjs()}
   ${priorityWidget}
+  ${renderWorkloadWidget()}
   ${storageWidget}`;
 }
 
@@ -2330,7 +2597,8 @@ function renderCategories() {
   <div class="projects-grid" id="cat-grid">
     ${cats.map(cat=>{const projs=visibleProjects().filter(p=>p.categoryId===cat.id);const active=projs.filter(p=>p.status==='in_progress').length;const done=projs.filter(p=>p.status==='completed').length;const mgrIds=[...new Set([...(cat.managerIds||[]),...state.db.users.filter(u=>u.categoryRoles&&u.categoryRoles[cat.id]==='project_manager').map(u=>u.id)])];const mgrs=mgrIds.map(id=>getUser(id)?.name).filter(Boolean).join(', ');const init=cat.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();const canDelCat=canManageCats;
 const dragAttrs=canDrag?`draggable="true" ondragstart="catDragStart(event,'${cat.id}')" ondragover="catDragOver(event)" ondragleave="catDragLeave(event)" ondrop="catDrop(event,'${cat.id}')" ondragend="catDragEnd()"`:''
-return`<div class="project-card cat-card${canDrag?' cat-draggable':''}" data-action="open-category" data-cid="${cat.id}" ${dragAttrs}><div class="project-card-accent" style="background:${cat.color}"></div>${canDrag?`<div class="cat-drag-handle" title="Σύρε για αναδιάταξη">⠿</div>`:''}<div class="project-card-body"><div class="project-monogram" style="background:${cat.bgLight};color:${cat.color}">${init}</div><div class="project-card-name">${esc(cat.name)}</div></div><div class="project-card-stats"><div class="pstat"><div class="pstat-num">${projs.length}</div><div class="pstat-label">Έργα</div></div><div class="pstat"><div class="pstat-num" style="color:var(--orange)">${active}</div><div class="pstat-label">Ενεργά</div></div><div class="pstat"><div class="pstat-num" style="color:var(--green)">${done}</div><div class="pstat-label">Ολοκλ.</div></div></div><div class="project-card-footer" style="justify-content:space-between"><span class="text-sm text-muted">${(cat.template?.phases||[]).length} φάσεις στο πρότυπο</span>${canDelCat?`<button class="btn btn-danger btn-sm" data-action="delete-category" data-cid="${cat.id}">Διαγραφή</button>`:'<span class="text-sm text-muted">Προβολή →</span>'}</div></div>`;}).join('')}
+const catAvgProg=projs.length===0?0:Math.round(projs.reduce((s,p)=>s+projectProgress(p).total.pct,0)/projs.length);const progColor=catAvgProg===100?'var(--green)':catAvgProg>50?'var(--orange)':'var(--red)';
+return`<div class="project-card cat-card${canDrag?' cat-draggable':''}" data-action="open-category" data-cid="${cat.id}" ${dragAttrs}><div class="project-card-accent" style="background:${cat.color}"></div>${canDrag?`<div class="cat-drag-handle" title="Σύρε για αναδιάταξη">⠿</div>`:''}<div class="project-card-body"><div class="project-monogram" style="background:${cat.bgLight};color:${cat.color}">${init}</div><div class="project-card-name">${esc(cat.name)}</div></div><div class="project-card-stats"><div class="pstat"><div class="pstat-num">${projs.length}</div><div class="pstat-label">Έργα</div></div><div class="pstat"><div class="pstat-num" style="color:var(--orange)">${active}</div><div class="pstat-label">Ενεργά</div></div><div class="pstat"><div class="pstat-num" style="color:var(--green)">${done}</div><div class="pstat-label">Ολοκλ.</div></div></div>${projs.length?`<div style="padding:0 16px 10px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="font-size:.72rem;color:var(--muted)">Μ.Ο. Προόδου</span><span style="font-size:.75rem;font-weight:600;color:${progColor}">${catAvgProg}%</span></div><div class="row-prog-bar" style="height:5px;border-radius:4px"><div class="row-prog-fill" style="width:${catAvgProg}%;background:${progColor};height:5px;border-radius:4px"></div></div></div>`:''}<div class="project-card-footer" style="justify-content:space-between"><span class="text-sm text-muted">${(cat.template?.phases||[]).length} φάσεις στο πρότυπο</span>${canDelCat?`<button class="btn btn-danger btn-sm" data-action="delete-category" data-cid="${cat.id}">Διαγραφή</button>`:'<span class="text-sm text-muted">Προβολή →</span>'}</div></div>`;}).join('')}
     ${canManageCats?`<div class="card-add" data-action="modal-add-category"><div class="card-add-icon">+</div><p>Νέα Κατηγορία</p></div>`:''}
   </div>`;
 }
@@ -2387,7 +2655,7 @@ function renderProjects() {
   const statusTabs=[{k:'',l:'Όλα',n:vis.length},{k:'in_progress',l:'Σε εξέλιξη',n:vis.filter(p=>p.status==='in_progress').length},{k:'completed',l:'Ολοκληρωμένα',n:vis.filter(p=>p.status==='completed').length}];
   const cols = '2fr 1fr 1.5fr 110px 110px 130px 30px';
   return `
-  <div class="page-hd"><div><h1>${esc(cat.name)}</h1><div class="page-hd-sub">${esc(cat.desc)}</div></div><div class="page-hd-actions">${canCreate?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-category" data-cid="${cat.id}" title="Επεξεργασία κατηγορίας">✏ Επεξεργασία</button>`:''}<button class="btn btn-secondary btn-sm" data-action="export-category" data-cid="${cat.id}" title="Εξαγωγή κατηγορίας σε Excel">⬇ Excel</button>${canCreate?`<button class="btn btn-primary" data-action="modal-add-project" data-cid="${cat.id}">+ Νέο Έργο</button>`:''}</div></div>
+  <div class="page-hd"><div><h1>${esc(cat.name)}</h1><div class="page-hd-sub">${esc(cat.desc)}</div></div><div class="page-hd-actions">${canCreate?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-category" data-cid="${cat.id}" title="Επεξεργασία κατηγορίας">✏ Επεξεργασία</button>`:''}<button class="btn btn-secondary btn-sm" data-action="export-category" data-cid="${cat.id}" title="Εξαγωγή κατηγορίας σε Excel">⬇ Excel</button><button class="btn btn-secondary btn-sm" data-action="export-category-pdf" data-cid="${cat.id}" title="Εξαγωγή κατηγορίας σε PDF">⬇ PDF</button>${canCreate?`<button class="btn btn-primary" data-action="modal-add-project" data-cid="${cat.id}">+ Νέο Έργο</button>`:''}</div></div>
   <div class="filter-bar mb-12">
     <div class="filter-tabs">${statusTabs.map(t=>`<button class="filter-tab${state.filter.status===t.k?' active':''}" data-action="filter-status" data-val="${t.k}">${t.l} <span class="filter-tab-count">${t.n}</span></button>`).join('')}</div>
     <div class="search-bar"><span class="search-icon">⌕</span><input type="text" placeholder="Αναζήτηση…" id="search-input" value="${esc(state.search)}"></div>
@@ -2408,7 +2676,7 @@ function renderProjects() {
       const pct = projectProgress(p).total.pct;
       const pctColor = pct===100 ? 'var(--green)' : 'var(--orange)';
       return`<div class="case-row${inactive?' proj-inactive':''}" style="grid-template-columns:${cols}" data-action="open-project" data-pid="${p.id}" data-proj-id="${p.id}" title="${inactive?'Δεν απαιτείται ενέργεια από εσάς αυτή τη στιγμή':''}">
-        <div class="case-row-title">${esc(p.name)}</div>
+        <div class="case-row-title">${esc(p.name)} ${(()=>{const hs=projectHealthScore(p);return p.status==='in_progress'?`<span style="font-size:.65rem;padding:1px 6px;border-radius:3px;background:${hs.color}20;color:${hs.color};font-weight:700">${hs.label}</span>`:''})()}</div>
         <div class="text-sm">${esc(mgrNames)}</div>
         <div class="text-sm">${phName}</div>
         <div class="text-sm text-muted">${phStart}</div>
@@ -2571,7 +2839,7 @@ function ensureCompactProjectDocsStyle() {
       border:1px solid var(--slate-200);
       border-radius:10px;
       padding:10px 12px;
-      background:rgba(248,250,252,.72);
+      background:var(--paper-2);
     }
     .task-documents-toolbar{
       display:flex;
@@ -2586,7 +2854,7 @@ function ensureCompactProjectDocsStyle() {
       gap:7px;
       font-size:.78rem;
       font-weight:800;
-      color:var(--navy);
+      color:var(--heading);
     }
     .task-documents-count{
       min-width:20px;
@@ -2605,7 +2873,7 @@ function ensureCompactProjectDocsStyle() {
       margin:9px 0 0;
       padding:9px 10px;
       border-radius:7px;
-      background:#fff;
+      background:var(--white);
       color:var(--muted);
       font-size:.75rem;
     }
@@ -2655,9 +2923,25 @@ function ensureCompactProjectDocsStyle() {
   document.head.appendChild(style);
 }
 
+function ensureProjectStyles() {
+  if(document.getElementById('be-project-extra-style')) return;
+  const style=document.createElement('style');
+  style.id='be-project-extra-style';
+  style.textContent=`
+    .bulk-check { width:16px;height:16px; }
+    #bulk-action-bar select { border:1px solid rgba(255,255,255,.3); }
+    .audit-list .audit-entry { display:flex;gap:10px;border-bottom:1px solid var(--slate-100);padding:8px 0; }
+    .audit-list .audit-dot { width:8px;height:8px;border-radius:50%;margin-top:5px;flex-shrink:0; }
+    .mention-drop:empty { display:none; }
+    .mention-item:hover { background:var(--slate-50); }
+  `;
+  document.head.appendChild(style);
+}
+
 // ── VIEW: PROJECT DETAIL ──────────────────────────────────────────
 function renderProject() {
   ensureCompactProjectDocsStyle();
+  ensureProjectStyles();
   const proj=getProject(state.projectId); if(!proj) return '<p>Έργο not found.</p>';
   const cat=getCategory(proj.categoryId); const mgrNames=projManagerNames(proj);
   const prog=projectProgress(proj); const isComp=proj.status==='completed'; const canMod=canModifyProject(proj);
@@ -2738,10 +3022,11 @@ function renderProject() {
       return `<div class="task-row ${t.status==='completed'?'task-done':''} ${!unlocked?'task-locked':''}" id="task-${t.id}"
         ${canMoveTsk?`draggable="true" ondragstart="projTaskDragStart(event,this,'${t.id}','${ph.id}','${proj.id}')" ondragend="projTaskDragEnd(this)" ondragover="projTaskRowDragOver(event,this)" ondragleave="projTaskRowDragLeave(this)" ondrop="projTaskRowDrop(event,this,'${t.id}','${ph.id}','${proj.id}')"`:''}>
         <div class="task-row-head" data-action="toggle-task" data-tid="${t.id}">
+          ${canMoveTsk&&!isComp?`<input type="checkbox" class="bulk-check" ${state.bulkSelected.has(t.id)?'checked':''} onclick="event.stopPropagation();toggleBulkTask('${t.id}')" title="Επιλογή εργασίας" style="margin-right:4px;cursor:pointer;accent-color:var(--orange)">`:''}
           ${canMoveTsk?'<div class="tpl-drag-handle" title="Σύρετε για αναδιάταξη">⠿</div>':''}
           <div class="task-status-dot" style="background:${stInfo.color}"></div>
           <div class="task-info">
-            <div class="task-name">${esc(t.name)}${t.urgent?' <span class="badge badge-red" style="font-size:.58rem;padding:1px 7px">⚡ ΕΠΕΙΓΟΝ</span>':''}${t.parallel?' <span class="badge badge-gray" style="font-size:.58rem;padding:1px 6px">Παράλληλη</span>':''}${t.mgmtCheck?' <span class="badge" style="font-size:.58rem;padding:1px 7px;background:#7c3aed;color:#fff">⚑ ΕΛΕΓΧΟΣ ΔΙΟΙΚΗΣΗΣ</span>':''}</div>
+            <div class="task-name">${esc(t.name)}${t.priority==='critical'?'<span class="badge" style="font-size:.58rem;padding:1px 7px;background:#dc2626;color:#fff">🔴 ΚΡΙΣΙΜΗ</span>':t.priority==='high'?'<span class="badge" style="font-size:.58rem;padding:1px 7px;background:#ea580c;color:#fff">🟠 Υψηλή</span>':t.priority==='low'?'<span class="badge" style="font-size:.58rem;padding:1px 7px;background:#2563eb;color:#fff">🔵 Χαμηλή</span>':''}${t.urgent?' <span class="badge badge-red" style="font-size:.58rem;padding:1px 7px">⚡ ΕΠΕΙΓΟΝ</span>':''}${t.parallel?' <span class="badge badge-gray" style="font-size:.58rem;padding:1px 6px">Παράλληλη</span>':''}${t.mgmtCheck?' <span class="badge" style="font-size:.58rem;padding:1px 7px;background:#7c3aed;color:#fff">⚑ ΕΛΕΓΧΟΣ ΔΙΟΙΚΗΣΗΣ</span>':''}${(()=>{if(!t.plannedEnd||t.status==='completed'||t.status==='cancelled')return'';const _end=new Date(t.plannedEnd);const _now=new Date();_now.setHours(0,0,0,0);const _diff=Math.round((_end-_now)/86400000);if(_diff<0)return`<span class="badge badge-red" style="font-size:.58rem;padding:1px 7px" title="Λήξη: ${fmt(t.plannedEnd)}">⚠ Εκπρόθεσμο</span>`;if(_diff<=3)return`<span class="badge badge-amber" style="font-size:.58rem;padding:1px 7px" title="Λήξη: ${fmt(t.plannedEnd)}">⏰ Επείγει (${_diff}μ)</span>`;return'';})()}${t.recurrence?`<span class="badge badge-gray" style="font-size:.58rem;padding:1px 6px">🔄 ${t.recurrence==='weekly'?'Εβδομαδ.':t.recurrence==='monthly'?'Μηνιαία':'Ετήσια'}</span>`:''}</div>
             <div class="task-meta">${assignee?`<span>Υπεύθυνος: ${esc(assignee.name)}</span>`:''}${taskMembers.length?`<span>Μέλη: ${taskMembers.map(m=>esc(m.name)).join(', ')}</span>`:''}${t.plannedStart?`<span class="date-planned">📅 Προγρ: ${fmt(t.plannedStart)}${t.plannedEnd?' – '+fmt(t.plannedEnd):''}</span>`:''}${t.startDate?`<span>Έναρξη: ${fmt(t.startDate)}</span>`:''}${t.completedDate?`<span>Ολοκλήρωση: ${fmt(t.completedDate)}</span>`:''}${depNames.length?`<span class="dep-badge">⊞ Εξαρτάται από: ${esc(depNames.join(', '))}</span>`:''}</div>
           </div>
           <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end">
@@ -2756,6 +3041,13 @@ function renderProject() {
         <div class="task-row-body${isExp?' body-open':''}" id="body-${t.id}">
           ${depNames.length?`<div class="lock-msg" style="opacity:.7${!unlocked?';color:var(--red)':''}">${!unlocked?'🔒':'ℹ'} Εξαρτάται από: ${esc(depNames.join(', '))}</div>`:''}
           ${canMod&&unlocked&&!isComp?`<div class="flex-center mb-12" style="gap:8px;flex-wrap:wrap"><select class="form-control" style="max-width:230px;font-size:.8rem" data-action="change-status" data-tid="${t.id}" data-phid="${ph.id}" data-pid="${proj.id}">${Object.entries(TASK_STATUSES).sort((a,b)=>a[1].label.localeCompare(b[1].label,'el')).map(([k,v])=>`<option value="${k}"${t.status===k?' selected':''}>${v.label}</option>`).join('')}</select><button class="btn btn-secondary btn-sm" data-action="modal-edit-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}">Επεξεργασία</button></div>`:''}
+          ${(()=>{
+            const logged=(state.db.timesheets||[]).filter(e=>e.taskId===t.id).reduce((s,e)=>s+(parseFloat(e.hours)||0),0);
+            if(!t.estimatedHours&&!logged) return '';
+            const est=t.estimatedHours||0;
+            const pct=est>0?Math.min(100,Math.round(logged/est*100)):null;
+            return `<div class="task-hours-summary" style="display:flex;align-items:center;gap:12px;padding:8px 12px;background:var(--slate-50);border-radius:6px;margin-bottom:10px;flex-wrap:wrap"><span style="font-size:.78rem;color:var(--muted)">⏱ Ώρες:</span>${est?`<span style="font-size:.82rem;font-weight:600">Εκτίμηση: ${est}h</span>`:''}${logged?`<span style="font-size:.82rem;font-weight:600;color:${est&&logged>est?'var(--red)':'var(--green)'}">Καταγράφηκαν: ${logged.toFixed(1)}h</span>`:''}${pct!==null?`<div style="flex:1;min-width:80px;background:var(--slate-200);border-radius:4px;height:6px"><div style="height:100%;width:${pct}%;background:${pct>100?'var(--red)':'var(--orange)'};border-radius:4px"></div></div><span style="font-size:.75rem;color:var(--muted)">${pct}%</span>`:''}</div>`;
+          })()}
           ${(t.subtasks||[]).length?`<div class="subtasks-section"><div class="subtask-label">Υποεργασίες</div>${t.subtasks.map(st=>{
             const srs=st.reviewStatus;
             const canActSt=unlocked&&!isComp&&canMod&&['project_manager','team_member'].includes(state.cu?.role);
@@ -2796,7 +3088,7 @@ function renderProject() {
     const canDropTasks = !isComp && state.cu && state.cu.role !== 'client';
     return `<div class="phase-section${phDone?' phase-done':''}" data-phase-idx="${phIdx}" data-phase-id="${ph.id}"${canReorder?` draggable="true" ondragstart="phaseDragStart(event,this,${phIdx})" ondragend="phaseDragEnd(this)"`:''} ${canDropTasks||canReorder?`ondragover="unifiedPhaseDragOver(event,this,${phIdx},'${ph.id}')" ondrop="unifiedPhaseDrop(event,this,${phIdx},'${ph.id}','${proj.id}')"`:''}>
       <div class="phase-header"><div class="phase-num${phDone?' pn-done':' pn-active'}">${phDone?'✓':phIdx+1}</div><div class="phase-title">${esc(ph.name)}</div>${phDone?'<span class="badge badge-green">Ολοκληρώθηκε</span>':''}
-      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button>${canMod?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canMod?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
       ${(()=>{const rs=ph.reviewStatus; const canReqRev=canMod&&['project_manager','team_member'].includes(state.cu?.role);
         if(isAdminOrMgmt&&rs==='pending') return `<div class="review-bar review-bar-pending phase-review-bar"><div class="review-bar-msg">📩 Η φάση <strong>${esc(ph.name)}</strong> χρειάζεται έλεγχο</div><div class="review-bar-acts"><button class="btn btn-primary btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','approved')">✅ Αποδοχή</button><button class="btn btn-danger btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','rejected')">❌ Απόρριψη</button></div></div>`;
         if(isAdminOrMgmt&&rs==='approved') return `<div class="review-bar review-bar-approved phase-review-bar">✅ Φάση Εγκρίθηκε</div>`;
@@ -2815,13 +3107,17 @@ function renderProject() {
 
   return `
   <div class="case-detail-hd">
-    <div class="cdh-mono" style="background:${cat?.bgLight||'rgba(255,255,255,.1)'};color:${cat?.color||'#fff'}">${init}</div>
-    <div class="cdh-info"><div class="cdh-name">${esc(proj.name)}</div><div class="cdh-sub">${proj.code?esc(proj.code)+' · ':''}Πελάτης: ${esc(proj.clientName||'—')} · Υπεύθυνος: ${esc(mgrNames)}${proj.startDate?` · 📅 Έναρξη: ${fmt(proj.startDate)}`:''}${proj.endDate?` · 🏁 Λήξη: ${fmt(proj.endDate)}`:''}</div>
-      <div style="margin-top:12px">${renderProjectProgressChart(proj, prog)}</div>
+    <div class="cdh-top-row">
+      <div class="cdh-mono" style="background:${cat?.bgLight||'rgba(255,255,255,.1)'};color:${cat?.color||'#fff'}">${init}</div>
+      <div class="cdh-info"><div class="cdh-name">${esc(proj.name)} ${proj.status==='in_progress'?`<span style="font-size:.72rem;padding:2px 9px;border-radius:4px;background:${projectHealthScore(proj).color}20;color:${projectHealthScore(proj).color};font-weight:700;margin-left:6px">${projectHealthScore(proj).label}</span>`:''}</div><div class="cdh-sub">${proj.code?esc(proj.code)+' · ':''}Πελάτης: ${esc(proj.clientName||'—')} · Υπεύθυνος: ${esc(mgrNames)}${proj.startDate?` · 📅 Έναρξη: ${fmt(proj.startDate)}`:''}${proj.endDate?` · 🏁 Λήξη: ${fmt(proj.endDate)}`:''}</div>
+      </div>
+      <div class="cdh-actions">${isComp?'<span class="badge badge-green" style="font-size:.75rem;padding:5px 12px">Ολοκληρωμένο</span>':'<span class="badge badge-orange" style="font-size:.75rem;padding:5px 12px">Σε Εξέλιξη</span>'}<button class="btn btn-secondary btn-sm" data-action="export-project" data-pid="${proj.id}" title="Εξαγωγή έργου σε Excel">⬇ Excel</button><button class="btn btn-secondary btn-sm" data-action="export-project-pdf" data-pid="${proj.id}" title="Εξαγωγή έργου σε PDF">⬇ PDF</button>${state.cu.role!=='client'?`<button class="btn btn-secondary btn-sm" data-action="project-to-template" data-pid="${proj.id}" title="Αποθήκευση ως Πρότυπο Έργου">📋 Σε Πρότυπο</button>`:''}<button class="btn ${state.ganttView?'btn-primary':'btn-secondary'} btn-sm" data-action="toggle-gantt" title="Gantt Chart">📊 Gantt</button>${canMod?`<button class="btn btn-secondary btn-sm" data-action="modal-edit-project" data-pid="${proj.id}" title="Επεξεργασία έργου">✏ Επεξεργασία</button><button class="btn btn-secondary btn-sm" data-action="apply-template-to-project" data-pid="${proj.id}" title="Εφαρμογή ή ενημέρωση προτύπου">📋 Πρότυπο</button>`:''}${canMod&&!isComp&&proj.clientId?`<button class="btn btn-secondary btn-sm" data-action="send-client-reminder" data-pid="${proj.id}" title="Αποστολή υπενθύμισης στον πελάτη">🔔 Υπενθύμιση</button>`:''}${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-phase" data-pid="${proj.id}">+ Φάση</button>`:''}${canMod?`<button class="btn btn-danger btn-sm" data-action="delete-project" data-pid="${proj.id}">Διαγραφή</button>`:''}</div>
     </div>
-    <div class="cdh-actions">${isComp?'<span class="badge badge-green" style="font-size:.75rem;padding:5px 12px">Ολοκληρωμένο</span>':'<span class="badge badge-orange" style="font-size:.75rem;padding:5px 12px">Σε Εξέλιξη</span>'}<button class="btn btn-secondary btn-sm" data-action="export-project" data-pid="${proj.id}" title="Εξαγωγή έργου σε Excel">⬇ Excel</button>${state.cu.role!=='client'?`<button class="btn btn-secondary btn-sm" data-action="project-to-template" data-pid="${proj.id}" title="Αποθήκευση ως Πρότυπο Έργου">📋 Σε Πρότυπο</button>`:''}<button class="btn ${state.ganttView?'btn-primary':'btn-secondary'} btn-sm" data-action="toggle-gantt" title="Gantt Chart">📊 Gantt</button>${canMod?`<button class="btn btn-secondary btn-sm" data-action="modal-edit-project" data-pid="${proj.id}" title="Επεξεργασία έργου">✏ Επεξεργασία</button><button class="btn btn-secondary btn-sm" data-action="apply-template-to-project" data-pid="${proj.id}" title="Εφαρμογή ή ενημέρωση προτύπου">📋 Πρότυπο</button>`:''}${canMod&&!isComp&&proj.clientId?`<button class="btn btn-secondary btn-sm" data-action="send-client-reminder" data-pid="${proj.id}" title="Αποστολή υπενθύμισης στον πελάτη">🔔 Υπενθύμιση</button>`:''}${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-phase" data-pid="${proj.id}">+ Φάση</button>`:''}${canMod?`<button class="btn btn-danger btn-sm" data-action="delete-project" data-pid="${proj.id}">Διαγραφή</button>`:''}</div>
+    <div class="cdh-progress-full">${renderProjectProgressChart(proj, prog)}</div>
   </div>
-  ${state.ganttView ? renderGantt(proj) : `<div class="phases-list">${phases}</div>`}`;
+  ${state.ganttView ? renderGantt(proj) : `<div class="phases-list">${phases}</div>`}
+  ${!isComp&&state.cu.role!=='client'?`<div class="card" style="margin-top:24px"><div class="section-hd" style="cursor:pointer" onclick="state._auditOpen=!state._auditOpen;this.nextElementSibling.style.display=state._auditOpen?'':'none'"><h3>📋 Ιστορικό Αλλαγών</h3><span style="color:var(--muted);font-size:.8rem">${state._auditOpen?'▲':'▼'}</span></div><div style="display:${state._auditOpen===true?'block':'none'};padding:0 4px">${renderProjectAuditTimeline(proj)}</div></div>`:''}
+  ${renderBulkBar()}`;
 }
 
 // ── VIEW: USERS ───────────────────────────────────────────────────
@@ -2865,7 +3161,10 @@ function renderUsers() {
         ${onlineCount ? `&nbsp;·&nbsp;<span style="color:var(--green);font-weight:600">● ${onlineCount} ενεργοί τώρα</span>` : ''}
       </div>
     </div>
-    <div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-user">+ Νέος Χρήστης</button></div>
+    <div class="page-hd-actions" style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-ghost" onclick="backupAllData()" title="Εξαγωγή όλων των δεδομένων σε JSON" style="font-size:.82rem">📥 Backup Δεδομένων</button>
+      <button class="btn btn-primary" data-action="modal-add-user">+ Νέος Χρήστης</button>
+    </div>
   </div>
   <div class="users-table">
     <div class="users-table-head">
@@ -2880,6 +3179,57 @@ function renderUsers() {
   </div>`;
 }
 
+// ── BACKUP ────────────────────────────────────────────────────────
+window.backupAllData = async function() {
+  showToast('Backup σε εξέλιξη… παρακαλώ περιμένετε.', 'info');
+  try {
+    const TABLES = [
+      'be_users', 'be_categories', 'be_projects', 'be_offers',
+      'be_audit_log', 'be_templates', 'be_timesheets', 'be_client_calendar'
+    ];
+    const backup = { timestamp: new Date().toISOString(), tables: {} };
+    for (const table of TABLES) {
+      let allRows = [];
+      let from = 0;
+      const PAGE = 1000;
+      while (true) {
+        const { data, error } = await sb.from(table).select('*').range(from, from + PAGE - 1);
+        if (error) { console.warn(`backup skip ${table}:`, error.message); break; }
+        allRows = allRows.concat(data || []);
+        if (!data || data.length < PAGE) break;
+        from += PAGE;
+      }
+      backup.tables[table] = allRows;
+    }
+    const total = Object.values(backup.tables).reduce((s,r)=>s+r.length, 0);
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `BE_BACKUP_${new Date().toISOString().slice(0,19).replace(/[T:]/g,'-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`✅ Backup ολοκληρώθηκε — ${total} εγγραφές`, 'success');
+  } catch(e) {
+    showToast('Σφάλμα backup: ' + (e.message||e), 'error');
+  }
+};
+
+// ── PER-PROJECT AUDIT TIMELINE ────────────────────────────────────
+function renderProjectAuditTimeline(proj) {
+  const entries = (state.db.auditLog||[]).filter(e=>
+    e.projectId===proj.id ||
+    (!e.projectId && e.details && (e.details.includes(proj.name)||e.details.includes(proj.code||'____NOMATCH____')))
+  ).slice(0,50);
+  if(!entries.length) return `<div class="text-sm text-muted" style="padding:12px 0">Δεν υπάρχουν εγγραφές ακόμη.</div>`;
+  return `<div class="audit-list" style="margin-top:8px">${entries.map(e=>{
+    const ri=ROLE_INFO[e.role]||{};
+    return`<div class="audit-entry" style="padding:8px 0"><div class="audit-dot" style="background:${e.role==='admin'?'var(--orange)':e.role==='client'?'var(--blue)':'var(--slate-400)'}"></div><div class="audit-info"><div class="audit-action" style="font-size:.8rem">${esc(e.action)}</div>${e.details?`<div class="audit-detail" style="font-size:.74rem">${esc(e.details)}</div>`:''}<div class="audit-meta"><span class="role-badge ${ri.cls}" style="font-size:.58rem;padding:1px 7px">${ri.label}</span> ${esc(e.userName)} · ${fmtDT(e.timestamp)}</div></div></div>`;
+  }).join('')}</div>`;
+}
+
 // ── VIEW: AUDIT ───────────────────────────────────────────────────
 function renderAudit() {
   if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
@@ -2892,7 +3242,7 @@ function renderAudit() {
 // ── VIEW: CLIENT PORTAL ───────────────────────────────────────────
 function renderClientPortal() {
   const projs=visibleProjects();
-  const hdr=`<div class="client-header"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'" style="height:46px;object-fit:contain"><div style="margin-left:14px"><div style="font-weight:800;font-size:1rem;color:var(--navy)">Παρακολούθηση Έργου</div><div class="text-sm text-muted">Καλωσήρθατε, ${esc(state.cu.name)}</div></div><div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button class="btn btn-ghost btn-sm" data-action="my-account">⚙ Λογαριασμός</button><button class="btn btn-ghost btn-sm" data-action="logout">Αποσύνδεση</button></div></div>`;
+  const hdr=`<div class="client-header"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'" style="height:46px;object-fit:contain"><div style="margin-left:14px"><div style="font-weight:800;font-size:1rem;color:var(--heading)">Παρακολούθηση Έργου</div><div class="text-sm text-muted">Καλωσήρθατε, ${esc(state.cu.name)}</div></div><div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button class="btn btn-ghost btn-sm" data-action="my-account">⚙ Λογαριασμός</button><button class="btn btn-ghost btn-sm" data-action="logout">Αποσύνδεση</button></div></div>`;
   if (!projs.length) return `<div class="client-wrap">${hdr}<div class="empty-state"><h3>Δεν βρέθηκαν έργα</h3></div></div>`;
   // Multi-project support: track selected project
   if (!state.clientProjectId || !projs.find(p=>p.id===state.clientProjectId)) state.clientProjectId=projs[0].id;
@@ -2906,7 +3256,7 @@ function renderClientPortal() {
 
 function renderClientPortalFix8() {
   const projs=visibleProjects();
-  const hdr=`<div class="client-header"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'" style="height:46px;object-fit:contain"><div style="margin-left:14px"><div style="font-weight:800;font-size:1rem;color:var(--navy)">Παρακολούθηση Έργου</div><div class="text-sm text-muted">Καλωσήρθατε, ${esc(state.cu.name)}</div></div><div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button class="btn btn-ghost btn-sm" data-action="my-account">⚙ Λογαριασμός</button><button class="btn btn-ghost btn-sm" data-action="logout">Αποσύνδεση</button></div></div>`;
+  const hdr=`<div class="client-header"><img src="logo.jpg" alt="B&E Solutions" onerror="this.style.display='none'" style="height:46px;object-fit:contain"><div style="margin-left:14px"><div style="font-weight:800;font-size:1rem;color:var(--heading)">Παρακολούθηση Έργου</div><div class="text-sm text-muted">Καλωσήρθατε, ${esc(state.cu.name)}</div></div><div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button class="btn btn-ghost btn-sm" data-action="my-account">⚙ Λογαριασμός</button><button class="btn btn-ghost btn-sm" data-action="logout">Αποσύνδεση</button></div></div>`;
   if(!projs.length) return `<div class="client-wrap">${hdr}<div class="empty-state"><h3>Δεν βρέθηκαν έργα</h3></div></div>`;
   if(!state.clientProjectId||!projs.some(p=>p.id===state.clientProjectId)) state.clientProjectId=projs[0].id;
   const proj=projs.find(p=>p.id===state.clientProjectId)||projs[0];
@@ -3009,6 +3359,13 @@ window.syncTsCategoryFromProject = function(prefix) {
   const proj=getProject(projectId);
   const categoryId=proj?.categoryId || '';
   select.value=getTimesheetCategory(categoryId) ? categoryId : '';
+};
+
+window.syncTsTaskFromProject = function(pfx) {
+  const pid = el(pfx+'-projectId')?.value;
+  const sel = el(pfx+'-taskId');
+  if(!sel) return;
+  sel.innerHTML = buildTsTaskOptions(pid);
 };
 
 window.setTimesheetSort = function(key) {
@@ -3169,7 +3526,7 @@ function renderTimesheet() {
     const projectName=timesheetProjectName(e)||'—';
     const categoryName=timesheetCategoryName(e);
     const categoryCell=canEdit?`<select class="form-control ts-category-select" data-hydrated="0" title="${esc(categoryName||'Επιλογή Είδους Έργου')}" onfocus="hydrateTimesheetCategorySelect(this,'${esc(e.projectCategoryId||'')}')" onchange="setTimesheetCategory('${e.id}',this.value)"><option value="${esc(e.projectCategoryId||'')}" selected>${esc(categoryName||'—')}</option></select>`:`<div class="ts-two-line" title="${esc(categoryName||'')}">${esc(categoryName||'—')}</div>`;
-    return `<tr><td style="font-size:.76rem;white-space:nowrap">${esc(e.date)}${timeRange}</td>${isAdminOrMgmt?`<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(e.userName||'')}">${esc(e.userName||'—')}</div></td>`:''}<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(projectName)}">${esc(projectName)}</div></td><td>${categoryCell}</td><td style="font-size:.76rem;font-weight:700;color:var(--navy);text-align:center">${parseFloat(e.hours||0).toFixed(1)}h</td><td style="font-size:.74rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.desc||'')}">${esc(e.desc||'—')}</div></td><td style="font-size:.75rem;text-align:center;color:var(--navy);white-space:nowrap">${e.km?`${e.km} χλμ.`:'—'}</td><td style="font-size:.72rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.comments||'')}">${esc(e.comments||'—')}</div></td><td><div class="ts-actions-cell">${canEdit?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-timesheet" data-eid="${e.id}">✏</button>`:''}${canEdit?`<button class="btn btn-danger btn-icon btn-sm" data-action="delete-timesheet" data-eid="${e.id}">✕</button>`:''}</div></td></tr>`;
+    return `<tr><td style="font-size:.76rem;white-space:nowrap">${esc(e.date)}${timeRange}</td>${isAdminOrMgmt?`<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(e.userName||'')}">${esc(e.userName||'—')}</div></td>`:''}<td style="font-size:.76rem"><div class="ts-two-line" title="${esc(projectName)}">${esc(projectName)}${e.taskName?`<div style="font-size:.68rem;color:var(--muted);margin-top:1px">↳ ${esc(e.taskName)}</div>`:''}</div></td><td>${categoryCell}</td><td style="font-size:.76rem;font-weight:700;color:var(--heading);text-align:center">${parseFloat(e.hours||0).toFixed(1)}h</td><td style="font-size:.74rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.desc||'')}">${esc(e.desc||'—')}</div></td><td style="font-size:.75rem;text-align:center;color:var(--heading);white-space:nowrap">${e.km?`${e.km} χλμ.`:'—'}</td><td style="font-size:.72rem;color:var(--muted)"><div class="ts-two-line" title="${esc(e.comments||'')}">${esc(e.comments||'—')}</div></td><td><div class="ts-actions-cell">${canEdit?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-timesheet" data-eid="${e.id}">✏</button>`:''}${canEdit?`<button class="btn btn-danger btn-icon btn-sm" data-action="delete-timesheet" data-eid="${e.id}">✕</button>`:''}</div></td></tr>`;
   }).join('');
 
   const pagebar=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px;padding:8px 2px 2px;flex-wrap:wrap"><div style="font-size:.78rem;color:var(--muted)">${rangeFrom}–${rangeTo} από ${totalCount.toLocaleString('el-GR')} εγγραφές · σύνολο φίλτρου <strong>${totalHours.toFixed(1)}h</strong></div><div style="display:flex;gap:6px;align-items:center"><button class="btn btn-ghost btn-sm" onclick="goTimesheetPage(${page-1})" ${page<=1?'disabled':''}>‹ Προηγούμενη</button><span style="font-size:.78rem;color:var(--muted);min-width:90px;text-align:center">Σελίδα ${page} / ${totalPages}</span><button class="btn btn-ghost btn-sm" onclick="goTimesheetPage(${page+1})" ${page>=totalPages?'disabled':''}>Επόμενη ›</button></div></div>`;
@@ -3270,14 +3627,17 @@ function _renderCalMonth() {
   });
 
   const monthName = firstDay.toLocaleDateString('el-GR',{month:'long',year:'numeric'});
-  const dayNames  = ['Δευ','Τρί','Τετ','Πέμ','Παρ','Σάβ','Κυρ'];
+  // Μηνιαία προβολή: μόνο εργάσιμες ημέρες (Δευ–Παρ), όπως και η εβδομαδιαία.
+  const dayNames  = ['Δευ','Τρί','Τετ','Πέμ','Παρ'];
 
   let cells = dayNames.map(d=>`<div class="cal-day-name">${d}</div>`).join('');
-  for (let i=0;i<startDow;i++) cells+=`<div class="cal-cell cal-empty"></div>`;
+  const leadBlanks = startDow<=4 ? startDow : 0;
+  for (let i=0;i<leadBlanks;i++) cells+=`<div class="cal-cell cal-empty"></div>`;
   for (let day=1;day<=lastDay.getDate();day++) {
+    const dow=(startDow+day-1)%7;
+    if (dow>=5) continue; // Σάββατο/Κυριακή — δεν εμφανίζονται
     const dateStr=`${monthPrefix}${String(day).padStart(2,'0')}`;
     const isToday=dateStr===todayStr;
-    const isWeekend=((startDow+day-1)%7)>=5;
     const dayPhases=phasesByDay[day]||[];
     const dayTasks=tasksByDay[day]||[];
     const totalItems=dayPhases.length+dayTasks.length;
@@ -3298,7 +3658,7 @@ function _renderCalMonth() {
       return `<div class="cal-task ${st.cls}" data-action="open-project" data-pid="${proj.id}" title="${esc(task.name)} · ${esc(proj.name)}">${esc(nm)}${timeLabel}<span class="cal-task-proj">${esc(pn)}</span></div>`;
     }).join('');
     const more=totalItems>2?`<div class="cal-more">+${totalItems-2} ακόμα</div>`:'';
-    cells+=`<div class="cal-cell${isToday?' cal-today':''}${isWeekend?' cal-weekend':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${phaseBars}${pills}${more}</div>`;
+    cells+=`<div class="cal-cell${isToday?' cal-today':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${phaseBars}${pills}${more}</div>`;
   }
 
   return `
@@ -3596,10 +3956,11 @@ function renderTemplates() {
   const cards = tpls.map(tpl => {
     const phCount = (tpl.phases||[]).length;
     const taskCount = (tpl.phases||[]).reduce((s,ph)=>s+(ph.tasks||[]).length, 0);
+    const tplInit = (tpl.name||'?').trim().split(/\s+/).slice(0,2).map(w=>w[0]).join('').toUpperCase();
     return `<div class="project-card" style="cursor:pointer" data-action="open-template" data-tid="${tpl.id}">
       <div class="project-card-accent" style="background:var(--orange)"></div>
       <div class="project-card-body">
-        <div class="project-monogram" style="background:#fff3e6;color:var(--orange)">📋</div>
+        <div class="project-monogram" style="background:#fff3e6;color:var(--orange)">${esc(tplInit)}</div>
         <div class="project-card-name">${esc(tpl.name)}</div>
         <div class="project-card-desc">${esc(tpl.desc||'—')}</div>
       </div>
@@ -3732,7 +4093,26 @@ document.addEventListener('click',e=>{
     else if (a==='nav-crm-contacts')  navigate('crm-contacts');
     return;
   }
-  // Header bell opens the single, full Notification Center page.
+  // Header bell: toggle dropdown
+  const bellToggle=e.target.closest('[data-action="toggle-notif-drop"]');
+  if(bellToggle){ e.stopPropagation(); state.notifOpen=!state.notifOpen; updateHeaderUser(); return; }
+  // Dropdown: "Προβολή όλων" footer button
+  const dropAll=e.target.closest('[data-action="notif-drop-all"]');
+  if(dropAll){ e.stopPropagation(); state.notifOpen=false; navigate('notifications'); return; }
+  // Dropdown: click on a notification row (open-notification or mark-read)
+  const dropRow=e.target.closest('.notif-drop-row[data-action]');
+  if(dropRow){
+    e.stopPropagation();
+    state.notifOpen=false;
+    const a2=dropRow.dataset.action;
+    if(a2==='open-notification'){
+      window.openNotificationTarget(dropRow.dataset.nid,dropRow.dataset.source,dropRow.dataset.pid,dropRow.dataset.phid,dropRow.dataset.tid).catch(()=>{});
+    }else if(a2==='mark-notification-read'){
+      markOneNotificationRead(dropRow.dataset.nid,dropRow.dataset.source);
+    }
+    return;
+  }
+  // nav-notifications (legacy sidebar links)
   const bell=e.target.closest('[data-action="nav-notifications"]');
   if (bell) { e.stopPropagation(); navigate('notifications'); return; }
   // Sidebar / header logout (outside main-content)
@@ -3741,6 +4121,18 @@ document.addEventListener('click',e=>{
   // My account (sidebar)
   const accBtn=e.target.closest('[data-action="my-account"]');
   if (accBtn) { showModalMyAccount(); return; }
+  // βελτίωση #5: κλείσιμο dropdown αν κλικ έξω από notif-wrap
+  if(state.notifOpen && !e.target.closest('.notif-wrap')){
+    state.notifOpen=false; updateHeaderUser();
+  }
+  // Κλείσιμο dropdown ταξινόμησης dashboard αν κλικ έξω από αυτό
+  if(state.dashSortOpen && !e.target.closest('.dash-sort-wrap')){
+    state.dashSortOpen=false; render();
+  }
+  // Κλείσιμο dropdown ταξινόμησης Assigned To αν κλικ έξω από αυτό
+  if(state.asgnSortOpen && !e.target.closest('.asgn-sort-wrap')){
+    state.asgnSortOpen=false; render();
+  }
 });
 
 // ── AUTH ACTIONS ──────────────────────────────────────────────────
@@ -3920,6 +4312,11 @@ async function handleStatusChange(sel) {
   const phaseBefore=currentActionPhase(proj);
   const phaseBeforeId=phaseBefore?.id || null;
 
+  const phaseAlreadyDone = isPhaseComplete(ph);
+  const terminalStatuses = ['completed','cancelled','not_required'];
+  const wouldCompletePhase = terminalStatuses.includes(next) && !phaseAlreadyDone &&
+    ph.tasks.filter(t=>t.id!==tid).every(t=>terminalStatuses.includes(t.status));
+
   if (isSupabaseAuthMode()) {
     sel.disabled=true;
     try {
@@ -3929,24 +4326,62 @@ async function handleStatusChange(sel) {
         p_task_id:tid,
         p_status:next
       },pid);
-      auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`);
+      auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`, pid);
+      // G4 Supabase: create next recurring occurrence locally
+      if(next==='completed'&&task.recurrence){
+        const _today_=today();
+        const nextDate_=(d,rec)=>{const nd=new Date(d||_today_);if(rec==='weekly')nd.setDate(nd.getDate()+7);else if(rec==='monthly')nd.setMonth(nd.getMonth()+1);else if(rec==='yearly')nd.setFullYear(nd.getFullYear()+1);return nd.toISOString().slice(0,10);};
+        const recTask={id:uid(),name:task.name,assigneeId:task.assigneeId,memberIds:[...(task.memberIds||[])],status:'not_started',priority:task.priority||'normal',parallel:false,dependsOn:[],enforceDeps:false,subtasks:(task.subtasks||[]).map(s=>({...s,id:uid(),done:false})),docs:(task.docs||[]).map(d=>({...d,id:uid(),done:false,file:null,url:null})),urgent:false,mgmtCheck:task.mgmtCheck||false,recurrence:task.recurrence,plannedStart:task.plannedEnd?nextDate_(task.plannedEnd,task.recurrence):null,estimatedHours:task.estimatedHours||null,createdAt:nowTS()};
+        const freshProj2=getProject(pid);const freshPh2=freshProj2?.phases.find(p=>p.id===phid);
+        if(freshPh2){freshPh2.tasks.push(recTask);dbSaveProject(freshProj2).catch(()=>{});}
+        showToast(`🔄 Νέα επαναλαμβανόμενη εργασία: "${recTask.name}"`, 'success');
+      }
       const freshProj=getProject(pid);
       if(freshProj) await notifyPhaseActivation(freshProj,phaseBeforeId);
     } catch(err) {
       console.error('app_task_set_status:',err);
       showToast('Η αλλαγή κατάστασης απορρίφθηκε: '+(err.message||err),'error');
     } finally {
+      if(wouldCompletePhase) showToast(`🎉 Η φάση "${ph.name}" ολοκληρώθηκε! Όλες οι εργασίες έχουν ολοκληρωθεί.`,'success');
       render(); requestAnimationFrame(()=>restoreExpanded());
     }
     return;
   }
 
   task.status=next;
+  // G4: Auto-create next occurrence for recurring tasks
+  if(next==='completed'&&task.recurrence){
+    const _today_=today();
+    const nextDate=(d,rec)=>{const nd=new Date(d||_today_);if(rec==='weekly')nd.setDate(nd.getDate()+7);else if(rec==='monthly')nd.setMonth(nd.getMonth()+1);else if(rec==='yearly')nd.setFullYear(nd.getFullYear()+1);return nd.toISOString().slice(0,10);};
+    const newTask={
+      id:uid(),
+      name:task.name,
+      assigneeId:task.assigneeId,
+      memberIds:[...(task.memberIds||[])],
+      status:'not_started',
+      priority:task.priority||'normal',
+      parallel:task.parallel||false,
+      dependsOn:[],
+      enforceDeps:false,
+      subtasks:(task.subtasks||[]).map(s=>({...s,id:uid(),done:false})),
+      docs:(task.docs||[]).map(d=>({...d,id:uid(),done:false,file:null,url:null})),
+      urgent:false,
+      mgmtCheck:task.mgmtCheck||false,
+      recurrence:task.recurrence,
+      plannedStart:task.plannedEnd?nextDate(task.plannedEnd,task.recurrence):null,
+      plannedEnd:task.plannedEnd&&task.estimatedHours?nextDate(nextDate(task.plannedEnd,task.recurrence),task.recurrence):null,
+      estimatedHours:task.estimatedHours||null,
+      createdAt:nowTS()
+    };
+    ph.tasks.push(newTask);
+    showToast(`🔄 Δημιουργήθηκε νέα επαναλαμβανόμενη εργασία: "${newTask.name}"`, 'success');
+  }
   if (next==='completed'&&!task.completedDate) task.completedDate=today();
   if (next!=='completed') task.completedDate=null;
-  auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`);
+  auditLog('Αλλαγή κατάστασης',`"${task.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[next]?.label}`, pid);
   dbSaveProject(proj).catch(()=>{});
   notifyPhaseActivation(proj,phaseBeforeId).catch(()=>{});
+  if(wouldCompletePhase) showToast(`🎉 Η φάση "${ph.name}" ολοκληρώθηκε! Όλες οι εργασίες έχουν ολοκληρωθεί.`,'success');
   render(); requestAnimationFrame(()=>restoreExpanded());
 }
 
@@ -3980,6 +4415,71 @@ async function toggleSubtask(pid,phid,tid,stid,checked) {
   render(); requestAnimationFrame(()=>restoreExpanded());
 }
 
+window.toggleBulkTask = function(tid) {
+  if(state.bulkSelected.has(tid)) state.bulkSelected.delete(tid);
+  else state.bulkSelected.add(tid);
+  // Update just the bulk bar without full render
+  const bar=document.getElementById('bulk-action-bar');
+  if(bar) bar.outerHTML=renderBulkBar();
+  else {
+    const mc=document.getElementById('main-content');
+    if(mc&&state.bulkSelected.size===1){
+      // first selection: need to add bar — do a targeted inject
+      const wrap=document.createElement('div');
+      wrap.innerHTML=renderBulkBar();
+      if(wrap.firstElementChild) mc.appendChild(wrap.firstElementChild);
+    }
+  }
+};
+
+function renderBulkBar() {
+  const n = state.bulkSelected.size;
+  if(!n) return `<div id="bulk-action-bar" style="display:none"></div>`;
+  const statOpts=Object.entries(TASK_STATUSES).sort((a,b)=>a[1].label.localeCompare(b[1].label,'el')).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('');
+  return `<div id="bulk-action-bar" style="position:fixed;bottom:0;left:0;right:0;z-index:900;background:var(--navy);color:#fff;padding:12px 24px;display:flex;align-items:center;gap:12px;box-shadow:0 -4px 20px rgba(0,0,0,.2);flex-wrap:wrap">
+    <span style="font-weight:700;font-size:.88rem">${n} εργασί${n===1?'α':'ες'} επιλεγμέν${n===1?'η':'ες'}</span>
+    <select id="bulk-status-sel" class="form-control" style="max-width:200px;font-size:.8rem;background:var(--white);color:var(--heading)">
+      <option value="">Αλλαγή κατάστασης…</option>${statOpts}
+    </select>
+    <button class="btn btn-primary btn-sm" onclick="applyBulkStatus()">Εφαρμογή</button>
+    <button class="btn btn-ghost btn-sm" style="color:#fff;border-color:rgba(255,255,255,.3)" onclick="state.bulkSelected=new Set();render()">✕ Αποεπιλογή</button>
+  </div>`;
+}
+
+window.applyBulkStatus = async function() {
+  const newStatus = document.getElementById('bulk-status-sel')?.value;
+  if(!newStatus){showToast('Επιλέξτε κατάσταση.','error');return;}
+  const tasks=[];
+  for(const proj of state.db.projects){
+    for(const ph of (proj.phases||[])){
+      for(const t of (ph.tasks||[])){
+        if(state.bulkSelected.has(t.id)) tasks.push({proj,ph,t});
+      }
+    }
+  }
+  if(!tasks.length){showToast('Δεν βρέθηκαν εργασίες.','error');return;}
+  for(const {proj,ph,t} of tasks){
+    const old=t.status;
+    if(old===newStatus) continue;
+    if(isSupabaseAuthMode()){
+      try{
+        await secureProjectRpc('app_task_set_status',{p_project_id:proj.id,p_phase_id:ph.id,p_task_id:t.id,p_status:newStatus},proj.id);
+        auditLog('Μαζική αλλαγή κατάστασης',`"${t.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[newStatus]?.label}`,proj.id);
+      }catch(e){console.error('bulk status:',e);}
+    } else {
+      t.status=newStatus;
+      if(newStatus==='completed'&&!t.completedDate) t.completedDate=today();
+      if(newStatus!=='completed') t.completedDate=null;
+      auditLog('Μαζική αλλαγή κατάστασης',`"${t.name}": ${TASK_STATUSES[old]?.label} → ${TASK_STATUSES[newStatus]?.label}`,proj.id);
+      dbSaveProject(proj).catch(()=>{});
+    }
+  }
+  state.bulkSelected=new Set();
+  showToast(`${tasks.length} εργασίες ενημερώθηκαν.`,'success');
+  render();
+  requestAnimationFrame(()=>restoreExpanded());
+};
+
 function handleClick(e) {
   const btn=e.target.closest('[data-action]'); if(!btn||btn.tagName==='LABEL') return;
   e.stopPropagation();
@@ -3994,6 +4494,10 @@ function handleClick(e) {
     case 'my-account':         showModalMyAccount();                        break;
     case 'nav-dashboard':      navigate('dashboard'); state.dashFilter=null; break;
     case 'dash-filter': { const v=btn.dataset.val; state.dashFilter=(state.dashFilter===v?null:v); render(); break; }
+    case 'toggle-dash-sort':   state.dashSortOpen=!state.dashSortOpen; render(); break;
+    case 'set-dash-sort':      state.dashSortMode=btn.dataset.val; state.dashSortOpen=false; render(); break;
+    case 'toggle-asgn-sort':   state.asgnSortOpen=!state.asgnSortOpen; render(); break;
+    case 'set-asgn-sort':      state.asgnSortMode=btn.dataset.val; state.asgnSortOpen=false; render(); break;
     case 'nav-categories':     navigate('categories');                      break;
     case 'nav-projects':       navigate('projects',{categoryId:btn.dataset.cid}); break;
     case 'nav-templates':      navigate('templates');                       break;
@@ -4016,6 +4520,9 @@ function handleClick(e) {
     case 'mark-all-notifications-read':
       markAllProjectNotificationsRead();
       break;
+    case 'clear-read-notifications':
+      clearReadNotifications();
+      break;
     case 'filter-notifications':
       state.notificationFilter=btn.dataset.val||'all'; render();
       break;
@@ -4032,10 +4539,13 @@ function handleClick(e) {
     case 'doc-rename':         docRename(did,tid);                         break;
     case 'delete-doc':         deleteDoc(did,tid);                         break;
     case 'export-category':    exportCategoryToExcel(cid);            break;
+    case 'export-category-pdf':exportCategoryToPDF(cid);              break;
     case 'export-project':     exportProjectToExcel(pid);             break;
+    case 'export-project-pdf': exportProjectToPDF(pid);               break;
     case 'project-to-template':       showModalCreateTemplateFromProject(pid); break;
     case 'apply-template-to-project': showModalApplyTemplate(pid);            break;
     case 'export-phase':       exportPhaseToExcel(pid,phid);          break;
+    case 'export-phase-pdf':   exportPhaseToPDF(pid,phid);            break;
     case 'filter-status':      state.filter.status=btn.dataset.val; render(); break;
     case 'toggle-priority-sort': state.sortByPriority=!state.sortByPriority; render(); break;
     case 'toggle-gantt':       state.ganttView=!state.ganttView; render(); break;
@@ -5213,7 +5723,7 @@ window.billingLoad = async function() {
             placeholder="€/h"
             style="width:90px;font-size:.82rem;text-align:right"
             oninput="billingCalc()"></td>
-      <td style="text-align:right;font-size:.83rem;font-weight:600;color:var(--navy)" id="bill-sub-${uid}">—</td>
+      <td style="text-align:right;font-size:.83rem;font-weight:600;color:var(--heading)" id="bill-sub-${uid}">—</td>
     </tr>`).join('');
 
   el('bill-results').innerHTML = `
@@ -5250,7 +5760,7 @@ window.billingLoad = async function() {
       <div style="display:flex;justify-content:space-between;margin-top:4px"><span>Αμοιβή εργασίας:</span><span id="bill-labor-total">—</span></div>
       <div style="display:flex;justify-content:space-between;margin-top:4px"><span>Άλλα κόστη:</span><span id="bill-other-display">—</span></div>
       <hr style="margin:8px 0">
-      <div style="display:flex;justify-content:space-between;font-weight:700;font-size:1rem;color:var(--navy)"><span>ΓΕΝΙΚΟ ΣΥΝΟΛΟ:</span><span id="bill-grand">—</span></div>
+      <div style="display:flex;justify-content:space-between;font-weight:700;font-size:1rem;color:var(--heading)"><span>ΓΕΝΙΚΟ ΣΥΝΟΛΟ:</span><span id="bill-grand">—</span></div>
     </div>`;
 
   // Store context for export
@@ -5605,14 +6115,17 @@ window.updateTsPreview = function(prefix) {
     prev.innerHTML=`<span style="color:var(--red);font-size:.8rem">⚠ Η ώρα λήξης πρέπει να είναι μετά την έναρξη</span>`;
   } else {
     const h = Math.floor(mins/60), m = mins%60;
-    prev.innerHTML=`<span style="color:var(--navy);font-size:.82rem;font-weight:600">= ${h > 0 ? h+'ω ' : ''}${m > 0 ? m+'λ' : ''} (${(mins/60).toFixed(2)}h)</span>`;
+    prev.innerHTML=`<span style="color:var(--heading);font-size:.82rem;font-weight:600">= ${h > 0 ? h+'ω ' : ''}${m > 0 ? m+'λ' : ''} (${(mins/60).toFixed(2)}h)</span>`;
   }
 };
 
 function showModalAddTimesheet() {
   const cu=state.cu;
   const isAdminOrMgmt=['admin','management'].includes(cu.role);
-  const accessibleProjects=isAdminOrMgmt ? state.db.projects : visibleProjects();
+  // Τα Μόνιμα Έργα (standing) πρέπει να είναι πάντα διαθέσιμα στο Timesheet,
+  // ανεξάρτητα από το αν ο χρήστης είναι ρητά αναθεμένος σε αυτά (visibleProjects()
+  // τα αποκλείει γιατί δεν έχουν φάσεις/μέλη/PM).
+  const accessibleProjects=isAdminOrMgmt ? state.db.projects : unionStandingProjects(visibleProjects());
   const myProjects=accessibleProjects.filter(p=>p.standing || p.status==='in_progress');
   const today=new Date().toISOString().slice(0,10);
 
@@ -5637,10 +6150,16 @@ function showModalAddTimesheet() {
       </div>
       <div class="form-group">
         <label class="form-label">Έργο</label>
-        <select class="form-control" id="ts-projectId" onchange="syncTsCategoryFromProject('ts')">
+        <select class="form-control" id="ts-projectId" onchange="syncTsCategoryFromProject('ts');syncTsTaskFromProject('ts')">
           ${buildTsProjectOptions(myProjects)}
         </select>
         <div class="form-hint">Εμφανίζονται μόνο ενεργά έργα και Μόνιμα Έργα Timesheet.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Εργασία <span class="text-muted">(προαιρετικό)</span></label>
+        <select class="form-control" id="ts-taskId">
+          <option value="">— Χωρίς συγκεκριμένη εργασία —</option>
+        </select>
       </div>
       <div class="form-group">
         <label class="form-label">Είδος Έργου <sup>*</sup></label>
@@ -5685,7 +6204,7 @@ function showModalEditTimesheet(eid) {
   const entry=(state.db.timesheets||[]).find(e=>e.id===eid); if(!entry) return;
   const cu=state.cu;
   const isAdminOrMgmt=['admin','management'].includes(cu.role);
-  const accessibleProjects=isAdminOrMgmt ? state.db.projects : visibleProjects();
+  const accessibleProjects=isAdminOrMgmt ? state.db.projects : unionStandingProjects(visibleProjects());
   const myProjects=accessibleProjects.filter(p=>p.standing || p.status==='in_progress' || p.id===entry.projectId);
 
   const existFrom=entry.timeFrom||'09:00';
@@ -5706,8 +6225,14 @@ function showModalEditTimesheet(eid) {
       </div>
       <div class="form-group">
         <label class="form-label">Έργο</label>
-        <select class="form-control" id="tse-projectId" onchange="syncTsCategoryFromProject('tse')">
+        <select class="form-control" id="tse-projectId" onchange="syncTsCategoryFromProject('tse');syncTsTaskFromProject('tse')">
           ${buildTsProjectOptions(myProjects,entry.projectId,entry.projectName||'')}
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Εργασία <span class="text-muted">(προαιρετικό)</span></label>
+        <select class="form-control" id="tse-taskId">
+          ${buildTsTaskOptions(entry.projectId, entry.taskId||'')}
         </select>
       </div>
       <div class="form-group">
@@ -5755,6 +6280,7 @@ window.updateTimesheetEntry = async function(eid) {
   const desc=el('tse-desc')?.value?.trim();
   const kmRaw=el('tse-km')?.value?.trim();
   const comments=el('tse-comments')?.value?.trim();
+  const taskId=el('tse-taskId')?.value||null;
 
   if(!date){showToast('Επιλέξτε ημερομηνία.','error');return;}
   if(!projectId){showToast('Επιλέξτε έργο.','error');return;}
@@ -5778,6 +6304,8 @@ window.updateTimesheetEntry = async function(eid) {
   entry.desc=desc;
   entry.km=kmRaw ? parseInt(kmRaw,10) : null;
   entry.comments=comments||null;
+  entry.taskId=taskId||null;
+  entry.taskName=taskId ? (getProject(projectId)?.phases.flatMap(ph=>ph.tasks).find(t=>t.id===taskId)?.name||null) : null;
 
   closeModal();
   await dbSaveTimesheet(entry);
@@ -5815,6 +6343,7 @@ window.saveTimesheetEntry = async function() {
   const mins=calcTsMins(timeFrom,timeTo);
   if(!mins||mins<=0){showToast('Η ώρα λήξης πρέπει να είναι μετά την έναρξη.','error');return;}
 
+  const taskId=el('ts-taskId')?.value||null;
   const proj=getProject(projectId);
   const cat=getTimesheetCategory(categoryId);
   const entry={
@@ -5828,6 +6357,8 @@ window.saveTimesheetEntry = async function() {
     desc,
     km:kmRaw ? parseInt(kmRaw,10) : null,
     comments:comments||null,
+    taskId: taskId||null,
+    taskName: taskId ? (getProject(projectId)?.phases.flatMap(ph=>ph.tasks).find(t=>t.id===taskId)?.name||null) : null,
     createdAt:nowTS()
   };
 
@@ -6371,13 +6902,13 @@ function showModalAddTask(pid,phid) {
   const otherTasks=ph?.tasks||[];
   const canAssignMembers = state.cu && ['admin','management'].includes(state.cu.role);
   const membersHtml = canAssignMembers ? `<div class="form-group"><label class="form-label">Μέλη Ομάδας</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${members.map(u=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-member" value="${u.id}"> ${esc(u.name)} <span class="text-muted" style="font-size:.75rem">(${ROLE_INFO[u.role]?.label||u.role})</span></label>`).join('')}</div><div class="form-hint">Επιλέξτε όσους συμμετέχουν στην εργασία</div></div>` : '';
-  showModal(`<div class="modal-header"><div class="modal-title">Νέα Εργασία – ${esc(ph?.name||'')}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="nt-name" placeholder="π.χ. Σύνταξη Σύμβασης"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="nt-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="nt-parallel" style="margin-right:6px">Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-dep-ck" value="${t.id}"> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-enforce-deps"> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="form-group"><label class="form-label">Ημερομηνία Έναρξης</label><input type="date" class="form-control" id="nt-start" value="${today()}"></div><div class="form-group" style="border:1px solid #dc262633;border-radius:6px;padding:10px 14px;background:#fef2f2"><label class="form-label" style="cursor:pointer;color:#b91c1c;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-urgent">⚡ Επείγουσα εργασία</label><div class="form-hint">Η ένδειξη δεν αλλάζει τη σειρά. Ειδοποιεί μόνο τους συμμετέχοντες.</div></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-mgmt-check" style="margin-right:2px">⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveTask('${pid}','${phid}')">Προσθήκη</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Νέα Εργασία – ${esc(ph?.name||'')}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="nt-name" placeholder="π.χ. Σύνταξη Σύμβασης"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="nt-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="nt-parallel" style="margin-right:6px">Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="nt-dep-ck" value="${t.id}"> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-enforce-deps"> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="form-group"><label class="form-label">Ημερομηνία Έναρξης</label><input type="date" class="form-control" id="nt-start" value="${today()}"></div><div class="form-group" style="border:1px solid #dc262633;border-radius:6px;padding:10px 14px;background:#fef2f2"><label class="form-label" style="cursor:pointer;color:#b91c1c;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-urgent">⚡ Επείγουσα εργασία</label><div class="form-hint">Η ένδειξη δεν αλλάζει τη σειρά. Ειδοποιεί μόνο τους συμμετέχοντες.</div></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="nt-mgmt-check" style="margin-right:2px">⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div><div class="form-group"><label class="form-label">Προτεραιότητα</label><select class="form-control" id="nt-priority"><option value="normal" selected>Κανονική</option><option value="low">🔵 Χαμηλή</option><option value="high">🟠 Υψηλή</option><option value="critical">🔴 Κρίσιμη</option></select></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveTask('${pid}','${phid}')">Προσθήκη</button></div>`);
 }
 window.modalSaveTask=async function(pid,phid){
   const name=el('nt-name').value.trim(); if(!name){alert('Συμπληρώστε τίτλο.');return;}
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); if(!ph) return;
   const memberIds=Array.from(document.querySelectorAll('.nt-member:checked')).map(c=>c.value);
-  const task={id:'task_'+uid(),name,assigneeId:el('nt-assignee').value||null,memberIds,status:'not_started',parallel:el('nt-parallel')?.checked||false,dependsOn:Array.from(document.querySelectorAll('.nt-dep-ck:checked')).map(c=>c.value),enforceDeps:el('nt-enforce-deps')?.checked||false,startDate:el('nt-start')?.value||null,completedDate:null,subtasks:[],docs:[],urgent:false,mgmtCheck:el('nt-mgmt-check')?.checked||false};
+  const task={id:'task_'+uid(),name,assigneeId:el('nt-assignee').value||null,memberIds,status:'not_started',parallel:el('nt-parallel')?.checked||false,dependsOn:Array.from(document.querySelectorAll('.nt-dep-ck:checked')).map(c=>c.value),enforceDeps:el('nt-enforce-deps')?.checked||false,startDate:el('nt-start')?.value||null,completedDate:null,subtasks:[],docs:[],urgent:false,mgmtCheck:el('nt-mgmt-check')?.checked||false,priority:el('nt-priority')?.value||'normal'};
   task.urgent=!!el('nt-urgent')?.checked&&canSetTaskUrgent(proj,task);
   ph.tasks.push(task);
   auditLog('Προσθήκη εργασίας',`"${name}" – ${ph.name}`);
@@ -6434,7 +6965,10 @@ function showModalEditTask(pid,phid,tid) {
   const mgmtField=el('et-mgmt-check')?.closest('.form-group');
   if(mgmtField){
     mgmtField.insertAdjacentHTML('beforebegin',`<div class="form-group" style="border:1px solid #dc262633;border-radius:6px;padding:10px 14px;background:#fef2f2"><label class="form-label" style="cursor:${canSetTaskUrgent(proj,task)?'pointer':'not-allowed'};color:#b91c1c;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-urgent"${task.urgent?' checked':''}${canSetTaskUrgent(proj,task)?'':' disabled'}>⚡ Επείγουσα εργασία</label><div class="form-hint">Μπορεί να αλλάξει μόνο ο Υπεύθυνος Έργου ή ο Υπεύθυνος Εργασίας. Δεν επηρεάζει τη σειρά.</div></div>`);
+    mgmtField.insertAdjacentHTML('afterend',`<div class="form-group"><label class="form-label">Προτεραιότητα</label><select class="form-control" id="et-priority"><option value="normal"${task.priority==='normal'||!task.priority?' selected':''}>Κανονική</option><option value="low"${task.priority==='low'?' selected':''}>🔵 Χαμηλή</option><option value="high"${task.priority==='high'?' selected':''}>🟠 Υψηλή</option><option value="critical"${task.priority==='critical'?' selected':''}>🔴 Κρίσιμη</option></select></div>`);
   }
+  const priorField=el('et-priority')?.closest('.form-group');
+  if(priorField){priorField.insertAdjacentHTML('afterend',`<div class="form-group"><label class="form-label">Εκτιμώμενες Ώρες <span class="text-muted">(προαιρετικό)</span></label><input class="form-control" type="number" id="et-est-hours" min="0" step="0.5" value="${task.estimatedHours||''}"></div><div class="form-group"><label class="form-label">Επανάληψη <span class="text-muted">(για ολοκλήρωση)</span></label><select class="form-control" id="et-recurrence"><option value="">Καμία</option><option value="weekly"${task.recurrence==='weekly'?' selected':''}>Εβδομαδιαία</option><option value="monthly"${task.recurrence==='monthly'?' selected':''}>Μηνιαία</option><option value="yearly"${task.recurrence==='yearly'?' selected':''}>Ετήσια</option></select></div>`);}
 }
 window.modalAddSubtask=async function(){
   const name=el('et-sub')?.value.trim(); if(!name) return;
@@ -6461,6 +6995,9 @@ window.modalUpdateTask=async function(){
   task.startTime=el('et-stime')?.value||null; task.endTime=el('et-etime')?.value||null;
   task.startDate=el('et-start').value||null; task.actualStartTime=el('et-atime')?.value||null; task.completedDate=el('et-comp').value||null; task.actualEndTime=el('et-ctime')?.value||null;
   task.mgmtCheck=el('et-mgmt-check')?.checked||false;
+  task.priority=el('et-priority')?.value||'normal';
+  task.estimatedHours = parseFloat(el('et-est-hours')?.value)||null;
+  task.recurrence = el('et-recurrence')?.value||null;
   if(el('et-urgent')&&canSetTaskUrgent(proj,task)) task.urgent=!!el('et-urgent').checked;
   if(task.completedDate) task.status='completed';
   auditLog('Επεξεργασία εργασίας',`"${task.name}"`);
@@ -6691,29 +7228,30 @@ window.modalSaveDoc=async function(pid,phid,tid){
 
 // ADD USER
 function showModalAddUser() {
-  if (isSupabaseAuthMode()) {
-    showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div>
-      <div class="modal-body">
-        <div class="login-err" style="display:block">
-          Η δημιουργία νέου χρήστη είναι προσωρινά απενεργοποιημένη στη μεταβατική Auth έκδοση.
-        </div>
-        <div class="form-hint">Οι υπάρχοντες χρήστες συνεχίζουν κανονικά. Η νέα ροή provisioning θα ενεργοποιηθεί στο τελικό cutover, ώστε να μη δημιουργούνται ασύνδετα application/Auth accounts.</div>
-      </div>
-      <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">OK</button></div>`);
-    return;
-  }
   showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο <sup>*</sup></label><input class="form-control" id="nu-name" placeholder="Γεώργιος Παπαδόπουλος"></div><div class="form-group"><label class="form-label">Username <sup>*</sup></label><input class="form-control" id="nu-user" placeholder="gpapadopoulos"></div><div class="form-group"><label class="form-label">Κωδικός <sup>*</sup></label><input class="form-control" type="password" id="nu-pass"></div><div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="nu-email"></div><div class="form-group"><label class="form-label">Ρόλος</label><select class="form-control" id="nu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">Κατηγορίες (για Υπ. Έργου)</label>${state.db.categories.map(c=>`<label style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" class="nu-catck" value="${c.id}"> ${esc(c.name)}</label>`).join('')}</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveUser()">Δημιουργία</button></div>`);
 }
 window.modalSaveUser=async function(){
   const name=el('nu-name').value.trim(); const username=el('nu-user').value.trim(); const password=el('nu-pass').value;
   if(!name||!username||!password){alert('Συμπληρώστε υποχρεωτικά πεδία.');return;}
-  if(state.db.users.find(u=>u.username===username)){alert('Το username υπάρχει ήδη.');return;}
   const catIds=Array.from(document.querySelectorAll('.nu-catck:checked')).map(c=>c.value);
   const hashedPass = dcodeIO.bcrypt.hashSync(password, 10);
-  const user={id:'u_'+uid(),name,username,password:hashedPass,role:el('nu-role').value,email:el('nu-email').value.trim(),categoryIds:catIds,projectIds:[]};
-  state.db.users.push(user);
-  auditLog('Δημιουργία χρήστη',`${user.name} (${ROLE_INFO[user.role]?.label})`);
-  await dbSaveUser(user); closeModal(); render(); showToast(`Χρήστης «${name}» δημιουργήθηκε.`,'success');
+  // Check for existing user with same username (case-insensitive)
+  const existingIdx = state.db.users.findIndex(u=>(u.username||'').toLowerCase()===username.toLowerCase());
+  let user;
+  if (existingIdx >= 0) {
+    // Update existing user (overwrite stale/zombie entry)
+    user = {...state.db.users[existingIdx], name, username, password:hashedPass, role:el('nu-role').value, email:el('nu-email').value.trim(), categoryIds:catIds};
+    state.db.users[existingIdx] = user;
+    auditLog('Ενημέρωση χρήστη',`${user.name} (${ROLE_INFO[user.role]?.label})`);
+  } else {
+    user = {id:'u_'+uid(),name,username,password:hashedPass,role:el('nu-role').value,email:el('nu-email').value.trim(),categoryIds:catIds,projectIds:[]};
+    state.db.users.push(user);
+    auditLog('Δημιουργία χρήστη',`${user.name} (${ROLE_INFO[user.role]?.label})`);
+  }
+  // Use direct upsert to be_users for new user creation (auth-mode RPC is update-only)
+  const {error: saveErr} = await sb.from('be_users').upsert({id:user.id, data:user});
+  if (saveErr) { showToast('Σφάλμα αποθήκευσης: '+(saveErr.message||saveErr),'error'); return; }
+  closeModal(); render(); showToast(`Χρήστης «${name}» αποθηκεύτηκε.`,'success');
 };
 
 // USER PRIORITY
@@ -7111,7 +7649,7 @@ function _renderPriorityList() {
         onkeydown="if(event.key==='Enter')this.blur()"
         onclick="this.select()">
       <div style="flex:1;min-width:0">
-        <div style="font-weight:700;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--navy)">${esc(p.name)}</div>
+        <div style="font-weight:700;font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--heading)">${esc(p.name)}</div>
         <div style="font-size:.72rem;color:var(--steel);margin-top:2px">${esc(cat?.name||'—')} · ${prog.tasks.pct}% πρόοδος</div>
       </div>
       <div style="display:flex;flex-direction:column;gap:3px;flex-shrink:0">
@@ -7179,7 +7717,7 @@ function showModalEditUser(userId) {
   const user=getUser(userId); if(!user) return;
   const isGlobalFixed=['admin','management','client'].includes(user.role);
   const catRoleOpts=(current)=>`<option value=""${!current?' selected':''}>— Προεπιλογή (${ROLE_INFO[user.role]?.label||user.role}) —</option><option value="project_manager"${current==='project_manager'?' selected':''}>Υπεύθυνος Έργου</option><option value="team_member"${current==='team_member'?' selected':''}>Μέλος Ομάδας</option>`;
-  const catRolesHtml=isGlobalFixed?'':`<div class="form-group"><label class="form-label" style="margin-bottom:8px">Ρόλος ανά Κατηγορία</label><div style="border:1px solid var(--navy-line);border-radius:6px;overflow:hidden">${state.db.categories.map((c,i)=>`<div style="display:flex;align-items:center;gap:12px;padding:8px 12px;${i>0?'border-top:1px solid var(--navy-line)':''}"><span style="flex:1;font-size:.82rem">${esc(c.name)}</span><select class="eu-catrole" data-cid="${c.id}" style="font-size:.78rem;padding:3px 6px;border:1px solid var(--navy-line);border-radius:4px;background:var(--white)">${catRoleOpts((user.categoryRoles||{})[c.id])}</select></div>`).join('')}</div><div class="form-hint">«Προεπιλογή» σημαίνει χρήση του global ρόλου.</div></div>`;
+  const catRolesHtml=isGlobalFixed?'':`<div class="form-group"><label class="form-label" style="margin-bottom:8px">Ρόλος ανά Κατηγορία</label><div style="border:1px solid var(--navy-line);border-radius:6px;overflow:hidden">${state.db.categories.map((c,i)=>`<div style="display:flex;align-items:center;gap:12px;padding:8px 12px;${i>0?'border-top:1px solid var(--navy-line)':''}"><span style="flex:1;font-size:.82rem">${esc(c.name)}</span><select class="eu-catrole" data-cid="${c.id}" style="font-size:.78rem;padding:3px 6px;border:1px solid var(--navy-line);border-radius:4px;background:var(--white);color:var(--ink)">${catRoleOpts((user.categoryRoles||{})[c.id])}</select></div>`).join('')}</div><div class="form-hint">«Προεπιλογή» σημαίνει χρήση του global ρόλου.</div></div>`;
 
   // Access section: per category full OR specific projects
   // Clients also get access control (admin/management pick what they see)
@@ -7252,14 +7790,14 @@ function renderTaskComments(task, proj, ph) {
     const isOwn = c.userId === state.cu?.id;
     return `<div class="comment-item">
       <div class="comment-meta">${esc(u?.name||'Άγνωστος')} · ${fmtDT(c.at)}${isOwn?`<button class="btn btn-danger btn-icon btn-sm" style="margin-left:auto;padding:1px 5px;font-size:.6rem" data-action="delete-comment" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${task.id}" data-cid="${c.id}">✕</button>`:''}</div>
-      <div class="comment-text">${esc(c.text)}</div>
+      <div class="comment-text">${esc(c.text).replace(/@(\S+)/g,'<span style="background:var(--orange-light);color:var(--orange);padding:0 3px;border-radius:3px;font-weight:600">@$1</span>')}</div>
     </div>`;
   }).join('');
   return `<div class="comments-section">
     <div class="comments-label">💬 Σχόλια${comments.length?` (${comments.length})`:''}${comments.length?`<button class="btn btn-ghost btn-sm" style="font-size:.68rem;padding:2px 6px;margin-left:auto" data-action="toggle-comments" data-tid="${task.id}">${state.commentsOpen?.[task.id]?'Απόκρυψη':'Εμφάνιση'}</button>`:''}</div>
     ${(state.commentsOpen?.[task.id]||comments.length===0)?`<div class="comments-list">${listHtml}</div>`:''}
     <div class="comment-add">
-      <textarea class="form-control comment-input" id="ci-${task.id}" placeholder="Σχόλιο…" rows="2"></textarea>
+      <div style="position:relative"><textarea class="form-control comment-input" id="comment-input-${task.id}" oninput="handleCommentInput(this)" autocomplete="off" placeholder="Σχόλιο…" rows="8" style="min-height:120px;width:500px;max-width:100%;resize:vertical"></textarea><div id="mention-drop-${task.id}" class="mention-drop" style="display:none;position:absolute;background:var(--white);border:1px solid var(--slate-200);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.12);z-index:200;max-height:200px;overflow-y:auto;min-width:200px"></div></div>
       <button class="btn btn-secondary btn-sm" data-action="add-comment" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${task.id}">+ Αποστολή</button>
     </div>
   </div>`;
@@ -7295,7 +7833,7 @@ async function sendCommentNotifications(proj, ph, task, commentText) {
 
 async function addComment(pid, phid, tid) {
   const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); if(!task) return;
-  const input=el('ci-'+tid); const text=(input?.value||'').trim(); if(!text) return;
+  const input=el('comment-input-'+tid); const text=(input?.value||'').trim(); if(!text) return;
 
   if (isSupabaseAuthMode()) {
     try {
@@ -7314,6 +7852,22 @@ async function addComment(pid, phid, tid) {
       if (freshProj && freshPh && freshTask) {
         sendCommentNotifications(freshProj,freshPh,freshTask,text);
       }
+      // Detect @mentions in comment text and notify
+      const commentTextarea = document.getElementById('comment-input-'+tid);
+      const mentions = commentTextarea?._mentions||[];
+      const commentText = el('comment-input-'+tid)?.value||'';
+      const parsed = [...commentText.matchAll(/@([^\s]+)/g)].map(m=>m[1]);
+      mentions.forEach(({userId:muid,name:mname})=>{
+        if(muid===state.cu.id) return;
+        const mentionedUser=getUser(muid);
+        if(!mentionedUser) return;
+        const proj_=getProject(pid);
+        const nid='mention_'+uid();
+        const notif={id:nid,source:'legacy',type:'mention',title:`📌 Mention από ${state.cu.name}`,sub:proj_?`Στην εργασία του ${proj_.name}`:'',projId:pid,tid,at:nowTS(),read:false,readAt:null,projectId:pid,taskId:tid};
+        state.db.notifications=(state.db.notifications||[]);
+        console.log('Mention notification for', mname, notif);
+      });
+      if(commentTextarea) commentTextarea._mentions=[];
     } catch(err) {
       showToast('Το σχόλιο δεν αποθηκεύτηκε: '+(err.message||err),'error');
     }
@@ -7329,6 +7883,22 @@ async function addComment(pid, phid, tid) {
   render();
   showToast('Σχόλιο προστέθηκε.','success');
   sendCommentNotifications(proj, ph, task, text);
+  // Detect @mentions in comment text and notify
+  const commentTextarea = document.getElementById('comment-input-'+tid);
+  const mentions = commentTextarea?._mentions||[];
+  const commentText2 = el('comment-input-'+tid)?.value||'';
+  const parsed2 = [...commentText2.matchAll(/@([^\s]+)/g)].map(m=>m[1]);
+  mentions.forEach(({userId:muid,name:mname})=>{
+    if(muid===state.cu.id) return;
+    const mentionedUser=getUser(muid);
+    if(!mentionedUser) return;
+    const proj_=getProject(pid);
+    const nid='mention_'+uid();
+    const notif={id:nid,source:'legacy',type:'mention',title:`📌 Mention από ${state.cu.name}`,sub:proj_?`Στην εργασία του ${proj_.name}`:'',projId:pid,tid,at:nowTS(),read:false,readAt:null,projectId:pid,taskId:tid};
+    state.db.notifications=(state.db.notifications||[]);
+    console.log('Mention notification for', mname, notif);
+  });
+  if(commentTextarea) commentTextarea._mentions=[];
 }
 
 async function deleteComment(pid, phid, tid, cid) {
@@ -7352,6 +7922,36 @@ async function deleteComment(pid, phid, tid, cid) {
   state.expandedTasks[tid]=true;
   render();
 }
+
+window.handleCommentInput = function(textarea) {
+  const val=textarea.value;
+  const caret=textarea.selectionStart;
+  const before=val.slice(0,caret);
+  const match=before.match(/@(\w{0,20})$/);
+  const drop=textarea.closest('[style*="position:relative"]')?.querySelector('.mention-drop')||document.querySelector('.mention-drop');
+  if(!drop) return;
+  if(!match){drop.style.display='none';return;}
+  const q=match[1].toLowerCase();
+  const users=state.db.users.filter(u=>u.role!=='client'&&u.id!==state.cu.id&&(u.name.toLowerCase().includes(q)||u.email?.toLowerCase().includes(q))).slice(0,6);
+  if(!users.length){drop.style.display='none';return;}
+  drop.innerHTML=users.map(u=>`<div class="mention-item" onclick="insertMention('${u.id}','${esc(u.name)}',this.closest('[style*=relative]').querySelector('textarea'))" style="padding:8px 12px;cursor:pointer;font-size:.82rem;display:flex;align-items:center;gap:8px"><span style="width:24px;height:24px;background:var(--orange-light);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:700;color:var(--orange)">${u.name[0]}</span>${esc(u.name)}</div>`).join('');
+  drop.style.display='block';
+};
+window.insertMention = function(userId, name, textarea) {
+  if(!textarea) return;
+  const val=textarea.value;
+  const caret=textarea.selectionStart;
+  const before=val.slice(0,caret);
+  const newBefore=before.replace(/@\w{0,20}$/,`@${name} `);
+  textarea.value=newBefore+val.slice(caret);
+  textarea.selectionStart=textarea.selectionEnd=newBefore.length;
+  const drop=textarea.closest('[style*="position:relative"]')?.querySelector('.mention-drop');
+  if(drop) drop.style.display='none';
+  textarea.focus();
+  // Store the mention for notification
+  if(!textarea._mentions) textarea._mentions=[];
+  textarea._mentions.push({userId,name});
+};
 
 // ── GANTT CHART ───────────────────────────────────────────────────
 function renderGantt(proj) {
@@ -7450,7 +8050,7 @@ function renderGantt(proj) {
     const actualBar=(ad.start||ad.end)
       ? _mkBar(ad.start,ad.end,actualClr,ad.start&&ad.end?fmt(ad.start)+' → '+fmt(ad.end):fmt(ad.start||ad.end),0.75)
       : '';
-    const labelCol=`<div style="width:200px;flex-shrink:0;font-size:.75rem;font-weight:600;color:var(--navy);padding:0 14px;border-right:1px solid var(--navy-line);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center" title="${esc(ph.name)}">${idx+1}. ${esc(ph.name)}</div>`;
+    const labelCol=`<div style="width:200px;flex-shrink:0;font-size:.75rem;font-weight:600;color:var(--heading);padding:0 14px;border-right:1px solid var(--navy-line);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center" title="${esc(ph.name)}">${idx+1}. ${esc(ph.name)}</div>`;
     return `<div style="border-bottom:1px solid var(--slate-100)">
       <div style="display:flex;align-items:stretch;min-height:30px">
         ${labelCol}
@@ -7468,7 +8068,8 @@ function renderGantt(proj) {
     <button class="btn btn-sm" onclick="state.ganttScale='week';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='week'?'background:var(--navy);color:#fff':''}">Εβδομάδα</button>
     <button class="btn btn-sm" onclick="state.ganttScale='month';render()" style="font-size:.62rem;padding:3px 7px;${ganttScale==='month'?'background:var(--navy);color:#fff':''}">Μήνας</button>
   </div>
-  <div style="background:var(--white);border:1px solid var(--navy-line);border-radius:10px;overflow:hidden;margin-top:0">
+  <div class="gantt-scroll-wrap">
+  <div style="background:var(--white);border:1px solid var(--navy-line);border-radius:10px;overflow:hidden;margin-top:0;min-width:640px">
     <div style="display:flex;align-items:center;border-bottom:2px solid var(--navy-line)">
       <div style="width:200px;flex-shrink:0;padding:8px 14px;font-size:.68rem;font-weight:800;color:var(--steel);text-transform:uppercase;letter-spacing:.06em;border-right:1px solid var(--navy-line)">Φάση</div>
       <div style="flex:1;position:relative;height:28px">${headerLabels}</div>
@@ -7479,6 +8080,7 @@ function renderGantt(proj) {
       <span style="display:inline-block;width:12px;height:10px;background:var(--orange);border-radius:2px;vertical-align:middle"></span> Προγραμματισμένο &nbsp;
       <span style="display:inline-block;width:12px;height:10px;background:var(--blue);border-radius:2px;vertical-align:middle;opacity:.75"></span> Πραγματικό
     </div>
+  </div>
   </div>`;
 }
 
@@ -7758,6 +8360,49 @@ function exportPhaseToExcel(projId, phId) {
   const tRows=[], dRows=[];
   (ph.tasks||[]).forEach(t=>{ tRows.push(_taskRow(proj,ph,t)); dRows.push(..._docRows(proj,ph,t)); });
   _writeXlsx(tRows, dRows, `${proj.code||proj.name} – ${ph.name}.xlsx`);
+}
+
+// ── PDF EXPORT (browser print → "Save as PDF") ──────────────────────
+function _printRows(title, subtitle, rows) {
+  const area = document.getElementById('print-area');
+  if (!area) { showToast('Η εξαγωγή PDF δεν είναι διαθέσιμη.','error'); return; }
+  const cols = rows.length ? Object.keys(rows[0]) : [];
+  const theadHtml = `<tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`;
+  const tbodyHtml = rows.length
+    ? rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(String(r[c]??''))}</td>`).join('')}</tr>`).join('')
+    : `<tr><td colspan="${Math.max(cols.length,1)}">Δεν υπάρχουν εγγραφές</td></tr>`;
+  area.innerHTML = `
+    <div style="padding:24px;font-family:Arial,Helvetica,sans-serif;color:#000">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;border-bottom:2px solid #071827;padding-bottom:10px">
+        <img src="logo.jpg" style="height:32px;flex-shrink:0" onerror="this.style.display='none'">
+        <div>
+          <div style="font-size:16px;font-weight:800">${esc(title)}</div>
+          ${subtitle?`<div style="font-size:11px;color:#555">${esc(subtitle)}</div>`:''}
+        </div>
+      </div>
+      <div style="font-size:10px;color:#888;margin:10px 0 14px">Εξαγωγή: ${esc(fmtDT(nowTS()))}</div>
+      <table>${theadHtml}<tbody>${tbodyHtml}</tbody></table>
+    </div>`;
+  setTimeout(()=>window.print(), 80);
+}
+function exportCategoryToPDF(catId) {
+  const cat=getCategory(catId); if(!cat) return;
+  const projs=state.db.projects.filter(p=>p.categoryId===catId);
+  const rows=[];
+  projs.forEach(proj=>(proj.phases||[]).forEach(ph=>(ph.tasks||[]).forEach(t=>rows.push(_taskRow(proj,ph,t)))));
+  _printRows(cat.name, 'Κατηγορία — Εργασίες όλων των έργων', rows);
+}
+function exportProjectToPDF(projId) {
+  const proj=getProject(projId); if(!proj) return;
+  const rows=[];
+  (proj.phases||[]).forEach(ph=>(ph.tasks||[]).forEach(t=>rows.push(_taskRow(proj,ph,t))));
+  _printRows(proj.name, proj.code?`Κωδικός: ${proj.code}`:'', rows);
+}
+function exportPhaseToPDF(projId, phId) {
+  const proj=getProject(projId); if(!proj) return;
+  const ph=proj.phases.find(p=>p.id===phId); if(!ph) return;
+  const rows=(ph.tasks||[]).map(t=>_taskRow(proj,ph,t));
+  _printRows(`${proj.name} — ${ph.name}`, proj.code?`Κωδικός: ${proj.code}`:'', rows);
 }
 
 // ── CLIENT CALENDAR ───────────────────────────────────────────────
@@ -8381,18 +9026,26 @@ function renderAssigned() {
   const activeProjects=assignedProjectOrder(
     allProjs.filter(p=>p.status!=='completed'&&!p.standing),viewUser
   );
-  const rows=activeProjects.flatMap(proj=>assignedRowsForProject(proj,viewUserId));
+  let rows=activeProjects.flatMap(proj=>assignedRowsForProject(proj,viewUserId));
+  rows=_asgnSortRows(rows);
   rows.forEach((r,i) => { r.displayRank = i+1; });
   const projectCount=new Set(rows.map(r=>r.proj.id)).size;
   const waitingCount=rows.filter(r=>r.waiting).length;
 
   const userFilter = isAdminOrMgmt ? `
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <label style="font-size:.82rem;font-weight:600;color:var(--navy)">Εργαζόμενος:</label>
+      <label style="font-size:.82rem;font-weight:600;color:var(--heading)">Εργαζόμενος:</label>
       <select class="form-control" style="max-width:200px;font-size:.82rem" onchange="state.assignedUserId=this.value;render()">
         ${sortByName(state.db.users.filter(u=>u.role!=='client')).map(u=>`<option value="${u.id}" ${u.id===viewUserId?'selected':''}>${esc(u.name)}</option>`).join('')}
       </select>
     </div>` : `<div style="font-size:.82rem;color:var(--muted)">Εμφανίζονται οι δικές σου αναθέσεις</div>`;
+
+  const sortDropdown = `<div class="asgn-sort-wrap">
+    <button class="btn btn-secondary btn-sm" data-action="toggle-asgn-sort" title="Ταξινόμηση">↕ ${esc(ASGN_SORT_OPTIONS[state.asgnSortMode||'smart'])}</button>
+    <div class="asgn-sort-dropdown${state.asgnSortOpen?' is-open':''}">
+      ${Object.entries(ASGN_SORT_OPTIONS).map(([k,label])=>`<div class="asgn-sort-opt${(state.asgnSortMode||'smart')===k?' is-active':''}" data-action="set-asgn-sort" data-val="${k}">${(state.asgnSortMode||'smart')===k?'✓ ':''}${esc(label)}</div>`).join('')}
+    </div>
+  </div>`;
 
   const statusLabel = {
     not_started:'Εκκρεμεί', in_progress:'Σε εξέλιξη', internal_processing:'Εσωτερική επεξεργασία',
@@ -8403,14 +9056,14 @@ function renderAssigned() {
   const tableRows = rows.map(r => {
     const stt = r.task.status||'not_started';
     const urgentControl=canSetTaskUrgent(r.proj,r.task)
-      ? `<button class="btn btn-sm ${r.task.urgent?'btn-danger':'btn-ghost'}" onclick="setTaskUrgent('${r.proj.id}','${r.ph.id}','${r.task.id}',${r.task.urgent?'false':'true'})" title="Η ένδειξη δεν αλλάζει τη σειρά">${r.task.urgent?'⚡ Επείγον':'⚡ Ορισμός επείγοντος'}</button>`
+      ? `<button class="btn btn-xs asgn-urgent-btn ${r.task.urgent?'btn-danger':'btn-ghost'}" onclick="setTaskUrgent('${r.proj.id}','${r.ph.id}','${r.task.id}',${r.task.urgent?'false':'true'})" title="Η ένδειξη δεν αλλάζει τη σειρά">${r.task.urgent?'⚡ Επείγον':'⚡ Ορισμός επείγοντος'}</button>`
       : (r.task.urgent?'<span class="badge badge-red" style="font-size:.58rem">⚡ ΕΠΕΙΓΟΝ</span>':'');
     return `<tr class="asgn-row${r.waiting?' asgn-row-waiting':''}">
       <td class="asgn-td" style="width:40px;text-align:center"><span class="asgn-rank-num">${r.displayRank}</span></td>
       <td class="asgn-td asgn-meta" style="font-weight:600"><span class="asgn-task-name" onclick="navigate('project',{projectId:'${r.proj.id}'})" title="Άνοιγμα έργου">${esc(r.proj.name)}</span></td>
       <td class="asgn-td asgn-meta">${esc(r.ph.name)}</td>
-      <td class="asgn-td"><span class="asgn-task-name" onclick="navigate('project',{projectId:'${r.proj.id}'})" title="Άνοιγμα έργου">${esc(r.task.name)}</span><div style="margin-top:5px">${urgentControl}</div></td>
-      <td class="asgn-td"><span class="asgn-status asgn-status-${stt}">${esc(r.waiting?.label||statusLabel[stt]||stt)}</span>${r.waiting?'<div class="text-sm text-muted" style="margin-top:4px">Εμφανίζεται μαζί με την επόμενη εκτελέσιμη εργασία.</div>':''}</td>
+      <td class="asgn-td"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span class="asgn-task-name" onclick="navigate('project',{projectId:'${r.proj.id}'})" title="Άνοιγμα έργου">${esc(r.task.name)}</span>${urgentControl}</div></td>
+      <td class="asgn-td"><span class="asgn-status asgn-status-${stt}">${esc(r.waiting?.label||statusLabel[stt]||stt)}</span>${r.waiting?'<div class="text-sm text-muted" style="margin-top:2px">Μαζί με την επόμενη εκτελέσιμη εργασία.</div>':''}</td>
       <td class="asgn-td asgn-meta">${r.task.plannedStart ? fmt(r.task.plannedStart) : '—'}</td>
       <td class="asgn-td asgn-meta">${r.task.plannedEnd ? fmt(r.task.plannedEnd) : '—'}</td>
     </tr>`;
@@ -8427,7 +9080,10 @@ function renderAssigned() {
         <h2 class="asgn-title">👤 Assigned To${viewUser ? ' — '+esc(viewUser.name) : ''}</h2>
         <p class="asgn-subtitle">${projectCount} ενεργά έργα · ${rows.length-waitingCount} εκτελέσιμες εργασίες${waitingCount?' · '+waitingCount+' σε αναμονή':''}</p>
       </div>
-      ${userFilter}
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        ${userFilter}
+        ${rows.length>0 ? sortDropdown : ''}
+      </div>
     </div>
     ${rows.length>0 ? `
     <div class="asgn-table-wrap">
@@ -8602,18 +9258,49 @@ window.setTaskRankManual = async function(pid, phid, tid, total) {
 function renderOffers() {
   const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
   const q = (state.offersSearch||'').toLowerCase();
-  const stFilter = state.offersStatus||'';
-  let offers = (state.db.offers||[]).filter(o=>{
-    if (stFilter && o.status !== stFilter) return false;
+  const stFilter    = state.offersStatus||'';
+  const fCat        = state.offersFilterCat||'';
+  const fInvoiced   = state.offersFilterInvoiced||'';
+  const fPaid       = state.offersFilterPaid||'';
+  const fCompleted  = state.offersFilterCompleted||'';
+  const sortCol     = state.offersSortCol||'code';
+  const sortDir     = state.offersSortDir||'asc';
+
+  const allOffers = state.db.offers||[];
+  const allCats   = [...new Set(allOffers.map(o=>o.category).filter(Boolean))].sort();
+
+  let offers = allOffers.filter(o=>{
+    if (stFilter   && o.status           !== stFilter)   return false;
+    if (fCat       && (o.category||'')   !== fCat)       return false;
+    if (fInvoiced  && (o.invoiced||'')   !== fInvoiced)  return false;
+    if (fPaid      && (o.paid||'')       !== fPaid)      return false;
+    if (fCompleted && (o.projectCompleted||'') !== fCompleted) return false;
     if (!q) return true;
     return (o.code||'').toLowerCase().includes(q)
         || (o.title||'').toLowerCase().includes(q)
         || (o.clientName||'').toLowerCase().includes(q)
+        || (o.category||'').toLowerCase().includes(q)
         || (o.notes||'').toLowerCase().includes(q);
+  });
+
+  // Sort
+  const numCols = new Set(['amount','agreedAmount']);
+  offers = [...offers].sort((a,b)=>{
+    let va = a[sortCol]??'', vb = b[sortCol]??'';
+    if (numCols.has(sortCol)) { va=parseFloat(va)||0; vb=parseFloat(vb)||0; return sortDir==='asc'?va-vb:vb-va; }
+    va=String(va).toLowerCase(); vb=String(vb).toLowerCase();
+    return sortDir==='asc' ? va.localeCompare(vb,'el') : vb.localeCompare(va,'el');
   });
 
   const users = state.db.users||[];
   const getUserName = id => { const u=users.find(x=>x.id===id); return u?u.name:'—'; };
+  const fmtAmt = v => v ? new Intl.NumberFormat('el-GR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(v) : '—';
+  const yesno  = v => v==='YES' ? '<span style="color:#059669;font-size:1rem">✅</span>' : v==='NO' ? '<span style="color:#dc2626;font-weight:700">✕</span>' : '<span style="color:var(--muted)">—</span>';
+
+  // Sort helpers
+  const arrow  = col => sortCol===col ? (sortDir==='asc'?' ▲':' ▼') : '';
+  const thSort = (col,label,extra='') =>
+    `<th class="crm-th" style="${thStyle};cursor:pointer;user-select:none;${extra}" onclick="offerSort('${col}')">${label}${arrow(col)}</th>`;
 
   const statusBtns = ['',...Object.keys(OFFER_STATUSES)].map(s=>{
     const active=stFilter===s;
@@ -8622,107 +9309,212 @@ function renderOffers() {
     return `<button class="crm-filter-btn${active?' active':''}" style="${active?`background:${color}20;color:${color};border-color:${color}`:''}" onclick="state.offersStatus='${s}';render()">${label}</button>`;
   }).join('');
 
+  const selStyle = 'font-size:.75rem;padding:3px 6px;border:1px solid var(--border);border-radius:5px;background:var(--white);color:var(--heading);height:28px';
+  const filterSel = (stateKey,label,opts) => {
+    const val = state[stateKey]||'';
+    const options = [['','Όλα',...opts]].flat();
+    const optsHtml = [['','Όλα'],...opts.map(o=>[o,o])].map(([v,l])=>`<option value="${v}" ${val===v?'selected':''}>${l}</option>`).join('');
+    return `<label style="font-size:.72rem;color:var(--muted);display:flex;align-items:center;gap:4px">${label}
+      <select style="${selStyle}" onchange="state.${stateKey}=this.value;render()">${optsHtml}</select></label>`;
+  };
+
+  const thStyle = 'white-space:nowrap;font-size:.72rem;padding:6px 8px';
+  const tdStyle = 'font-size:.78rem;padding:5px 8px;vertical-align:middle';
+  const tdCtr   = tdStyle+';text-align:center';
+
   const rows = offers.map(o=>{
-    const st=OFFER_STATUSES[o.status]||OFFER_STATUSES.draft;
-    const amountStr=o.amount?new Intl.NumberFormat('el-GR',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(o.amount):'—';
+    const st = OFFER_STATUSES[o.status]||OFFER_STATUSES.draft;
     const fileHref = o.fileUrl||'';
-    const fileName = fileHref ? fileHref.replace(/\\/g,'/').split('/').pop() : '';
-    const fileLink = fileHref
-      ? `<a href="${esc(fileHref)}" target="_blank" style="font-size:.72rem;color:var(--blue);display:block;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px" title="${esc(fileHref)}">📎 ${esc(decodeURIComponent(fileName))}</a>`
-      : '';
-    const fileBtn = canEdit
-      ? `<button class="btn btn-ghost btn-sm" data-action="offer-file" data-oid="${o.id}" title="Σύνδεση αρχείου" style="font-size:.78rem;padding:3px 7px">${fileHref?'📎':'📁'}</button>`
-      : '';
+    const fileBtn  = canEdit
+      ? `<button class="btn btn-ghost btn-sm" data-action="offer-file" data-oid="${o.id}" title="Σύνδεση αρχείου" style="font-size:.72rem;padding:2px 6px">${fileHref?'📎':'📁'}</button>`
+      : (fileHref ? `<a href="${esc(fileHref)}" target="_blank" title="${esc(fileHref)}" style="font-size:.85rem">📎</a>` : '');
     return `<tr class="crm-tr">
-      <td class="crm-td">
-        <div class="crm-co-name">${esc(o.code||'')} ${esc(o.title||'')}</div>
-        ${o.clientName?`<div class="crm-sub">${esc(o.clientName)}</div>`:''}
-        ${o.notes?`<div class="crm-sub" style="color:var(--muted);font-style:italic;margin-top:2px">${esc(o.notes)}</div>`:''}
-        ${fileLink}
-      </td>
-      <td class="crm-td">${fmt(o.date)}</td>
-      <td class="crm-td">${getUserName(o.managerId)}</td>
-      <td class="crm-td"><span class="crm-badge" style="background:${st.color}20;color:${st.color}">${st.label}</span></td>
-      <td class="crm-td" style="font-weight:600;color:var(--navy)">${amountStr}</td>
-      <td class="crm-td" style="text-align:right;white-space:nowrap">
-        ${fileBtn}
+      <td class="crm-td" style="${tdCtr}">${fileBtn}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap;font-weight:600">${esc(o.code||'—')}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap">${fmt(o.date)}</td>
+      <td class="crm-td" style="${tdStyle}">${esc(o.clientName||'—')}</td>
+      <td class="crm-td" style="${tdStyle}">${esc(o.clientVia||'—')}</td>
+      <td class="crm-td" style="${tdStyle}">${esc(o.category||'—')}</td>
+      <td class="crm-td" style="${tdStyle};max-width:200px">${esc(o.title||'—')}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap">${getUserName(o.managerId)}</td>
+      <td class="crm-td" style="${tdStyle};text-align:right;font-weight:600">${fmtAmt(o.amount)}</td>
+      <td class="crm-td" style="${tdCtr}"><span class="crm-badge" style="background:${st.color}20;color:${st.color};white-space:nowrap">${st.label}</span></td>
+      <td class="crm-td" style="${tdStyle};text-align:right">${fmtAmt(o.agreedAmount)}</td>
+      <td class="crm-td" style="${tdCtr}">${esc(o.hasContract||'—')}</td>
+      <td class="crm-td" style="${tdCtr}">${yesno(o.contractSentToAccounting)}</td>
+      <td class="crm-td" style="${tdCtr}">${yesno(o.projectCompleted)}</td>
+      <td class="crm-td" style="${tdCtr}">${yesno(o.satisfactionSurveySent)}</td>
+      <td class="crm-td" style="${tdCtr}">${yesno(o.invoiced)}</td>
+      <td class="crm-td" style="${tdCtr}">${yesno(o.paid)}</td>
+      <td class="crm-td" style="${tdStyle};text-align:right;white-space:nowrap">
         ${canEdit?`<button class="btn btn-ghost btn-sm" data-action="offer-edit" data-oid="${o.id}" style="font-size:.72rem">✏</button>
         <button class="btn btn-danger btn-sm" data-action="offer-delete" data-oid="${o.id}" style="font-size:.72rem">✕</button>`:''}
       </td>
     </tr>`;
   }).join('');
 
-  return `<div class="page-hd">
-    <div><h1>Offers</h1><div class="page-hd-sub">${offers.length} από ${(state.db.offers||[]).length} offers</div></div>
+  return `<style>#offers-table-wrap::-webkit-scrollbar{height:0!important}#offers-table-wrap{scrollbar-width:none}</style>
+  <div class="page-hd">
+    <div><h1>Offers</h1><div class="page-hd-sub">${offers.length} από ${allOffers.length} offers</div></div>
     <div class="page-hd-actions">
       ${canEdit?`<button class="btn btn-primary" data-action="offer-add">+ Νέο Offer</button>`:''}
     </div>
   </div>
-  <div class="crm-toolbar">
-    <input class="form-control crm-search" placeholder="🔍 Αναζήτηση…" value="${esc(state.offersSearch||'')}" oninput="state.offersSearch=this.value;render()" style="max-width:300px">
+  <div class="crm-toolbar" style="flex-wrap:wrap;gap:8px">
+    <input class="form-control crm-search" placeholder="🔍 Αναζήτηση…" value="${esc(state.offersSearch||'')}" oninput="state.offersSearch=this.value;render()" style="max-width:240px">
     <div class="crm-filters">${statusBtns}</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto">
+      ${filterSel('offersFilterCat','Κατηγορία:',allCats)}
+      ${filterSel('offersFilterCompleted','Ολοκλ.:',['YES','NO'])}
+      ${filterSel('offersFilterInvoiced','Τιμολ.:',['YES','NO'])}
+      ${filterSel('offersFilterPaid','Εξοφλ.:',['YES','NO'])}
+    </div>
   </div>
-  ${offers.length ? `<div class="crm-table-wrap"><table class="crm-table">
+  ${offers.length ? `
+  <div id="offers-top-scroll" style="overflow-x:auto;overflow-y:hidden;height:14px;border-bottom:1px solid var(--border)"><div id="offers-top-inner" style="height:1px;min-width:1400px"></div></div>
+  <div id="offers-table-wrap" class="crm-table-wrap" style="overflow-x:auto;overflow-y:auto;max-height:calc(100vh - 300px)">
+    <table class="crm-table" style="min-width:1400px">
     <thead><tr>
-      <th class="crm-th">Offer</th>
-      <th class="crm-th">Ημερομηνία</th>
-      <th class="crm-th">Υπεύθυνος</th>
-      <th class="crm-th">Κατάσταση</th>
-      <th class="crm-th">Ποσό</th>
-      <th class="crm-th"></th>
+      <th class="crm-th" style="${thStyle};text-align:center">Αρχείο</th>
+      ${thSort('code','Offer No.')}
+      ${thSort('date','Ημερομηνία')}
+      ${thSort('clientName','Επωνυμία')}
+      ${thSort('clientVia','Μέσω')}
+      ${thSort('category','Κατηγορία Έργου')}
+      ${thSort('title','Περιγραφή Έργου')}
+      ${thSort('managerId','Project Manager')}
+      ${thSort('amount','Αμοιβή Προσφοράς','text-align:right')}
+      ${thSort('status','Offer Accepted?','text-align:center')}
+      ${thSort('agreedAmount','Συμφ. Αμοιβή','text-align:right')}
+      ${thSort('hasContract','Σύμβαση','text-align:center')}
+      ${thSort('contractSentToAccounting','Σύμβ.→Λογ.','text-align:center')}
+      ${thSort('projectCompleted','Ολοκλ.','text-align:center')}
+      ${thSort('satisfactionSurveySent','Ερωτ/λόγιο','text-align:center')}
+      ${thSort('invoiced','Τιμολ.','text-align:center')}
+      ${thSort('paid','Εξοφλ.','text-align:center')}
+      <th class="crm-th" style="${thStyle}"></th>
     </tr></thead>
     <tbody>${rows}</tbody>
-  </table></div>`
+  </table></div>
+  `
   : `<div class="empty-state"><div class="es-icon">📋</div><h3>Δεν βρέθηκαν offers</h3>${canEdit?`<button class="btn btn-primary" data-action="offer-add">+ Νέο Offer</button>`:''}</div>`}`;
 }
+
+function _initOffersTopScroll() {
+  const top  = document.getElementById('offers-top-scroll');
+  const wrap = document.getElementById('offers-table-wrap');
+  if (!top || !wrap) return;
+  const inner = document.getElementById('offers-top-inner');
+  if (inner) inner.style.minWidth = wrap.scrollWidth + 'px';
+  let syncing = false;
+  top.addEventListener('scroll', () => { if (!syncing) { syncing=true; wrap.scrollLeft=top.scrollLeft; syncing=false; } });
+  wrap.addEventListener('scroll', () => { if (!syncing) { syncing=true; top.scrollLeft=wrap.scrollLeft; syncing=false; } });
+}
+
+window.offerSort = function(col) {
+  if (state.offersSortCol === col) {
+    state.offersSortDir = state.offersSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    state.offersSortCol = col;
+    state.offersSortDir = 'asc';
+  }
+  render();
+};
 
 function showModalOffer(id) {
   const o = id ? (state.db.offers||[]).find(x=>x.id===id) : null;
   const users = sortByName((state.db.users||[]).filter(u=>u.role!=='client'));
   const userOpts = users.map(u=>`<option value="${u.id}" ${(o?.managerId||state.cu?.id)===u.id?'selected':''}>${esc(u.name)}</option>`).join('');
   const statusOpts = Object.entries(OFFER_STATUSES).map(([k,v])=>`<option value="${k}" ${(o?.status||'draft')===k?'selected':''}>${v.label}</option>`).join('');
+  const ynoOpts = (val) => ['','YES','NO'].map(v=>`<option value="${v}" ${(val||'')===(v)?'selected':''}>${v===''?'—':v}</option>`).join('');
+  const contractOpts = (val) => ['','ΝΑΙ','ΌΧΙ','Δ/Α'].map(v=>`<option value="${v}" ${(val||'')===(v)?'selected':''}>${v===''?'—':v}</option>`).join('');
 
   showModal(`
     <div class="modal-header">
       <div class="modal-title">${o?'Επεξεργασία Offer':'Νέο Offer'}</div>
       <button class="modal-close" onclick="closeModal()">✕</button>
     </div>
-    <div class="modal-body">
+    <div class="modal-body" style="max-height:75vh;overflow-y:auto">
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div class="form-group">
-          <label class="form-label">Κωδικός Offer</label>
-          <input class="form-control" id="of-code" placeholder="π.χ. OF26001" value="${esc(o?.code||'')}">
+          <label class="form-label">Offer No.</label>
+          <input class="form-control" id="of-code" placeholder="π.χ. Offer26001" value="${esc(o?.code||'')}">
         </div>
         <div class="form-group">
           <label class="form-label">Ημερομηνία</label>
           <input class="form-control" type="date" id="of-date" value="${o?.date||today()}">
         </div>
       </div>
-      <div class="form-group">
-        <label class="form-label">Τίτλος / Περιγραφή</label>
-        <input class="form-control" id="of-title" placeholder="π.χ. ACCORD - ΝΕΑ ΟΙΚΟΔΟΜΙΚΗ ΑΔΕΙΑ" value="${esc(o?.title||'')}">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label class="form-label">Επωνυμία</label>
+          <input class="form-control" id="of-client" placeholder="Επωνυμία πελάτη" value="${esc(o?.clientName||'')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Μέσω</label>
+          <input class="form-control" id="of-via" placeholder="Για λογαριασμό ή μέσω…" value="${esc(o?.clientVia||'')}">
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label class="form-label">Κατηγορία Έργου</label>
+          <input class="form-control" id="of-category" placeholder="π.χ. Αδειοδότηση" value="${esc(o?.category||'')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Περιγραφή Έργου</label>
+          <input class="form-control" id="of-title" placeholder="Περιγραφή…" value="${esc(o?.title||'')}">
+        </div>
       </div>
       <div class="form-group">
-        <label class="form-label">Πελάτης</label>
-        <input class="form-control" id="of-client" placeholder="Επωνυμία πελάτη" value="${esc(o?.clientName||'')}">
+        <label class="form-label">Project Manager</label>
+        <select class="form-control" id="of-manager">${userOpts}</select>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
         <div class="form-group">
-          <label class="form-label">Υπεύθυνος</label>
-          <select class="form-control" id="of-manager">${userOpts}</select>
+          <label class="form-label">Αμοιβή Προσφοράς (€)</label>
+          <input class="form-control" type="number" id="of-amount" min="0" step="0.01" placeholder="0.00" value="${o?.amount||''}">
         </div>
         <div class="form-group">
-          <label class="form-label">Κατάσταση</label>
+          <label class="form-label">Offer Accepted?</label>
           <select class="form-control" id="of-status">${statusOpts}</select>
         </div>
         <div class="form-group">
-          <label class="form-label">Ποσό (€)</label>
-          <input class="form-control" type="number" id="of-amount" min="0" step="0.01" placeholder="0.00" value="${o?.amount||''}">
+          <label class="form-label">Συμφωνηθείσα Αμοιβή (€)</label>
+          <input class="form-control" type="number" id="of-agreed" min="0" step="0.01" placeholder="0.00" value="${o?.agreedAmount||''}">
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border);margin:8px 0 12px;padding-top:12px">
+        <div style="font-size:.75rem;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">Εκτέλεση & Χρέωση</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="form-group">
+            <label class="form-label">Υπάρχει Σύμβαση;</label>
+            <select class="form-control" id="of-contract">${contractOpts(o?.hasContract)}</select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Στάλθηκε σύμβαση στο λογιστήριο;</label>
+            <select class="form-control" id="of-contract-sent">${ynoOpts(o?.contractSentToAccounting)}</select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Ολοκληρώθηκε το έργο;</label>
+            <select class="form-control" id="of-completed">${ynoOpts(o?.projectCompleted)}</select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Στάλθηκε Ερωτηματολόγιο Ικανοποίησης;</label>
+            <select class="form-control" id="of-survey">${ynoOpts(o?.satisfactionSurveySent)}</select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Τιμολογήθηκε;</label>
+            <select class="form-control" id="of-invoiced">${ynoOpts(o?.invoiced)}</select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Εξοφλήθηκε;</label>
+            <select class="form-control" id="of-paid">${ynoOpts(o?.paid)}</select>
+          </div>
         </div>
       </div>
       <div class="form-group">
         <label class="form-label">Σημειώσεις</label>
-        <textarea class="form-control" id="of-notes" rows="3" placeholder="Προαιρετικές σημειώσεις…">${esc(o?.notes||'')}</textarea>
+        <textarea class="form-control" id="of-notes" rows="2" placeholder="Προαιρετικές σημειώσεις…">${esc(o?.notes||'')}</textarea>
       </div>
     </div>
     <div class="modal-footer">
@@ -8732,19 +9524,34 @@ function showModalOffer(id) {
 }
 
 window.modalSaveOffer = async function(id) {
-  const code    = el('of-code')?.value.trim();
-  const title   = el('of-title')?.value.trim();
-  const client  = el('of-client')?.value.trim();
-  const manager = el('of-manager')?.value;
-  const status  = el('of-status')?.value;
-  const amount  = parseFloat(el('of-amount')?.value)||0;
-  const date    = el('of-date')?.value;
-  const notes   = el('of-notes')?.value.trim();
+  const code         = el('of-code')?.value.trim();
+  const title        = el('of-title')?.value.trim();
+  const client       = el('of-client')?.value.trim();
+  const clientVia    = el('of-via')?.value.trim()||null;
+  const category     = el('of-category')?.value.trim()||null;
+  const manager      = el('of-manager')?.value;
+  const status       = el('of-status')?.value;
+  const amount       = parseFloat(el('of-amount')?.value)||null;
+  const agreedAmount = parseFloat(el('of-agreed')?.value)||null;
+  const date         = el('of-date')?.value;
+  const notes        = el('of-notes')?.value.trim()||null;
+  const hasContract              = el('of-contract')?.value||null;
+  const contractSentToAccounting = el('of-contract-sent')?.value||null;
+  const projectCompleted         = el('of-completed')?.value||null;
+  const satisfactionSurveySent   = el('of-survey')?.value||null;
+  const invoiced                 = el('of-invoiced')?.value||null;
+  const paid                     = el('of-paid')?.value||null;
 
   if (!title && !code) { alert('Συμπληρώστε τουλάχιστον κωδικό ή τίτλο.'); return; }
 
   const existing = id ? (state.db.offers||[]).find(x=>x.id===id) : null;
-  const offer = { ...(existing||{}), id:id||uid(), code, title, clientName:client, managerId:manager, status, amount:amount||null, date, notes };
+  const offer = {
+    ...(existing||{}), id:id||uid(),
+    code, title, clientName:client, clientVia, category,
+    managerId:manager, status, amount, agreedAmount, date, notes,
+    hasContract, contractSentToAccounting, projectCompleted,
+    satisfactionSurveySent, invoiced, paid
+  };
   await dbSaveOffer(offer);
   auditLog(id?'Επεξεργασία Offer':'Νέο Offer', `${code} – ${title}`);
   closeModal();
@@ -9155,6 +9962,24 @@ function showToast(msg,type='') {
   t.textContent=msg; wrap.appendChild(t); setTimeout(()=>t.remove(),3500);
 }
 
+// ── DARK MODE ─────────────────────────────────────────────────────
+function applyTheme(theme) {
+  document.documentElement.classList.toggle('theme-dark', theme==='dark');
+  const btn=el('theme-toggle-btn');
+  if (btn) btn.textContent = theme==='dark' ? '☀️' : '🌙';
+}
+function toggleTheme() {
+  const next = document.documentElement.classList.contains('theme-dark') ? 'light' : 'dark';
+  try { localStorage.setItem('bne_theme', next); } catch(e){}
+  applyTheme(next);
+}
+function initTheme() {
+  let saved=null;
+  try { saved=localStorage.getItem('bne_theme'); } catch(e){}
+  const theme = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  applyTheme(theme);
+}
+
 // ── INIT ──────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey||e.metaKey) && e.key==='k') { e.preventDefault(); if(state.cu&&state.cu.role!=='client') showGlobalSearch(); }
@@ -9162,7 +9987,7 @@ document.addEventListener('keydown', e => {
 
 document.addEventListener('DOMContentLoaded', async () => {
   const main=el('main-content');
-  if (main) main.innerHTML=`<div class="login-wrap"><div class="login-box" style="text-align:center"><div style="font-size:2rem;margin-bottom:16px">⏳</div><div style="font-weight:700;color:var(--navy)">Έλεγχος συνεδρίας…</div><div class="text-sm text-muted" style="margin-top:6px">Παρακαλώ περιμένετε</div></div></div>`;
+  if (main) main.innerHTML=`<div class="login-wrap"><div class="login-box" style="text-align:center"><div style="font-size:2rem;margin-bottom:16px">⏳</div><div style="font-weight:700;color:var(--heading)">Έλεγχος συνεδρίας…</div><div class="text-sm text-muted" style="margin-top:6px">Παρακαλώ περιμένετε</div></div></div>`;
   document.body.style.background='var(--navy)';
   const sidebar=document.querySelector('.sidebar'); if(sidebar) sidebar.style.display='none';
 
@@ -9255,6 +10080,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (sidebar) sidebar.style.display='';
   render();
+  initTheme();
+  setTimeout(checkDeadlineAlerts, 1500);
 
   sb.auth.onAuthStateChange((event)=>{
     if(event==='SIGNED_OUT' && isSupabaseAuthMode()){
