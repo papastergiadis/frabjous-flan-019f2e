@@ -207,6 +207,10 @@ async function fetchTimesheetRowsForBilling(projectId,dateFrom,dateTo){
 }
 
 async function loadFromDB() {
+     if (!isSupabaseAuthMode()) {
+    state.db = emptyDbState();
+    return;
+  }
   try {
     if (isSupabaseAuthMode()) {
       const [u, c, p, a, t, ts, tc, cc, comp, cont, off, notif, deliveries] = await Promise.all([
