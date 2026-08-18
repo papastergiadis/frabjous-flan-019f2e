@@ -23,10 +23,15 @@
   <script src="https://cdn.jsdelivr.net/npm/bcryptjs@2.4.3/dist/bcrypt.min.js"></script>
   <script src="https://accounts.google.com/gsi/client" defer onload="gsiLoaded()"></script>
   <script>
-    const sb = supabase.createClient(
-      'https://ilxvoghrbjeogporyfkp.supabase.co',
-      'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlseHZvZ2hyYmplb2dwb3J5ZmtwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MTYwMzEsImV4cCI6MjEwMDE5MjAzMX0.7_P3FiSEUfQ1vjBKivMPJBB31C0HR2l7MP8oQJjhxps'
-    );
+    const SUPABASE_URL = 'https://ilxvoghrbjeogporyfkp.supabase.co';
+    const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlseHZvZ2hyYmplb2dwb3J5ZmtwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MTYwMzEsImV4cCI6MjEwMDE5MjAzMX0.7_P3FiSEUfQ1vjBKivMPJBB31C0HR2l7MP8oQJjhxps';
+    const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    // Separate anonymous storage client. The existing documents bucket was
+    // configured with anon file policies, while the main client becomes an
+    // authenticated database client after sign-in.
+    const sbFiles = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: {persistSession:false, autoRefreshToken:false, detectSessionInUrl:false}
+    });
     // Registered as early as possible (before app.js's own listener) so we
     // never miss the PASSWORD_RECOVERY event fired when a user lands here
     // via a "forgot password" email link — Supabase parses the recovery
@@ -105,6 +110,22 @@
         <path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z"/><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd"/>
       </svg>
       Πρότυπα
+    </div>
+
+    <div class="nav-link" data-nav="notebook" data-noClient-only>
+      <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+        <path d="M5 2a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V4a2 2 0 00-2-2H5zm2 4h6a1 1 0 110 2H7a1 1 0 010-2zm0 4h6a1 1 0 110 2H7a1 1 0 110-2zm0 4h3a1 1 0 110 2H7a1 1 0 110-2z"/>
+      </svg>
+      Σημειωματάριο
+      <span class="nav-count notebook-nav-count" id="notebook-nav-count" style="display:none">0</span>
+    </div>
+
+    <div class="nav-link" data-nav="safety-visits" data-noClient-only>
+      <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+        <path fill-rule="evenodd" d="M10 2a1 1 0 01.447.106l6 3A1 1 0 0117 6v4c0 3.968-2.518 6.912-6.553 7.894a2 2 0 01-.894 0C5.518 16.912 3 13.968 3 10V6a1 1 0 01.553-.894l6-3A1 1 0 0110 2zm3.707 6.293a1 1 0 00-1.414-1.414L9 10.172 7.707 8.879a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+      </svg>
+      Τεχνικός Ασφάλειας
+      <span class="nav-count notebook-nav-count" id="safety-nav-count" style="display:none">0</span>
     </div>
 
     <div class="nav-section" data-noClient-only>CRM</div>

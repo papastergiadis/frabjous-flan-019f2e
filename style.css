@@ -2154,6 +2154,29 @@ select.form-control { appearance: auto; cursor: pointer; }
 .cal-task.ts-wp   { border-color: #0891b2; background: #ecfeff; color: #0891b2; }
 .cal-more { font-size: .58rem; color: var(--muted); padding: 1px 4px; margin-top: 1px; }
 
+/* Personal calendar entries — private notebook and safety visits */
+.cal-personal-event { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cal-personal-note {
+  border-left-color:#7c3aed !important; background:#f5f3ff !important; color:#6d28d9 !important;
+}
+.cal-personal-safety {
+  border-left-color:#0f766e !important; background:#ecfdf5 !important; color:#0f766e !important;
+}
+.cal-personal-card { border-left-width:4px; }
+.cal-personal-card .cwc-name,
+.cal-personal-card .cal-day-path { color:inherit; }
+.cal-personal-card.is-completed,
+.cal-personal-event.is-completed { opacity:.58; text-decoration:line-through; }
+.cal-personal-card .cwc-proj {
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.cal-personal-day-group { margin-bottom:12px; }
+.cal-personal-legend { padding:8px 2px 0; }
+.cal-legend-note { background:#7c3aed; }
+.cal-legend-safety { background:#0f766e; }
+html.theme-dark .cal-personal-note { background:#251b38 !important; color:#c4b5fd !important; }
+html.theme-dark .cal-personal-safety { background:#102f2b !important; color:#6ee7d8 !important; }
+
 /* ── WEEK VIEW ──────────────────────────────────────────────────── */
 .cal-week-grid {
   display: grid; grid-template-columns: repeat(7, 1fr);
@@ -2436,6 +2459,160 @@ select.form-control { appearance: auto; cursor: pointer; }
   html { font-size: 17px; }
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .cdh-actions .btn, .page-hd-actions .btn { font-size: .74rem; padding: 6px 9px; }
+}
+
+/* ================================================================
+   PERSONAL NOTEBOOK
+   ================================================================ */
+.notebook-nav-count { margin-left:auto; min-width:20px; justify-content:center; }
+.notebook-page-hd { margin-bottom:16px; }
+.notebook-privacy {
+  display:flex; align-items:flex-start; gap:12px; padding:12px 16px; margin-bottom:16px;
+  background:var(--blue-light); border:1px solid var(--blue-border); border-left:3px solid var(--blue);
+  color:var(--heading);
+}
+.notebook-privacy > span { font-size:1rem; line-height:1.2; }
+.notebook-privacy strong { display:block; font-size:.78rem; margin-bottom:2px; }
+.notebook-privacy p { margin:0; color:var(--muted); font-size:.7rem; line-height:1.45; }
+.notebook-alert {
+  display:flex; align-items:center; gap:14px; padding:11px 16px; margin-bottom:16px;
+  background:var(--amber-bg); border:1px solid var(--amber-border); color:var(--amber);
+  font-size:.76rem;
+}
+.notebook-alert span { color:var(--muted); overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.notebook-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-bottom:16px; }
+.notebook-stat {
+  background:var(--white); border:1px solid var(--navy-line); border-top:3px solid var(--slate-400);
+  padding:14px 16px; box-shadow:var(--shadow-xs);
+}
+.notebook-stat span { display:block; color:var(--muted); font-size:.62rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+.notebook-stat strong { display:block; margin-top:4px; color:var(--heading); font-size:1.35rem; font-family:var(--mono); line-height:1.2; }
+.notebook-stat.today { border-top-color:var(--blue); }
+.notebook-stat.overdue { border-top-color:var(--red); }
+.notebook-stat.upcoming { border-top-color:var(--green); }
+.notebook-toolbar {
+  display:flex; align-items:center; gap:10px; justify-content:space-between;
+  background:var(--white); border:1px solid var(--navy-line); border-bottom:0; padding:10px 12px;
+}
+.notebook-search-wrap {
+  display:flex; align-items:center; gap:8px; width:min(520px,100%); border:1px solid var(--navy-line);
+  background:var(--paper); padding:7px 10px;
+}
+.notebook-search-wrap span { color:var(--muted); font-size:1rem; line-height:1; }
+.notebook-search-wrap input { border:0; outline:0; background:transparent; color:var(--heading); width:100%; font-size:.76rem; }
+.notebook-search-wrap input::placeholder { color:var(--steel); }
+.notebook-filter { width:190px; flex:0 0 190px; font-size:.74rem; padding:7px 10px; }
+.notebook-table-wrap { background:var(--white); border:1px solid var(--navy-line); overflow-x:auto; box-shadow:var(--shadow-xs); }
+.notebook-table { width:100%; min-width:980px; border-collapse:collapse; }
+.notebook-table th {
+  background:var(--navy); color:rgba(255,255,255,.62); text-align:left; padding:10px 12px;
+  font-size:.58rem; text-transform:uppercase; letter-spacing:.09em; font-weight:800; white-space:nowrap;
+}
+.notebook-table th:first-child { width:52px; text-align:center; }
+.notebook-table th:nth-child(2) { width:34%; }
+.notebook-table th:last-child { width:96px; text-align:center; }
+.notebook-table td { padding:12px; border-top:1px solid var(--navy-line); vertical-align:middle; font-size:.74rem; }
+.notebook-row { transition:background var(--transition); }
+.notebook-row:hover { background:var(--paper); }
+.notebook-row.is-overdue { background:color-mix(in srgb,var(--red-bg) 58%,var(--white)); }
+.notebook-row.is-completed { opacity:.63; }
+.notebook-row.is-completed .notebook-title { text-decoration:line-through; }
+.notebook-status-cell { text-align:center; }
+.notebook-check {
+  width:24px; height:24px; border:2px solid var(--slate-300); background:var(--white); color:#fff;
+  display:inline-flex; align-items:center; justify-content:center; font-size:.72rem; font-weight:900;
+}
+.notebook-check:hover { border-color:var(--green); }
+.notebook-check.checked { border-color:var(--green); background:var(--green); }
+.notebook-title { color:var(--heading); font-weight:800; font-size:.78rem; line-height:1.35; }
+.notebook-details { color:var(--muted); font-size:.68rem; line-height:1.45; margin-top:4px; white-space:pre-line; max-width:520px; }
+.notebook-date { color:var(--heading); font-size:.7rem; white-space:nowrap; }
+.notebook-date.overdue { color:var(--red); font-weight:800; }
+.notebook-date.reminder-due { color:var(--amber); font-weight:800; }
+.notebook-overdue-label,.notebook-reminder-label { margin-top:3px; font-size:.56rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
+.notebook-overdue-label { color:var(--red); }
+.notebook-reminder-label { color:var(--amber); }
+.notebook-priority { display:inline-flex; align-items:center; padding:3px 8px; border:1px solid var(--navy-line); font-size:.62rem; font-weight:800; white-space:nowrap; }
+.notebook-priority.low { background:var(--paper); color:var(--muted); }
+.notebook-priority.normal { background:var(--blue-light); color:var(--blue); border-color:var(--blue-border); }
+.notebook-priority.high { background:var(--amber-bg); color:var(--amber); border-color:var(--amber-border); }
+.notebook-priority.critical { background:var(--red-bg); color:var(--red); border-color:var(--red-border); }
+.notebook-actions { display:flex; justify-content:center; gap:5px; }
+.notebook-empty { min-height:210px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; color:var(--muted); text-align:center; }
+.notebook-empty > div { width:42px; height:42px; display:grid; place-items:center; background:var(--green-bg); color:var(--green); font-size:1.1rem; margin-bottom:4px; }
+.notebook-empty strong { color:var(--heading); font-size:.8rem; }
+.notebook-empty span { font-size:.68rem; }
+.notebook-form-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+
+@media (max-width: 900px) {
+  .notebook-stats { grid-template-columns:1fr 1fr; }
+}
+@media (max-width: 640px) {
+  .notebook-toolbar { align-items:stretch; flex-direction:column; }
+  .notebook-filter { width:100%; flex-basis:auto; }
+  .notebook-form-grid { grid-template-columns:1fr; gap:0; }
+  .notebook-privacy p { line-height:1.35; }
+}
+
+/* Dashboard — personal notebook widget */
+.dash-notebook-widget {
+  margin:0 0 16px; background:var(--white); border:1px solid var(--navy-line);
+  border-top:3px solid var(--blue); box-shadow:var(--shadow-xs);
+}
+.dash-notebook-head {
+  display:flex; align-items:center; justify-content:space-between; gap:16px;
+  padding:13px 16px; border-bottom:1px solid var(--navy-line);
+}
+.dash-notebook-head h3 { margin:2px 0 0; color:var(--heading); font-size:.9rem; }
+.dash-notebook-kicker { color:var(--blue); font-size:.56rem; font-weight:900; letter-spacing:.1em; }
+.dash-notebook-head-actions { display:flex; align-items:center; gap:7px; flex-shrink:0; }
+.dash-notebook-row {
+  display:grid; grid-template-columns:30px 54px minmax(0,1fr) 36px; align-items:center; gap:9px;
+  min-height:54px; padding:8px 14px; border-top:1px solid var(--slate-100);
+}
+.dash-notebook-row:first-of-type { border-top:0; }
+.dash-notebook-row:hover { background:var(--paper); }
+.dash-notebook-row.is-overdue { background:color-mix(in srgb,var(--red-bg) 55%,var(--white)); }
+.dash-notebook-time { color:var(--blue); font:800 .62rem/1.2 var(--mono); text-align:center; }
+.dash-notebook-row.is-overdue .dash-notebook-time { color:var(--red); }
+.dash-notebook-main { min-width:0; }
+.dash-notebook-main strong { display:block; color:var(--heading); font-size:.74rem; line-height:1.35; }
+.dash-notebook-main span {
+  display:block; margin-top:2px; color:var(--muted); font-size:.64rem;
+  overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
+}
+.dash-notebook-empty { display:flex; align-items:center; justify-content:center; gap:12px; min-height:84px; padding:14px 18px; }
+.dash-notebook-empty > span { width:32px; height:32px; display:grid; place-items:center; color:var(--green); background:var(--green-bg); font-weight:900; }
+.dash-notebook-empty strong { display:block; color:var(--heading); font-size:.73rem; }
+.dash-notebook-empty p { margin:3px 0 0; color:var(--muted); font-size:.64rem; }
+.dash-notebook-more { padding:8px 16px; border-top:1px solid var(--slate-100); color:var(--muted); font-size:.64rem; text-align:right; }
+
+/* Shared Safety Technician schedule */
+.safety-table { min-width:1380px; }
+.safety-table th:first-child { width:52px; }
+.safety-table th:nth-child(2) { width:250px; }
+.safety-table th:nth-child(3) { width:155px; }
+.safety-table th:nth-child(4) { width:95px; }
+.safety-table th:nth-child(5) { width:300px; }
+.safety-table th:nth-child(6) { width:175px; }
+.safety-table th:nth-child(7) { width:130px; }
+.safety-table th:last-child { width:96px; }
+.safety-company { color:var(--heading); font-size:.78rem; font-weight:850; line-height:1.35; }
+.safety-location { margin-top:4px; color:var(--muted); font-size:.65rem; line-height:1.4; }
+.safety-duration { display:inline-flex; padding:4px 8px; background:var(--paper); border:1px solid var(--navy-line); color:var(--heading); font-size:.65rem; font-weight:750; white-space:nowrap; }
+.safety-notes { max-width:320px; color:var(--muted); font-size:.68rem; line-height:1.48; white-space:pre-line; }
+.safety-file-btn { max-width:122px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.safety-no-file { color:var(--steel); font-size:.62rem; }
+.safety-row.is-completed .safety-company { text-decoration:line-through; }
+.safety-remove-file { display:flex; align-items:center; gap:7px; margin-top:8px; color:var(--red); font-size:.68rem; font-weight:700; cursor:pointer; }
+.safety-remove-file input { accent-color:var(--red); }
+.safety-file-field input[type=file] { padding:7px; }
+
+@media (max-width: 640px) {
+  .dash-notebook-head { align-items:flex-start; flex-direction:column; }
+  .dash-notebook-head-actions { width:100%; }
+  .dash-notebook-head-actions .btn { flex:1; }
+  .dash-notebook-row { grid-template-columns:28px 48px minmax(0,1fr) 34px; padding:8px 9px; gap:6px; }
 }
 
 /* ================================================================
