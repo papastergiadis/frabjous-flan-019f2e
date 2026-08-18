@@ -344,14 +344,6 @@ async function dbSaveUser(user) {
   const {error} = await sb.from('be_users').upsert({id:user.id, data:user});
   if (error) { showToast('Σφάλμα αποθήκευσης χρήστη.','error'); throw error; }
 }
-
-async function provisionAuthUser(payload) {
-  if (!isSupabaseAuthMode()) throw new Error('Η ασφαλής δημιουργία χρήστη απαιτεί Supabase Auth session.');
-  const {data,error}=await sb.functions.invoke('admin-user-provision',{body:payload});
-  if(error) throw error;
-  if(!data?.user) throw new Error(data?.error||'Η δημιουργία χρήστη δεν επέστρεψε profile.');
-  return data;
-}
 async function dbSaveCategory(cat) {
   const {error} = await sb.from('be_categories').upsert({id:cat.id, data:cat});
   if (error) { showToast('Σφάλμα αποθήκευσης κατηγορίας.','error'); throw error; }
@@ -762,10 +754,7 @@ function clearCurrentUser() {
   sessionStorage.removeItem('be_pm_user');
 }
 
-// Admin/Management share several operational capabilities, but user
-// administration and the global audit trail are reserved for Admin only.
-function isAdmin()      { return ['admin','management'].includes(state.cu?.role); }
-function isAdminOnly()  { return state.cu?.role === 'admin'; }
+function isAdmin()  { return ['admin','management'].includes(state.cu?.role); }
 function isPM()     { return state.cu?.role === 'project_manager'; }
 function isClient() { return state.cu?.role === 'client'; }
 function canEdit()  { return ['admin','management','project_manager','team_member'].includes(state.cu?.role); }
@@ -816,6 +805,16 @@ const state = {
   tsSortKey: 'date',
   tsSortDir: 'desc',
   bulkSelected: new Set(),
+  notebook: [],
+  notebookLoaded: false,
+  notebookLoading: false,
+  notebookFilter: 'open',
+  notebookSearch: '',
+  safetyVisits: [],
+  safetyLoaded: false,
+  safetyLoading: false,
+  safetyFilter: 'scheduled',
+  safetySearch: '',
 };
 
 // ── PRESENCE ──────────────────────────────────────────────────────
@@ -1564,14 +1563,629 @@ function findDoc(did, tid) {
   return null;
 }
 
+// ── PERSONAL NOTEBOOK ────────────────────────────────────────────
+// Notes live in the signed-in Supabase user's private Auth metadata. The
+// client can read and update only its own Auth user, so notebook content never
+// enters the shared project/user directories or the common audit log.
+const NOTEBOOK_METADATA_KEY='bne_notebook_v1';
+const SAFETY_METADATA_KEY='bne_safety_visits_v1';
+let _notebookReminderTimer=null;
+const _notebookReminderSeen=new Set();
+const _safetyReminderSeen=new Set();
+
+function normalizeNotebookItem(item) {
+  if(!item || typeof item!=='object') return null;
+  return {
+    id:String(item.id||('note_'+uid())),
+    title:String(item.title||'').slice(0,180),
+    details:String(item.details||'').slice(0,3000),
+    dueAt:item.dueAt||null,
+    reminderAt:item.reminderAt||null,
+    priority:['low','normal','high','critical'].includes(item.priority)?item.priority:'normal',
+    completed:!!item.completed,
+    createdAt:item.createdAt||nowTS(),
+    updatedAt:item.updatedAt||item.createdAt||nowTS(),
+  };
+}
+
+function normalizeSafetyVisit(item) {
+  if(!item || typeof item!=='object') return null;
+  return {
+    id:String(item.id||('safety_'+uid())),
+    company:String(item.company||'').slice(0,180),
+    visitAt:item.visitAt||null,
+    durationMinutes:Math.max(0,Math.min(1440,Number(item.durationMinutes||60))),
+    location:String(item.location||'').slice(0,300),
+    notes:String(item.notes||'').slice(0,2000),
+    reminderAt:item.reminderAt||null,
+    completed:!!item.completed,
+    announcementPath:item.announcementPath||null,
+    announcementName:item.announcementName?String(item.announcementName).slice(0,220):null,
+    announcementType:item.announcementType||null,
+    announcementSize:Number(item.announcementSize||0),
+    createdAt:item.createdAt||nowTS(),
+    updatedAt:item.updatedAt||item.createdAt||nowTS(),
+  };
+}
+
+async function loadNotebook() {
+  if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') {
+    state.notebook=[];
+    state.notebookLoaded=true;
+    state.notebookLoading=false;
+    return;
+  }
+  state.notebookLoading=true;
+  if(state.view==='notebook'||state.view==='calendar') render();
+  try {
+    const {data,error}=await sb.auth.getUser();
+    if(error) throw error;
+    const raw=data?.user?.user_metadata?.[NOTEBOOK_METADATA_KEY];
+    state.notebook=(Array.isArray(raw)?raw:[]).map(normalizeNotebookItem).filter(Boolean);
+    state.notebookLoaded=true;
+    startNotebookReminders();
+  } catch(error) {
+    console.error('notebook load:',error);
+    showToast('Δεν ήταν δυνατή η φόρτωση του προσωπικού σημειωματαρίου.','error');
+  } finally {
+    state.notebookLoading=false;
+    updateNotebookNavCount();
+    if(state.view==='notebook'||state.view==='calendar') render();
+  }
+}
+
+async function persistNotebook() {
+  if(!isSupabaseAuthMode() || !state.cu) throw new Error('Απαιτείται ασφαλής σύνδεση.');
+  const {data,error}=await sb.auth.getUser();
+  if(error) throw error;
+  const user=data?.user;
+  if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
+  const clean=(state.notebook||[]).slice(0,150).map(normalizeNotebookItem).filter(Boolean);
+  const metadata={...(user.user_metadata||{}),[NOTEBOOK_METADATA_KEY]:clean};
+  const {error:updateError}=await sb.auth.updateUser({data:metadata});
+  if(updateError) throw updateError;
+  state.notebook=clean;
+}
+
+function safetyVisitDbRow(item) {
+  const visit=normalizeSafetyVisit(item);
+  return visit||null;
+}
+
+function safetyStorage() {
+  return (typeof sbFiles!=='undefined'?sbFiles:sb).storage.from(BUCKET);
+}
+
+// When a Supabase Storage policy blocks uploads, keep the announcement in
+// IndexedDB on this browser. The key includes the signed-in user, while the
+// visit metadata remains in that user's private Supabase Auth metadata.
+const SAFETY_LOCAL_DB='bne-safety-files-v1';
+const SAFETY_LOCAL_STORE='files';
+
+function isLocalSafetyFile(fileId) {
+  return String(fileId||'').startsWith('local:');
+}
+
+function safetyOpenLocalDb() {
+  return new Promise((resolve,reject)=>{
+    if(!window.indexedDB) { reject(new Error('Ο browser δεν υποστηρίζει τοπική αποθήκευση αρχείων.')); return; }
+    const request=window.indexedDB.open(SAFETY_LOCAL_DB,1);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(SAFETY_LOCAL_STORE)) db.createObjectStore(SAFETY_LOCAL_STORE,{keyPath:'key'});
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Δεν άνοιξε η τοπική αποθήκευση αρχείων.'));
+  });
+}
+
+function safetyLocalTxDone(transaction) {
+  return new Promise((resolve,reject)=>{
+    transaction.oncomplete=()=>resolve();
+    transaction.onerror=()=>reject(transaction.error||new Error('Αποτυχία τοπικής αποθήκευσης αρχείου.'));
+    transaction.onabort=()=>reject(transaction.error||new Error('Η τοπική αποθήκευση ακυρώθηκε.'));
+  });
+}
+
+function safetyLocalRequest(request) {
+  return new Promise((resolve,reject)=>{
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Αποτυχία ανάγνωσης τοπικού αρχείου.'));
+  });
+}
+
+async function safetyLocalFileSave(key,file) {
+  const db=await safetyOpenLocalDb();
+  try {
+    const transaction=db.transaction(SAFETY_LOCAL_STORE,'readwrite');
+    transaction.objectStore(SAFETY_LOCAL_STORE).put({
+      key,blob:file,name:file.name,type:file.type||_documentMime(file.name),size:file.size,updatedAt:nowTS(),
+    });
+    await safetyLocalTxDone(transaction);
+  } finally { db.close(); }
+}
+
+async function safetyLocalFileGet(key) {
+  const db=await safetyOpenLocalDb();
+  try {
+    const transaction=db.transaction(SAFETY_LOCAL_STORE,'readonly');
+    const record=await safetyLocalRequest(transaction.objectStore(SAFETY_LOCAL_STORE).get(key));
+    if(!record?.blob) throw new Error('Το αρχείο δεν βρέθηκε σε αυτόν τον browser.');
+    return record.blob;
+  } finally { db.close(); }
+}
+
+async function safetyLocalFileDelete(key) {
+  const db=await safetyOpenLocalDb();
+  try {
+    const transaction=db.transaction(SAFETY_LOCAL_STORE,'readwrite');
+    transaction.objectStore(SAFETY_LOCAL_STORE).delete(key);
+    await safetyLocalTxDone(transaction);
+  } finally { db.close(); }
+}
+
+async function safetyFileSave(fileId,file) {
+  const contentType=file.type||_documentMime(file.name);
+  const {error}=await safetyStorage().upload(fileId,file,{upsert:true,contentType});
+  if(error) throw error;
+}
+
+async function safetyFileGet(fileId) {
+  if(isLocalSafetyFile(fileId)) return safetyLocalFileGet(String(fileId).slice(6));
+  const {data,error}=await safetyStorage().download(fileId);
+  if(error) throw error;
+  return data;
+}
+
+async function safetyFileDelete(fileId) {
+  if(isLocalSafetyFile(fileId)) {
+    await safetyLocalFileDelete(String(fileId).slice(6)).catch(()=>{});
+    return;
+  }
+  await safetyStorage().remove([fileId]).catch(()=>{});
+}
+
+async function persistSafetyVisit(item) {
+  if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') throw new Error('Απαιτείται ασφαλής εσωτερικός λογαριασμός.');
+  const {data,error}=await sb.auth.getUser();
+  if(error) throw error;
+  const user=data?.user;
+  if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
+  const clean=(state.safetyVisits||[]).slice(0,300).map(safetyVisitDbRow).filter(Boolean);
+  const metadata={...(user.user_metadata||{}),[SAFETY_METADATA_KEY]:clean};
+  const {error:updateError}=await sb.auth.updateUser({data:metadata});
+  if(updateError) throw updateError;
+  state.safetyVisits=clean;
+  return safetyVisitDbRow(item);
+}
+
+async function removeSafetyVisit(visitId) {
+  await persistSafetyVisit(null);
+}
+
+async function loadSafetyVisits() {
+  if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') {
+    state.safetyVisits=[]; state.safetyLoaded=true; state.safetyLoading=false; return;
+  }
+  state.safetyLoading=true;
+  if(state.view==='safety-visits'||state.view==='calendar') render();
+  try {
+    const {data,error}=await sb.auth.getUser();
+    if(error) throw error;
+    const raw=data?.user?.user_metadata?.[SAFETY_METADATA_KEY];
+    state.safetyVisits=(Array.isArray(raw)?raw:[]).map(normalizeSafetyVisit).filter(Boolean);
+  } catch(error) {
+    console.warn('safety visits load:',error);
+    state.safetyVisits=[];
+    showToast('Δεν ήταν δυνατή η φόρτωση των προσωπικών επισκέψεων.','error');
+  } finally {
+    state.safetyLoaded=true; state.safetyLoading=false;
+    startNotebookReminders();
+    updateSafetyNavCount();
+    checkNotebookReminders();
+    if(state.view==='safety-visits'||state.view==='calendar') render();
+  }
+}
+
+function cleanupNotebookReminders() {
+  if(_notebookReminderTimer){clearInterval(_notebookReminderTimer);_notebookReminderTimer=null;}
+  _notebookReminderSeen.clear();
+  _safetyReminderSeen.clear();
+}
+
+function startNotebookReminders() {
+  if(_notebookReminderTimer) clearInterval(_notebookReminderTimer);
+  checkNotebookReminders();
+  _notebookReminderTimer=setInterval(checkNotebookReminders,30000);
+}
+
+function notebookOpenAlerts() {
+  const now=Date.now();
+  return (state.notebook||[]).filter(n=>!n.completed && (
+    (n.reminderAt && new Date(n.reminderAt).getTime()<=now) ||
+    (n.dueAt && new Date(n.dueAt).getTime()<now)
+  ));
+}
+
+function updateNotebookNavCount() {
+  const badge=el('notebook-nav-count'); if(!badge) return;
+  const count=notebookOpenAlerts().length;
+  badge.textContent=String(count);
+  badge.style.display=count?'inline-flex':'none';
+}
+
+function safetyOpenAlerts() {
+  const now=Date.now();
+  return (state.safetyVisits||[]).filter(v=>!v.completed&&(
+    (v.reminderAt&&new Date(v.reminderAt).getTime()<=now)||
+    (v.visitAt&&new Date(v.visitAt).getTime()<now)
+  ));
+}
+
+function updateSafetyNavCount() {
+  const badge=el('safety-nav-count'); if(!badge) return;
+  const count=safetyOpenAlerts().length;
+  badge.textContent=String(count);
+  badge.style.display=count?'inline-flex':'none';
+}
+
+function checkNotebookReminders() {
+  if(!state.cu) return;
+  const now=Date.now();
+  const due=state.notebookLoaded?(state.notebook||[]).filter(n=>!n.completed && n.reminderAt && new Date(n.reminderAt).getTime()<=now):[];
+  let fired=false;
+  due.forEach((note,index)=>{
+    const key=note.id+'|'+note.reminderAt;
+    if(_notebookReminderSeen.has(key)) return;
+    _notebookReminderSeen.add(key);
+    fired=true;
+    setTimeout(()=>showToast(`⏰ Υπενθύμιση: ${note.title}`,'info'),index*500);
+  });
+  const safetyDue=state.safetyLoaded?(state.safetyVisits||[]).filter(v=>!v.completed&&v.reminderAt&&new Date(v.reminderAt).getTime()<=now):[];
+  safetyDue.forEach((visit,index)=>{
+    const key=visit.id+'|'+visit.reminderAt;
+    if(_safetyReminderSeen.has(key)) return;
+    _safetyReminderSeen.add(key);
+    fired=true;
+    setTimeout(()=>showToast(`🛡️ Υπενθύμιση επίσκεψης: ${visit.company}`,'info'),(due.length+index)*500);
+  });
+  updateNotebookNavCount();
+  updateSafetyNavCount();
+  if(fired && (state.view==='notebook'||state.view==='safety-visits'||state.view==='dashboard')) render();
+}
+
+function notebookToInput(value) {
+  if(!value) return '';
+  const d=new Date(value); if(Number.isNaN(d.getTime())) return '';
+  const pad=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function notebookFromInput(value) {
+  if(!value) return null;
+  const d=new Date(value);
+  return Number.isNaN(d.getTime())?null:d.toISOString();
+}
+
+function notebookFormatDate(value) {
+  if(!value) return '—';
+  const d=new Date(value); if(Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString('el-GR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+
+function notebookPriorityInfo(priority) {
+  return {
+    low:{label:'Χαμηλή',cls:'low'},
+    normal:{label:'Κανονική',cls:'normal'},
+    high:{label:'Υψηλή',cls:'high'},
+    critical:{label:'Επείγουσα',cls:'critical'},
+  }[priority]||{label:'Κανονική',cls:'normal'};
+}
+
+function showNotebookModal(noteId=null) {
+  const note=(state.notebook||[]).find(n=>n.id===noteId)||null;
+  showModal(`<div class="modal-header"><div class="modal-title">${note?'Επεξεργασία εκκρεμότητας':'Νέα εκκρεμότητα'}</div><button class="modal-close" onclick="closeModal()" aria-label="Κλείσιμο">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label" for="nb-title">Τι πρέπει να κάνω <sup>*</sup></label><input class="form-control" id="nb-title" maxlength="180" value="${esc(note?.title||'')}" placeholder="π.χ. Τηλεφώνημα στον προμηθευτή"></div>
+      <div class="form-group"><label class="form-label" for="nb-details">Λεπτομέρειες</label><textarea class="form-control" id="nb-details" rows="4" maxlength="3000" placeholder="Πρόσθετες πληροφορίες ή στοιχεία επικοινωνίας…">${esc(note?.details||'')}</textarea></div>
+      <div class="notebook-form-grid">
+        <div class="form-group"><label class="form-label" for="nb-due">Ημερομηνία & ώρα</label><input class="form-control" type="datetime-local" id="nb-due" value="${notebookToInput(note?.dueAt)}"></div>
+        <div class="form-group"><label class="form-label" for="nb-reminder">Υπενθύμιση στο site</label><input class="form-control" type="datetime-local" id="nb-reminder" value="${notebookToInput(note?.reminderAt)}"><div class="form-hint">Εμφανίζεται όσο είστε συνδεδεμένος στο site.</div></div>
+      </div>
+      <div class="form-group"><label class="form-label" for="nb-priority">Προτεραιότητα</label><select class="form-control" id="nb-priority"><option value="low"${note?.priority==='low'?' selected':''}>Χαμηλή</option><option value="normal"${!note||note.priority==='normal'?' selected':''}>Κανονική</option><option value="high"${note?.priority==='high'?' selected':''}>Υψηλή</option><option value="critical"${note?.priority==='critical'?' selected':''}>Επείγουσα</option></select></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="saveNotebookModal('${note?.id||''}')">Αποθήκευση</button></div>`);
+  setTimeout(()=>el('nb-title')?.focus(),0);
+}
+
+window.saveNotebookModal=async function(noteId='') {
+  const title=(el('nb-title')?.value||'').trim();
+  if(!title){showToast('Γράψτε τι πρέπει να κάνετε.','error');el('nb-title')?.focus();return;}
+  const previous=JSON.stringify(state.notebook||[]);
+  const now=nowTS();
+  const item={
+    id:noteId||('note_'+uid()),
+    title,
+    details:(el('nb-details')?.value||'').trim(),
+    dueAt:notebookFromInput(el('nb-due')?.value),
+    reminderAt:notebookFromInput(el('nb-reminder')?.value),
+    priority:el('nb-priority')?.value||'normal',
+    completed:false,
+    createdAt:now,
+    updatedAt:now,
+  };
+  const existing=(state.notebook||[]).find(n=>n.id===noteId);
+  if(existing) Object.assign(item,{completed:existing.completed,createdAt:existing.createdAt});
+  const index=(state.notebook||[]).findIndex(n=>n.id===item.id);
+  if(index>=0) state.notebook[index]=item; else state.notebook.unshift(item);
+  try {
+    await persistNotebook();
+    closeModal();
+    render();
+    checkNotebookReminders();
+    showToast(existing?'Η εκκρεμότητα ενημερώθηκε.':'Η εκκρεμότητα προστέθηκε.','success');
+  } catch(error) {
+    state.notebook=JSON.parse(previous);
+    console.error('notebook save:',error);
+    showToast('Δεν ήταν δυνατή η αποθήκευση. Δοκιμάστε ξανά.','error');
+  }
+};
+
+async function toggleNotebookItem(noteId) {
+  const note=(state.notebook||[]).find(n=>n.id===noteId); if(!note) return;
+  const previous=note.completed;
+  note.completed=!note.completed; note.updatedAt=nowTS();
+  try {
+    await persistNotebook();
+    render();
+    updateNotebookNavCount();
+    showToast(note.completed?'Η εκκρεμότητα ολοκληρώθηκε.':'Η εκκρεμότητα άνοιξε ξανά.','success');
+  } catch(error) {
+    note.completed=previous;
+    showToast('Η αλλαγή δεν αποθηκεύτηκε.','error');
+  }
+}
+
+async function deleteNotebookItem(noteId) {
+  const note=(state.notebook||[]).find(n=>n.id===noteId); if(!note) return;
+  if(!confirm(`Διαγραφή της εκκρεμότητας «${note.title}»;`)) return;
+  const previous=[...(state.notebook||[])];
+  state.notebook=state.notebook.filter(n=>n.id!==noteId);
+  try {
+    await persistNotebook();
+    render();
+    updateNotebookNavCount();
+    showToast('Η εκκρεμότητα διαγράφηκε.','success');
+  } catch(error) {
+    state.notebook=previous;
+    showToast('Η διαγραφή δεν αποθηκεύτηκε.','error');
+  }
+}
+
+window.setNotebookFilter=function(value){state.notebookFilter=value||'open';render();};
+window.filterNotebookTable=function(value){
+  state.notebookSearch=String(value||'');
+  const q=state.notebookSearch.trim().toLocaleLowerCase('el');
+  document.querySelectorAll('[data-notebook-search]').forEach(row=>{
+    row.style.display=!q||String(row.dataset.notebookSearch||'').includes(q)?'':'none';
+  });
+};
+
+function renderNotebook() {
+  if(!state.cu || state.cu.role==='client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if(!isSupabaseAuthMode()) return '<div class="empty-state"><div class="es-icon">🔒</div><h3>Απαιτείται ασφαλής σύνδεση</h3><p>Συνδεθείτε ξανά με τον λογαριασμό σας για να ανοίξετε το προσωπικό σημειωματάριο.</p></div>';
+  if(state.notebookLoading || !state.notebookLoaded) return '<div class="empty-state"><div class="es-icon">⏳</div><h3>Φόρτωση σημειωματαρίου…</h3></div>';
+
+  const now=new Date(); const nowMs=now.getTime();
+  const todayKey=now.toLocaleDateString('en-CA');
+  const all=[...(state.notebook||[])].sort((a,b)=>{
+    if(a.completed!==b.completed) return a.completed?1:-1;
+    const ad=a.dueAt?new Date(a.dueAt).getTime():Number.MAX_SAFE_INTEGER;
+    const bd=b.dueAt?new Date(b.dueAt).getTime():Number.MAX_SAFE_INTEGER;
+    return ad-bd||String(b.updatedAt).localeCompare(String(a.updatedAt));
+  });
+  const open=all.filter(n=>!n.completed);
+  const overdue=open.filter(n=>n.dueAt&&new Date(n.dueAt).getTime()<nowMs);
+  const todayItems=open.filter(n=>n.dueAt&&new Date(n.dueAt).toLocaleDateString('en-CA')===todayKey);
+  const upcoming=open.filter(n=>n.dueAt&&new Date(n.dueAt).getTime()>=nowMs&&!todayItems.includes(n));
+  const reminderAlerts=open.filter(n=>n.reminderAt&&new Date(n.reminderAt).getTime()<=nowMs);
+  const filter=state.notebookFilter||'open';
+  let visible=all;
+  if(filter==='open') visible=open;
+  else if(filter==='today') visible=todayItems;
+  else if(filter==='overdue') visible=overdue;
+  else if(filter==='done') visible=all.filter(n=>n.completed);
+
+  const rows=visible.map(note=>{
+    const priority=notebookPriorityInfo(note.priority);
+    const isOverdue=!note.completed&&note.dueAt&&new Date(note.dueAt).getTime()<nowMs;
+    const reminderDue=!note.completed&&note.reminderAt&&new Date(note.reminderAt).getTime()<=nowMs;
+    const search=esc(`${note.title} ${note.details}`.toLocaleLowerCase('el'));
+    return `<tr class="notebook-row${note.completed?' is-completed':''}${isOverdue?' is-overdue':''}" data-notebook-search="${search}">
+      <td class="notebook-status-cell"><button class="notebook-check${note.completed?' checked':''}" data-action="toggle-notebook" data-nid="${esc(note.id)}" title="${note.completed?'Άνοιγμα ξανά':'Ολοκλήρωση'}" aria-label="${note.completed?'Άνοιγμα ξανά':'Σήμανση ως ολοκληρωμένη'}">${note.completed?'✓':''}</button></td>
+      <td><div class="notebook-title">${esc(note.title)}</div>${note.details?`<div class="notebook-details">${esc(note.details)}</div>`:''}</td>
+      <td><div class="notebook-date${isOverdue?' overdue':''}">${notebookFormatDate(note.dueAt)}</div>${isOverdue?'<div class="notebook-overdue-label">Εκπρόθεσμη</div>':''}</td>
+      <td><div class="notebook-date${reminderDue?' reminder-due':''}">${note.reminderAt?'🔔 '+notebookFormatDate(note.reminderAt):'—'}</div>${reminderDue?'<div class="notebook-reminder-label">Υπενθύμιση ενεργή</div>':''}</td>
+      <td><span class="notebook-priority ${priority.cls}">${priority.label}</span></td>
+      <td><div class="notebook-actions"><button class="btn btn-ghost btn-sm" data-action="modal-edit-notebook" data-nid="${esc(note.id)}" title="Επεξεργασία">✏</button><button class="btn btn-danger btn-sm" data-action="delete-notebook" data-nid="${esc(note.id)}" title="Διαγραφή">✕</button></div></td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="page-hd notebook-page-hd"><div><h1>Σημειωματάριο</h1><div class="page-hd-sub">Προσωπικές εκκρεμότητες · ορατές μόνο σε εσάς</div></div><div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-notebook">+ Νέα εκκρεμότητα</button></div></div>
+    <div class="notebook-privacy"><span>🔒</span><div><strong>Προσωπικός χώρος</strong><p>Οι σημειώσεις αποθηκεύονται στον δικό σας λογαριασμό και δεν εμφανίζονται σε συναδέλφους ή διαχειριστές του πίνακα έργων.</p></div></div>
+    ${reminderAlerts.length?`<div class="notebook-alert"><strong>⏰ ${reminderAlerts.length===1?'Έχετε μία ενεργή υπενθύμιση':`Έχετε ${reminderAlerts.length} ενεργές υπενθυμίσεις`}</strong><span>${esc(reminderAlerts.slice(0,2).map(n=>n.title).join(' · '))}${reminderAlerts.length>2?' …':''}</span></div>`:''}
+    <div class="notebook-stats"><div class="notebook-stat"><span>Ανοιχτές</span><strong>${open.length}</strong></div><div class="notebook-stat today"><span>Σήμερα</span><strong>${todayItems.length}</strong></div><div class="notebook-stat overdue"><span>Εκπρόθεσμες</span><strong>${overdue.length}</strong></div><div class="notebook-stat upcoming"><span>Προσεχώς</span><strong>${upcoming.length}</strong></div></div>
+    <div class="notebook-toolbar"><div class="notebook-search-wrap"><span>⌕</span><input id="notebook-search" value="${esc(state.notebookSearch||'')}" oninput="filterNotebookTable(this.value)" placeholder="Αναζήτηση στις εκκρεμότητες…" aria-label="Αναζήτηση"></div><select class="form-control notebook-filter" onchange="setNotebookFilter(this.value)" aria-label="Φίλτρο εκκρεμοτήτων"><option value="open"${filter==='open'?' selected':''}>Ανοιχτές</option><option value="today"${filter==='today'?' selected':''}>Σήμερα</option><option value="overdue"${filter==='overdue'?' selected':''}>Εκπρόθεσμες</option><option value="done"${filter==='done'?' selected':''}>Ολοκληρωμένες</option><option value="all"${filter==='all'?' selected':''}>Όλες</option></select></div>
+    <div class="notebook-table-wrap"><table class="notebook-table"><thead><tr><th aria-label="Κατάσταση"></th><th>Εκκρεμότητα</th><th>Πότε</th><th>Υπενθύμιση</th><th>Προτεραιότητα</th><th>Ενέργειες</th></tr></thead><tbody>${rows||`<tr><td colspan="6"><div class="notebook-empty"><div>✓</div><strong>Δεν υπάρχουν εγγραφές σε αυτή την προβολή</strong><span>Πατήστε «Νέα εκκρεμότητα» για να προσθέσετε την πρώτη σας σημείωση.</span></div></td></tr>`}</tbody></table></div>`;
+}
+
+// ── SAFETY TECHNICIAN VISITS ─────────────────────────────────────
+function safetyDurationLabel(minutes) {
+  const total=Math.max(0,Number(minutes||0));
+  const hours=Math.floor(total/60); const mins=total%60;
+  return [hours?`${hours} ώρ.`:'',mins?`${mins} λεπ.`:''].filter(Boolean).join(' ')||'—';
+}
+
+function safetyCompanyOptions() {
+  return (state.db.crmCompanies||[]).map(c=>c.company_name||c.name).filter(Boolean).sort((a,b)=>a.localeCompare(b,'el'));
+}
+
+function showSafetyVisitModal(visitId=null) {
+  const visit=(state.safetyVisits||[]).find(v=>v.id===visitId)||null;
+  const companies=safetyCompanyOptions();
+  showModal(`<div class="modal-header"><div class="modal-title">${visit?'Επεξεργασία επίσκεψης':'Νέα επίσκεψη Τεχνικού Ασφάλειας'}</div><button class="modal-close" onclick="closeModal()" aria-label="Κλείσιμο">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label" for="sv-company">Εταιρεία <sup>*</sup></label><input class="form-control" id="sv-company" list="sv-company-list" maxlength="180" value="${esc(visit?.company||'')}" placeholder="Επωνυμία εταιρείας"><datalist id="sv-company-list">${companies.map(name=>`<option value="${esc(name)}">`).join('')}</datalist></div>
+      <div class="notebook-form-grid"><div class="form-group"><label class="form-label" for="sv-visit">Ημερομηνία & ώρα επίσκεψης <sup>*</sup></label><input class="form-control" type="datetime-local" id="sv-visit" value="${notebookToInput(visit?.visitAt)}"></div><div class="form-group"><label class="form-label" for="sv-duration">Διάρκεια σε λεπτά</label><input class="form-control" type="number" id="sv-duration" min="0" max="1440" step="15" value="${visit?.durationMinutes||60}"></div></div>
+      <div class="form-group"><label class="form-label" for="sv-location">Τοποθεσία</label><input class="form-control" id="sv-location" maxlength="300" value="${esc(visit?.location||'')}" placeholder="Διεύθυνση ή χώρος επίσκεψης"></div>
+      <div class="form-group"><label class="form-label" for="sv-notes">Σημειώσεις</label><textarea class="form-control" id="sv-notes" rows="4" maxlength="2000" placeholder="Παρατηρήσεις, στοιχεία επικοινωνίας ή ενέργειες…">${esc(visit?.notes||'')}</textarea></div>
+      <div class="form-group"><label class="form-label" for="sv-reminder">Υπενθύμιση στο site</label><input class="form-control" type="datetime-local" id="sv-reminder" value="${notebookToInput(visit?.reminderAt)}"><div class="form-hint">Η υπενθύμιση εμφανίζεται μόνο στον δικό σας λογαριασμό.</div></div>
+      <div class="form-group safety-file-field"><label class="form-label" for="sv-file">Αναγγελία Τεχνικού Ασφάλειας</label><input class="form-control" type="file" id="sv-file" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png"><div class="form-hint">PDF, Word ή εικόνα · έως 15 MB. Αν το cloud απορρίψει το αρχείο, φυλάσσεται αυτόματα σε αυτόν τον browser.${visit?.announcementName?` · Τρέχον: ${esc(visit.announcementName)}`:''}</div>${visit?.announcementPath?'<label class="safety-remove-file"><input type="checkbox" id="sv-remove-file"> Αφαίρεση υπάρχοντος αρχείου</label>':''}</div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" id="sv-save-btn" onclick="saveSafetyVisitModal('${visit?.id||''}')">Αποθήκευση</button></div>`);
+  setTimeout(()=>el('sv-company')?.focus(),0);
+}
+
+window.saveSafetyVisitModal=async function(visitId='') {
+  const company=(el('sv-company')?.value||'').trim();
+  const visitAt=notebookFromInput(el('sv-visit')?.value);
+  if(!company){showToast('Συμπληρώστε την εταιρεία.','error');el('sv-company')?.focus();return;}
+  if(!visitAt){showToast('Συμπληρώστε ημερομηνία και ώρα επίσκεψης.','error');el('sv-visit')?.focus();return;}
+  const file=el('sv-file')?.files?.[0]||null;
+  if(file&&file.size>15*1024*1024){showToast('Το αρχείο δεν πρέπει να ξεπερνά τα 15 MB.','error');return;}
+  const allowed=/\.(pdf|doc|docx|jpe?g|png)$/i;
+  if(file&&!allowed.test(file.name||'')){showToast('Επιτρέπονται αρχεία PDF, Word και εικόνες.','error');return;}
+
+  const previous=JSON.stringify(state.safetyVisits||[]);
+  const existing=(state.safetyVisits||[]).find(v=>v.id===visitId)||null;
+  const id=visitId||('safety_'+uid()); const now=nowTS();
+  let uploadedPath=null;
+  let fileUploadError=null;
+  let fileStoredLocally=false;
+  const item={
+    id,company,visitAt,
+    durationMinutes:Math.max(0,Math.min(1440,Number(el('sv-duration')?.value||0))),
+    location:(el('sv-location')?.value||'').trim(),
+    notes:(el('sv-notes')?.value||'').trim(),
+    reminderAt:notebookFromInput(el('sv-reminder')?.value),
+    completed:existing?.completed||false,
+    announcementPath:existing?.announcementPath||null,
+    announcementName:existing?.announcementName||null,
+    announcementType:existing?.announcementType||null,
+    announcementSize:existing?.announcementSize||0,
+    createdAt:existing?.createdAt||now,
+    updatedAt:now,
+  };
+  const removeExisting=!!el('sv-remove-file')?.checked;
+  const btn=el('sv-save-btn'); if(btn){btn.disabled=true;btn.textContent=file?'Μεταφόρτωση…':'Αποθήκευση…';}
+  try {
+    if(file){
+      uploadedPath=`safetydoc_${uid()}`;
+      try {
+        await safetyFileSave(uploadedPath,file);
+        item.announcementPath=uploadedPath; item.announcementName=file.name;
+        item.announcementType=file.type||_documentMime(file.name); item.announcementSize=file.size;
+      } catch(uploadError) {
+        console.warn('safety announcement upload:',uploadError);
+        const localKey=`${state.cu?.id||'user'}:${id}`;
+        try {
+          await safetyLocalFileSave(localKey,file);
+          uploadedPath=`local:${localKey}`;
+          item.announcementPath=uploadedPath; item.announcementName=file.name;
+          item.announcementType=file.type||_documentMime(file.name); item.announcementSize=file.size;
+          fileStoredLocally=true;
+        } catch(localError) {
+          fileUploadError=localError;
+          uploadedPath=null;
+          console.error('safety announcement local fallback:',localError);
+        }
+      }
+    } else if(removeExisting){
+      item.announcementPath=null; item.announcementName=null; item.announcementType=null; item.announcementSize=0;
+    }
+    const index=(state.safetyVisits||[]).findIndex(v=>v.id===id);
+    if(index>=0) state.safetyVisits[index]=item; else state.safetyVisits.unshift(item);
+    await persistSafetyVisit(item);
+    if(existing?.announcementPath&&(file||removeExisting)&&existing.announcementPath!==item.announcementPath) await safetyFileDelete(existing.announcementPath);
+    closeModal(); render(); checkNotebookReminders();
+    const uploadDetail=String(fileUploadError?.message||fileUploadError||'');
+    const successMessage=fileStoredLocally?'Η επίσκεψη αποθηκεύτηκε. Η αναγγελία φυλάχτηκε με ασφάλεια σε αυτόν τον browser.':(existing?'Η επίσκεψη ενημερώθηκε.':'Η επίσκεψη προστέθηκε.');
+    showToast(fileUploadError?`Η επίσκεψη αποθηκεύτηκε, αλλά η αναγγελία δεν αποθηκεύτηκε${uploadDetail?`: ${uploadDetail}`:''}.`:successMessage,fileUploadError||fileStoredLocally?'info':'success');
+  } catch(error) {
+    if(uploadedPath) await safetyFileDelete(uploadedPath);
+    state.safetyVisits=JSON.parse(previous);
+    console.error('safety visit save:',error);
+    const message=String(error?.message||error||'');
+    showToast(`Δεν ήταν δυνατή η αποθήκευση${message?`: ${message}`:''}.`,'error');
+    if(btn){btn.disabled=false;btn.textContent='Αποθήκευση';}
+  }
+};
+
+async function toggleSafetyVisit(visitId) {
+  const visit=(state.safetyVisits||[]).find(v=>v.id===visitId); if(!visit) return;
+  const previous=visit.completed; visit.completed=!visit.completed; visit.updatedAt=nowTS();
+  try { await persistSafetyVisit(visit); render(); updateSafetyNavCount(); showToast(visit.completed?'Η επίσκεψη ολοκληρώθηκε.':'Η επίσκεψη άνοιξε ξανά.','success'); }
+  catch(error){visit.completed=previous;showToast('Η αλλαγή δεν αποθηκεύτηκε.','error');}
+}
+
+async function deleteSafetyVisit(visitId) {
+  const visit=(state.safetyVisits||[]).find(v=>v.id===visitId); if(!visit) return;
+  if(!confirm(`Διαγραφή της επίσκεψης στην εταιρεία «${visit.company}»;`)) return;
+  const previous=[...(state.safetyVisits||[])]; state.safetyVisits=state.safetyVisits.filter(v=>v.id!==visitId);
+  try { await removeSafetyVisit(visitId); if(visit.announcementPath) await safetyFileDelete(visit.announcementPath); render(); updateSafetyNavCount(); showToast('Η επίσκεψη διαγράφηκε.','success'); }
+  catch(error){state.safetyVisits=previous;showToast('Η διαγραφή δεν αποθηκεύτηκε.','error');}
+}
+
+async function openSafetyAnnouncement(visitId) {
+  const visit=(state.safetyVisits||[]).find(v=>v.id===visitId); if(!visit?.announcementPath) return;
+  const tab=_prepareDocumentTab();
+  try {
+    const blob=await safetyFileGet(visit.announcementPath);
+    const url=URL.createObjectURL(blob);
+    _navigateDocumentTab(tab,url);
+    setTimeout(()=>URL.revokeObjectURL(url),120000);
+  } catch(error) {
+    _closePreparedDocumentTab(tab);
+    showToast('Δεν ήταν δυνατό το άνοιγμα της αναγγελίας.','error');
+  }
+}
+
+window.setSafetyFilter=function(value){state.safetyFilter=value||'scheduled';render();};
+window.filterSafetyTable=function(value){
+  state.safetySearch=String(value||''); const q=state.safetySearch.trim().toLocaleLowerCase('el');
+  document.querySelectorAll('[data-safety-search]').forEach(row=>{row.style.display=!q||String(row.dataset.safetySearch||'').includes(q)?'':'none';});
+};
+
+function renderSafetyVisits() {
+  if(!state.cu||state.cu.role==='client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if(state.safetyLoading||!state.safetyLoaded) return '<div class="empty-state"><div class="es-icon">⏳</div><h3>Φόρτωση επισκέψεων…</h3></div>';
+  const now=new Date(); const nowMs=now.getTime(); const todayKey=now.toLocaleDateString('en-CA');
+  const weekEnd=nowMs+7*86400000;
+  const all=[...(state.safetyVisits||[])].sort((a,b)=>{if(a.completed!==b.completed)return a.completed?1:-1;return new Date(a.visitAt)-new Date(b.visitAt);});
+  const scheduled=all.filter(v=>!v.completed);
+  const todayVisits=scheduled.filter(v=>new Date(v.visitAt).toLocaleDateString('en-CA')===todayKey);
+  const overdue=scheduled.filter(v=>new Date(v.visitAt).getTime()<nowMs);
+  const nextWeek=scheduled.filter(v=>{const t=new Date(v.visitAt).getTime();return t>=nowMs&&t<=weekEnd;});
+  const reminderAlerts=scheduled.filter(v=>v.reminderAt&&new Date(v.reminderAt).getTime()<=nowMs);
+  const filter=state.safetyFilter||'scheduled'; let visible=all;
+  if(filter==='scheduled') visible=scheduled; else if(filter==='today') visible=todayVisits; else if(filter==='overdue') visible=overdue; else if(filter==='done') visible=all.filter(v=>v.completed);
+  const rows=visible.map(visit=>{
+    const isOverdue=!visit.completed&&new Date(visit.visitAt).getTime()<nowMs;
+    const reminderDue=!visit.completed&&visit.reminderAt&&new Date(visit.reminderAt).getTime()<=nowMs;
+    const search=esc(`${visit.company} ${visit.location} ${visit.notes}`.toLocaleLowerCase('el'));
+    return `<tr class="safety-row${visit.completed?' is-completed':''}${isOverdue?' is-overdue':''}" data-safety-search="${search}"><td><button class="notebook-check${visit.completed?' checked':''}" data-action="toggle-safety-visit" data-sid="${esc(visit.id)}" aria-label="${visit.completed?'Άνοιγμα ξανά':'Ολοκλήρωση επίσκεψης'}">${visit.completed?'✓':''}</button></td><td><div class="safety-company">${esc(visit.company)}</div>${visit.location?`<div class="safety-location">⌖ ${esc(visit.location)}</div>`:''}</td><td><div class="notebook-date${isOverdue?' overdue':''}">${notebookFormatDate(visit.visitAt)}</div>${isOverdue?'<div class="notebook-overdue-label">Εκπρόθεσμη</div>':''}</td><td><span class="safety-duration">${safetyDurationLabel(visit.durationMinutes)}</span></td><td><div class="safety-notes">${visit.notes?esc(visit.notes):'—'}</div></td><td><div class="notebook-date${reminderDue?' reminder-due':''}">${visit.reminderAt?'🔔 '+notebookFormatDate(visit.reminderAt):'—'}</div>${reminderDue?'<div class="notebook-reminder-label">Ενεργή</div>':''}</td><td>${visit.announcementPath?`<button class="btn btn-secondary btn-sm safety-file-btn" data-action="open-safety-file" data-sid="${esc(visit.id)}" title="${esc(visit.announcementName||'Αναγγελία')}">📎 Αναγγελία</button>`:'<span class="safety-no-file">Δεν έχει ανέβει</span>'}</td><td><div class="notebook-actions"><button class="btn btn-ghost btn-sm" data-action="modal-edit-safety-visit" data-sid="${esc(visit.id)}" title="Επεξεργασία">✏</button><button class="btn btn-danger btn-sm" data-action="delete-safety-visit" data-sid="${esc(visit.id)}" title="Διαγραφή">✕</button></div></td></tr>`;
+  }).join('');
+  return `<div class="page-hd notebook-page-hd"><div><h1>Τεχνικός Ασφάλειας</h1><div class="page-hd-sub">Προσωπικό πρόγραμμα επισκέψεων — ορατό μόνο από εσάς</div></div><div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-safety-visit">+ Νέα επίσκεψη</button></div></div>
+    <div class="notebook-privacy"><span>🔒</span><div><strong>Προσωπική ενότητα</strong><p>Οι επισκέψεις, οι σημειώσεις και οι υπενθυμίσεις αυτής της ενότητας ανήκουν στον λογαριασμό σας και δεν εμφανίζονται στους συναδέλφους.</p></div></div>
+    ${reminderAlerts.length?`<div class="notebook-alert"><strong>🛡️ ${reminderAlerts.length===1?'Μία ενεργή υπενθύμιση επίσκεψης':`${reminderAlerts.length} ενεργές υπενθυμίσεις επισκέψεων`}</strong><span>${esc(reminderAlerts.slice(0,2).map(v=>v.company).join(' · '))}${reminderAlerts.length>2?' …':''}</span></div>`:''}
+    <div class="notebook-stats safety-stats"><div class="notebook-stat"><span>Προγραμματισμένες</span><strong>${scheduled.length}</strong></div><div class="notebook-stat today"><span>Σήμερα</span><strong>${todayVisits.length}</strong></div><div class="notebook-stat overdue"><span>Εκπρόθεσμες</span><strong>${overdue.length}</strong></div><div class="notebook-stat upcoming"><span>Επόμενες 7 ημέρες</span><strong>${nextWeek.length}</strong></div></div>
+    <div class="notebook-toolbar"><div class="notebook-search-wrap"><span>⌕</span><input value="${esc(state.safetySearch||'')}" oninput="filterSafetyTable(this.value)" placeholder="Αναζήτηση εταιρείας, τοποθεσίας ή σημείωσης…" aria-label="Αναζήτηση επισκέψεων"></div><select class="form-control notebook-filter" onchange="setSafetyFilter(this.value)"><option value="scheduled"${filter==='scheduled'?' selected':''}>Προγραμματισμένες</option><option value="today"${filter==='today'?' selected':''}>Σήμερα</option><option value="overdue"${filter==='overdue'?' selected':''}>Εκπρόθεσμες</option><option value="done"${filter==='done'?' selected':''}>Ολοκληρωμένες</option><option value="all"${filter==='all'?' selected':''}>Όλες</option></select></div>
+    <div class="notebook-table-wrap"><table class="notebook-table safety-table"><thead><tr><th></th><th>Εταιρεία / Τοποθεσία</th><th>Ημερομηνία & ώρα</th><th>Διάρκεια</th><th>Σημειώσεις</th><th>Υπενθύμιση</th><th>Αναγγελία</th><th>Ενέργειες</th></tr></thead><tbody>${rows||'<tr><td colspan="8"><div class="notebook-empty"><div>🛡️</div><strong>Δεν υπάρχουν επισκέψεις σε αυτή την προβολή</strong><span>Πατήστε «Νέα επίσκεψη» για την πρώτη καταχώριση.</span></div></td></tr>'}</tbody></table></div>`;
+}
+
 // ── NAVIGATION ────────────────────────────────────────────────────
 function navigate(view, opts={}) {
   if (view!=='login' && !state.cu) { state.view='login'; render(); return; }
-  if (['users','audit'].includes(view) && !isAdminOnly()) {
-    state.view='dashboard';
-    render();
-    return;
-  }
   state.view=view;
   if (opts.categoryId  !==undefined) state.categoryId  =opts.categoryId;
   if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) state.ganttView=false; state.projectId=opts.projectId; }
@@ -1583,6 +2197,16 @@ function navigate(view, opts={}) {
     state.tsLoaded=false;
     state.tsPage=1;
     loadTimesheetPage(1);
+  }
+  if(view==='notebook' && isSupabaseAuthMode() && !state.notebookLoaded && !state.notebookLoading) {
+    loadNotebook();
+  }
+  if(view==='safety-visits' && !state.safetyLoading) {
+    loadSafetyVisits();
+  }
+  if(view==='calendar' && isSupabaseAuthMode()) {
+    if(!state.notebookLoaded && !state.notebookLoading) loadNotebook();
+    if(!state.safetyLoaded && !state.safetyLoading) loadSafetyVisits();
   }
   // Load storage stats for admin/management on dashboard
   if (view==='dashboard' && state.cu && ['admin','management'].includes(state.cu.role)) {
@@ -1647,6 +2271,8 @@ function render() {
       case 'audit':      main.innerHTML=renderAudit();      break;
       case 'templates':  main.innerHTML=renderTemplates();  break;
       case 'template':   main.innerHTML=renderTemplateDetail(); break;
+      case 'notebook':   main.innerHTML=renderNotebook();   break;
+      case 'safety-visits': main.innerHTML=renderSafetyVisits(); break;
       case 'timesheet':        main.innerHTML=renderTimesheet();      break;
       case 'calendar':         main.innerHTML=renderCalendar();       break;
       case 'client-calendar':  main.innerHTML=renderClientCalendar(); break;
@@ -1702,10 +2328,12 @@ function _updateSidebarFooter() {
 
 function updateNav() {
   document.querySelectorAll('.nav-link[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.view));
-  document.querySelectorAll('[data-admin-only]').forEach(e2=>{ e2.style.display=isAdminOnly()?'':'none'; });
+  document.querySelectorAll('[data-admin-only]').forEach(e2=>{ e2.style.display=isAdmin()?'':'none'; });
   document.querySelectorAll('[data-mgmt-only]').forEach(e2=>{ e2.style.display=canViewTemplates()?'':'none'; });
   document.querySelectorAll('[data-noClient-only]').forEach(e2=>{ e2.style.display=(state.cu&&state.cu.role!=='client')?'':'none'; });
   const ni=el('nav-count'); if(ni) ni.textContent=visibleProjects().filter(p=>p.status==='in_progress').length;
+  updateNotebookNavCount();
+  updateSafetyNavCount();
   const sb2=el('header-search-btn'); if(sb2) sb2.style.display=(state.cu&&state.cu.role!=='client')?'':'none';
 }
 function updateBreadcrumb() {
@@ -1726,6 +2354,8 @@ function updateBreadcrumb() {
   else if (state.view==='audit') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Ιστορικό</span>`;
   else if (state.view==='templates') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Πρότυπα</span>`;
   else if (state.view==='template') { const tpl=getTemplate(state.templateId); html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item" data-action="nav-templates">Πρότυπα</span>${sep}<span class="bc-item current">${esc(tpl?.name||'Πρότυπο')}</span>`; }
+  else if (state.view==='notebook') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Σημειωματάριο</span>`;
+  else if (state.view==='safety-visits') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Τεχνικός Ασφάλειας</span>`;
   else if (state.view==='calendar') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Ημερολόγιο</span>`;
   else if (state.view==='client-calendar') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Client Calendar</span>`;
   else if (state.view==='crm-companies') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Εταιρείες</span>`;
@@ -2558,6 +3188,21 @@ function renderWorkloadWidget() {
     </div>
   </div>`;
 }
+
+function renderNotebookDashboardWidget() {
+  if(!state.cu||state.cu.role==='client'||!state.notebookLoaded) return '';
+  const now=new Date(); const nowMs=now.getTime(); const todayKey=now.toLocaleDateString('en-CA');
+  const items=(state.notebook||[]).filter(n=>!n.completed&&n.dueAt&&(
+    new Date(n.dueAt).toLocaleDateString('en-CA')===todayKey||new Date(n.dueAt).getTime()<nowMs
+  )).sort((a,b)=>new Date(a.dueAt)-new Date(b.dueAt));
+  const rows=items.slice(0,5).map(note=>{
+    const overdue=new Date(note.dueAt).getTime()<nowMs;
+    const time=new Date(note.dueAt).toLocaleTimeString('el-GR',{hour:'2-digit',minute:'2-digit'});
+    return `<div class="dash-notebook-row${overdue?' is-overdue':''}"><button class="notebook-check" data-action="toggle-notebook" data-nid="${esc(note.id)}" aria-label="Ολοκλήρωση"></button><div class="dash-notebook-time">${overdue?'ΕΚΠΡ.':time}</div><div class="dash-notebook-main"><strong>${esc(note.title)}</strong>${note.details?`<span>${esc(note.details)}</span>`:''}</div><button class="btn btn-ghost btn-sm" data-action="modal-edit-notebook" data-nid="${esc(note.id)}" title="Επεξεργασία">✏</button></div>`;
+  }).join('');
+  return `<section class="dash-notebook-widget"><div class="dash-notebook-head"><div><span class="dash-notebook-kicker">ΠΡΟΣΩΠΙΚΟ ΠΛΑΝΟ</span><h3>Οι σημερινές μου εκκρεμότητες</h3></div><div class="dash-notebook-head-actions"><button class="btn btn-ghost btn-sm" data-action="nav-notebook">Προβολή όλων</button><button class="btn btn-primary btn-sm" data-action="modal-add-notebook">+ Νέα</button></div></div>${rows||'<div class="dash-notebook-empty"><span>✓</span><div><strong>Δεν υπάρχουν εκκρεμότητες για σήμερα</strong><p>Μπορείτε να προσθέσετε κάτι από το κουμπί «+ Νέα».</p></div></div>'}${items.length>5?`<div class="dash-notebook-more">+ ${items.length-5} ακόμη για σήμερα</div>`:''}</section>`;
+}
+
 function renderDashboard() {
   const s=dashStats();
   const f=state.dashFilter;
@@ -2574,6 +3219,7 @@ function renderDashboard() {
 
   return `
   <div class="dash-welcome mb-12"><h2>Καλωσήρθατε, ${esc(state.cu.name)}</h2><p>Επισκόπηση έργων · ${new Date().toLocaleDateString('el-GR',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</p></div>
+  ${renderNotebookDashboardWidget()}
   <div class="stats-grid">
     ${card('all','Έργα',`<div class="stat-card-icon" style="background:var(--orange-light)"><svg width="16" height="16" viewBox="0 0 20 20" fill="var(--orange)"><path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"/></svg></div>`,s.total,'','Συνολικά ορατά')}
     ${card('in_progress','Σε Εξέλιξη',`<div class="stat-card-icon" style="background:var(--amber-bg)"><svg width="16" height="16" viewBox="0 0 20 20" fill="var(--amber)"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"/></svg></div>`,s.active,'var(--orange)','Ενεργά έργα')}
@@ -3138,7 +3784,7 @@ function renderProject() {
 
 // ── VIEW: USERS ───────────────────────────────────────────────────
 function renderUsers() {
-  if (!isAdminOnly()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
   const onlineCount = state.db.users.filter(u => state.onlineUsers.has(u.id)).length;
   const rows = state.db.users.map(u => {
     const ri = ROLE_INFO[u.role] || {};
@@ -3248,7 +3894,7 @@ function renderProjectAuditTimeline(proj) {
 
 // ── VIEW: AUDIT ───────────────────────────────────────────────────
 function renderAudit() {
-  if (!isAdminOnly()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
   const log=state.db.auditLog.slice(0,100);
   return `
   <div class="page-hd"><div><h1>Ιστορικό Αλλαγών</h1><div class="page-hd-sub">${log.length} εγγραφές</div></div><div class="page-hd-actions"><button class="btn btn-danger btn-sm" data-action="clear-audit">Εκκαθάριση</button></div></div>
@@ -3568,7 +4214,89 @@ function _calToggle() {
 }
 
 function _calLegend() {
-  return '';
+  return `<div class="cal-legend cal-personal-legend">
+    <span class="cal-legend-item"><span class="cal-legend-dot cal-legend-note"></span>📝 Σημειωματάριο</span>
+    <span class="cal-legend-item"><span class="cal-legend-dot cal-legend-safety"></span>🛡️ Τεχνικός Ασφάλειας</span>
+  </div>`;
+}
+
+function _calPersonalDateTime(value) {
+  if(!value) return null;
+  const d=new Date(value);
+  if(Number.isNaN(d.getTime())) return null;
+  const pad=n=>String(n).padStart(2,'0');
+  return {
+    date:`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`,
+    time:`${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  };
+}
+
+function _calPersonalEvents() {
+  const events=[];
+  if(state.notebookLoaded) {
+    (state.notebook||[]).forEach(note=>{
+      const when=_calPersonalDateTime(note.dueAt); if(!when) return;
+      events.push({
+        id:note.id,kind:'note',date:when.date,time:when.time,title:note.title||'Εκκρεμότητα',
+        subtitle:note.details||'',completed:!!note.completed,
+      });
+    });
+  }
+  if(state.safetyLoaded) {
+    (state.safetyVisits||[]).forEach(visit=>{
+      const when=_calPersonalDateTime(visit.visitAt); if(!when) return;
+      events.push({
+        id:visit.id,kind:'safety',date:when.date,time:when.time,title:visit.company||'Επίσκεψη',
+        subtitle:[visit.location,visit.notes].filter(Boolean).join(' · '),completed:!!visit.completed,
+      });
+    });
+  }
+  return events.sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time)||a.title.localeCompare(b.title,'el'));
+}
+
+function _calPersonalEventsByDate() {
+  return _calPersonalEvents().reduce((map,event)=>{
+    (map[event.date]||(map[event.date]=[])).push(event);
+    return map;
+  },{});
+}
+
+function _calPersonalActionAttrs(event) {
+  return event.kind==='safety'
+    ? `data-action="modal-edit-safety-visit" data-sid="${esc(event.id)}"`
+    : `data-action="modal-edit-notebook" data-nid="${esc(event.id)}"`;
+}
+
+function _calPersonalMonthPill(event) {
+  const icon=event.kind==='safety'?'🛡️':'📝';
+  const short=event.title.length>17?event.title.slice(0,16)+'…':event.title;
+  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
+  return `<div class="cal-task cal-personal-event ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}${event.subtitle?' · '+esc(event.subtitle):''}">${icon} ${esc(event.time)} ${esc(short)}</div>`;
+}
+
+function _calPersonalWeekCard(event) {
+  const icon=event.kind==='safety'?'🛡️':'📝';
+  const label=event.kind==='safety'?'Τεχνικός Ασφάλειας':'Σημειωματάριο';
+  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
+  return `<div class="cwc cal-personal-card ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}">
+    <div class="cwc-name">${icon} ${esc(event.title)}</div>
+    <div class="cwc-time">⏰ ${esc(event.time)}</div>
+    <div class="cwc-proj">${label}${event.subtitle?` · ${esc(event.subtitle)}`:''}</div>
+  </div>`;
+}
+
+function _calPersonalDayCard(event) {
+  const icon=event.kind==='safety'?'🛡️':'📝';
+  const label=event.kind==='safety'?'Τεχνικός Ασφάλειας':'Σημειωματάριο';
+  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
+  return `<div class="cal-day-card cal-day-card-compact cal-personal-card ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}">
+    <div class="cal-day-mainline">
+      <span class="cal-day-path">${icon} ${esc(event.title)}</span>
+      <span class="cal-day-inline-meta">⏰ ${esc(event.time)}</span>
+      <span class="cal-day-inline-meta">${label}</span>
+    </div>
+    ${event.subtitle?`<div class="cal-day-subtask-lines"><span class="cal-day-subtask-item">${esc(event.subtitle)}</span></div>`:''}
+  </div>`;
 }
 
 function renderCalendar() {
@@ -3600,6 +4328,7 @@ function _renderCalMonth() {
   const startDow = (firstDay.getDay() + 6) % 7;
   const todayStr = today();
   const monthPrefix = `${year}-${String(month+1).padStart(2,'0')}-`;
+  const personalByDate=_calPersonalEventsByDate();
 
   // Build phasesByDay: day -> [{ph, proj, color}]
   const phasesByDay = {};
@@ -3656,16 +4385,23 @@ function _renderCalMonth() {
     const isToday=dateStr===todayStr;
     const dayPhases=phasesByDay[day]||[];
     const dayTasks=tasksByDay[day]||[];
-    const totalItems=dayPhases.length+dayTasks.length;
+    const dayPersonal=personalByDate[dateStr]||[];
+    const totalItems=dayPersonal.length+dayPhases.length+dayTasks.length;
+    const maxVisible=3;
 
-    // Phase bars (show up to 2)
-    const phaseBars = dayPhases.slice(0,2).map(({ph, proj, color, isFirst, isLast}) => {
+    // Personal appointments take priority so they never disappear behind
+    // project phases or tasks in the compact monthly cells.
+    const personalVisible=dayPersonal.slice(0,maxVisible);
+    const personalPills=personalVisible.map(_calPersonalMonthPill).join('');
+    const remainingAfterPersonal=Math.max(0,maxVisible-personalVisible.length);
+
+    const visiblePhases=dayPhases.slice(0,remainingAfterPersonal);
+    const phaseBars = visiblePhases.map(({ph, proj, color, isFirst, isLast}) => {
       const nm = isFirst ? (ph.name.length>14?ph.name.slice(0,13)+'…':ph.name) : '';
       return `<div class="cal-phase-bar" data-action="open-project" data-pid="${proj.id}" style="background:${color}20;border-left:3px solid ${color}" title="${esc(ph.name)} · ${esc(proj.name)}">${nm?`<span style="color:${color};font-weight:700">${esc(nm)}</span>`:''}</div>`;
     }).join('');
 
-    // Task pills (show up to 2, after phases)
-    const maxTasks = dayPhases.length >= 2 ? 0 : 2 - dayPhases.length;
+    const maxTasks=Math.max(0,remainingAfterPersonal-visiblePhases.length);
     const pills=dayTasks.slice(0,maxTasks).map(({task,proj})=>{
       const st=TASK_STATUSES[task.status]||TASK_STATUSES.not_started;
       const nm=task.name.length>16?task.name.slice(0,15)+'…':task.name;
@@ -3673,8 +4409,8 @@ function _renderCalMonth() {
       const timeLabel=task.startTime?`<span style="font-size:.55rem;opacity:.7"> ${task.startTime}</span>`:'';
       return `<div class="cal-task ${st.cls}" data-action="open-project" data-pid="${proj.id}" title="${esc(task.name)} · ${esc(proj.name)}">${esc(nm)}${timeLabel}<span class="cal-task-proj">${esc(pn)}</span></div>`;
     }).join('');
-    const more=totalItems>2?`<div class="cal-more">+${totalItems-2} ακόμα</div>`:'';
-    cells+=`<div class="cal-cell${isToday?' cal-today':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${phaseBars}${pills}${more}</div>`;
+    const more=totalItems>maxVisible?`<div class="cal-more">+${totalItems-maxVisible} ακόμα</div>`:'';
+    cells+=`<div class="cal-cell${isToday?' cal-today':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${personalPills}${phaseBars}${pills}${more}</div>`;
   }
 
   return `
@@ -3736,6 +4472,7 @@ function _renderCalWeek() {
   const weekDateStrs = days.map(d=>d.toISOString().slice(0,10));
   const weekDatesSet = new Set(weekDateStrs);
   const todayStr = today();
+  const personalByDate=_calPersonalEventsByDate();
 
   // Tasks by workday. Multi-day tasks are shown only on Monday–Friday,
   // because Saturday/Sunday do not exist in this weekly view.
@@ -3769,11 +4506,14 @@ function _renderCalWeek() {
     const dateStr = weekDateStrs[i];
     const isToday = dateStr===todayStr;
 
-    const dayTasks = (tasksByDate[dateStr]||[])
-      .slice()
-      .sort((a,b)=>(a.task.startTime||'').localeCompare(b.task.startTime||''));
+    const dayItems=[
+      ...(personalByDate[dateStr]||[]).map(event=>({type:'personal',time:event.time||'',event})),
+      ...(tasksByDate[dateStr]||[]).map(entry=>({type:'task',time:entry.task.startTime||'99:99',...entry})),
+    ].sort((a,b)=>a.time.localeCompare(b.time));
 
-    const cards = dayTasks.map(({task,proj}) => {
+    const cards = dayItems.map(item => {
+      if(item.type==='personal') return _calPersonalWeekCard(item.event);
+      const {task,proj}=item;
       const st = TASK_STATUSES[task.status] || TASK_STATUSES.not_started;
 
       // startTime/endTime represent the planned working time for this day.
@@ -3898,6 +4638,9 @@ function _renderCalDay() {
     });
   });
 
+  const personalEvents=(_calPersonalEventsByDate()[dateStr]||[])
+    .slice().sort((a,b)=>a.time.localeCompare(b.time));
+
   const timedTasks=dayTasks.filter(x=>x.task.startTime)
     .sort((a,b)=>a.task.startTime.localeCompare(b.task.startTime));
   const untimedTasks=dayTasks.filter(x=>!x.task.startTime);
@@ -3934,8 +4677,13 @@ function _renderCalDay() {
     </div>`;
   };
 
+  const personalGrid=personalEvents.length?`<div class="cdd-timegrid cal-personal-day-group">
+    <div class="cdd-tg-label">Προσωπικά ραντεβού</div>
+    ${personalEvents.map(_calPersonalDayCard).join('')}
+  </div>`:'';
+
   const timeGrid=timedTasks.length ? `<div class="cdd-timegrid">
-    <div class="cdd-tg-label">Προγραμματισμένες εργασίες</div>
+    <div class="cdd-tg-label">Προγραμματισμένες εργασίες έργων</div>
     ${timedTasks.map(x=>taskCard(x)).join('')}
   </div>`:'';
 
@@ -3944,8 +4692,8 @@ function _renderCalDay() {
     ${untimedTasks.map(x=>taskCard(x)).join('')}
   </div>`:'';
 
-  const empty=!dayTasks.length
-    ? `<div class="cal-day-empty"><div class="es-icon">📅</div><p>Δεν υπάρχουν εργασίες για αυτή την ημέρα.</p></div>`
+  const empty=!dayTasks.length&&!personalEvents.length
+    ? `<div class="cal-day-empty"><div class="es-icon">📅</div><p>Δεν υπάρχουν εργασίες ή προσωπικά ραντεβού για αυτή την ημέρα.</p></div>`
     :'';
 
   return `
@@ -3961,7 +4709,7 @@ function _renderCalDay() {
       <button class="btn btn-secondary btn-sm" data-action="cal-today">Σήμερα</button>
     </div>
   </div>
-  ${timeGrid}${untimedGrid}${empty}`;
+  ${personalGrid}${timeGrid}${untimedGrid}${empty}`;
 }
 
 // ── VIEW: TEMPLATES ───────────────────────────────────────────────
@@ -4105,6 +4853,8 @@ document.addEventListener('click',e=>{
     else if (a==='nav-categories') navigate('categories');
     else if (a==='nav-projects') navigate('projects',{categoryId:bc.dataset.cid});
     else if (a==='nav-templates')     navigate('templates');
+    else if (a==='nav-notebook')      navigate('notebook');
+    else if (a==='nav-safety-visits') navigate('safety-visits');
     else if (a==='nav-crm-companies') navigate('crm-companies');
     else if (a==='nav-crm-contacts')  navigate('crm-contacts');
     return;
@@ -4212,6 +4962,8 @@ async function doLogin() {
     const idx=state.db.users.findIndex(u=>u.id===profile.id);
     if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
     state.view=profile.role==='client'?'client':'dashboard';
+    await loadNotebook();
+    await loadSafetyVisits();
 
     sb.rpc('app_touch_last_login').then(({error})=>{
       if(error) console.warn('touch last login:',error);
@@ -4286,6 +5038,7 @@ window.submitPasswordReset = async function() {
 
 async function doLogout() {
   cleanupNotificationCenter();
+  cleanupNotebookReminders();
   try { auditLog('Αποσύνδεση',`Ο χρήστης ${state.cu?.name} αποσυνδέθηκε`); } catch(e){}
   cleanupPresence();
 
@@ -4295,6 +5048,11 @@ async function doLogout() {
 
   clearCurrentUser();
   state.cu=null;
+  state.notebook=[];
+  state.notebookLoaded=false;
+  state.safetyVisits=[];
+  state.safetyLoaded=false;
+  state.safetyLoading=false;
   state.view='login';
   AUTH_MODE='legacy';
 
@@ -4517,6 +5275,8 @@ function handleClick(e) {
     case 'nav-categories':     navigate('categories');                      break;
     case 'nav-projects':       navigate('projects',{categoryId:btn.dataset.cid}); break;
     case 'nav-templates':      navigate('templates');                       break;
+    case 'nav-notebook':       navigate('notebook');                        break;
+    case 'nav-safety-visits':  navigate('safety-visits');                   break;
     case 'nav-timesheet':      navigate('timesheet');                       break;
     case 'nav-notifications':  navigate('notifications');                   break;
     case 'open-template':      navigate('template',{templateId:btn.dataset.tid}); break;
@@ -4616,6 +5376,15 @@ function handleClick(e) {
     case 'modal-manage-standing':    showModalManageStanding();                     break;
     case 'modal-billing':            showModalBilling();                            break;
     case 'modal-add-template':       showModalAddTemplate();                        break;
+    case 'modal-add-notebook':       showNotebookModal();                           break;
+    case 'modal-edit-notebook':      showNotebookModal(btn.dataset.nid);            break;
+    case 'toggle-notebook':          toggleNotebookItem(btn.dataset.nid);           break;
+    case 'delete-notebook':          deleteNotebookItem(btn.dataset.nid);           break;
+    case 'modal-add-safety-visit':   showSafetyVisitModal();                        break;
+    case 'modal-edit-safety-visit':  showSafetyVisitModal(btn.dataset.sid);         break;
+    case 'toggle-safety-visit':      toggleSafetyVisit(btn.dataset.sid);            break;
+    case 'delete-safety-visit':      deleteSafetyVisit(btn.dataset.sid);            break;
+    case 'open-safety-file':         openSafetyAnnouncement(btn.dataset.sid);       break;
     case 'modal-edit-template':      showModalEditTemplate(btn.dataset.tid);        break;
     case 'delete-template':          confirmDeleteTemplate(btn.dataset.tid);        break;
     case 'duplicate-template':       duplicateTemplate(btn.dataset.tid);            break;
@@ -7244,53 +8013,27 @@ window.modalSaveDoc=async function(pid,phid,tid){
 
 // ADD USER
 function showModalAddUser() {
-  const authMode=isSupabaseAuthMode();
-  const accessField=authMode
-    ? `<div class="form-group"><label class="form-label">Email σύνδεσης <sup>*</sup></label><input class="form-control" type="email" id="nu-email" autocomplete="off"><div class="form-hint">Θα σταλεί ασφαλής πρόσκληση Supabase Auth. Δεν αποθηκεύεται κωδικός στο πρόγραμμα.</div></div>`
-    : `<div class="form-group"><label class="form-label">Κωδικός <sup>*</sup></label><input class="form-control" type="password" id="nu-pass"></div><div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="nu-email"></div>`;
-  showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο <sup>*</sup></label><input class="form-control" id="nu-name" placeholder="Γεώργιος Παπαδόπουλος"></div><div class="form-group"><label class="form-label">Username <sup>*</sup></label><input class="form-control" id="nu-user" placeholder="gpapadopoulos" autocomplete="off"></div>${accessField}<div class="form-group"><label class="form-label">Ρόλος</label><select class="form-control" id="nu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">Κατηγορίες (για Υπ. Έργου)</label>${state.db.categories.map(c=>`<label style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" class="nu-catck" value="${c.id}"> ${esc(c.name)}</label>`).join('')}</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveUser()">${authMode?'Αποστολή πρόσκλησης':'Δημιουργία'}</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Νέος Χρήστης</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο <sup>*</sup></label><input class="form-control" id="nu-name" placeholder="Γεώργιος Παπαδόπουλος"></div><div class="form-group"><label class="form-label">Username <sup>*</sup></label><input class="form-control" id="nu-user" placeholder="gpapadopoulos"></div><div class="form-group"><label class="form-label">Κωδικός <sup>*</sup></label><input class="form-control" type="password" id="nu-pass"></div><div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="nu-email"></div><div class="form-group"><label class="form-label">Ρόλος</label><select class="form-control" id="nu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}">${v.label}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">Κατηγορίες (για Υπ. Έργου)</label>${state.db.categories.map(c=>`<label style="display:flex;align-items:center;gap:8px;margin-top:6px"><input type="checkbox" class="nu-catck" value="${c.id}"> ${esc(c.name)}</label>`).join('')}</div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveUser()">Δημιουργία</button></div>`);
 }
 window.modalSaveUser=async function(){
-  const name=el('nu-name').value.trim();
-  const username=el('nu-user').value.trim().toLowerCase();
-  const email=(el('nu-email')?.value||'').trim().toLowerCase();
-  const catIds=Array.from(document.querySelectorAll('.nu-catck:checked')).map(c=>c.value);
-  const role=el('nu-role').value;
-
-  if(isSupabaseAuthMode()){
-    if(!name||!username||!email){alert('Ονοματεπώνυμο, username και email είναι υποχρεωτικά.');return;}
-    if(state.db.users.some(u=>(u.username||'').toLowerCase()===username||String(u.email||'').toLowerCase()===email)){
-      alert('Το username ή το email χρησιμοποιείται ήδη.'); return;
-    }
-    try{
-      const result=await provisionAuthUser({name,username,email,role,categoryIds:catIds});
-      state.db.users.push(result.user);
-      auditLog('Πρόσκληση νέου χρήστη',`${result.user.name} (${ROLE_INFO[result.user.role]?.label})`);
-      closeModal(); render(); showToast(`Στάλθηκε πρόσκληση στον χρήστη «${name}».`,'success');
-    }catch(err){
-      console.error('admin-user-provision error:',err);
-      showToast('Η δημιουργία χρήστη απέτυχε: '+(err?.message||err),'error');
-    }
-    return;
-  }
-
-  const password=el('nu-pass')?.value||'';
+  const name=el('nu-name').value.trim(); const username=el('nu-user').value.trim(); const password=el('nu-pass').value;
   if(!name||!username||!password){alert('Συμπληρώστε υποχρεωτικά πεδία.');return;}
+  const catIds=Array.from(document.querySelectorAll('.nu-catck:checked')).map(c=>c.value);
   const hashedPass = dcodeIO.bcrypt.hashSync(password, 10);
   // Check for existing user with same username (case-insensitive)
   const existingIdx = state.db.users.findIndex(u=>(u.username||'').toLowerCase()===username.toLowerCase());
   let user;
   if (existingIdx >= 0) {
     // Update existing user (overwrite stale/zombie entry)
-    user = {...state.db.users[existingIdx], name, username, password:hashedPass, role, email, categoryIds:catIds};
+    user = {...state.db.users[existingIdx], name, username, password:hashedPass, role:el('nu-role').value, email:el('nu-email').value.trim(), categoryIds:catIds};
     state.db.users[existingIdx] = user;
     auditLog('Ενημέρωση χρήστη',`${user.name} (${ROLE_INFO[user.role]?.label})`);
   } else {
-    user = {id:'u_'+uid(),name,username,password:hashedPass,role,email,categoryIds:catIds,projectIds:[]};
+    user = {id:'u_'+uid(),name,username,password:hashedPass,role:el('nu-role').value,email:el('nu-email').value.trim(),categoryIds:catIds,projectIds:[]};
     state.db.users.push(user);
     auditLog('Δημιουργία χρήστη',`${user.name} (${ROLE_INFO[user.role]?.label})`);
   }
-  // Legacy-only path. Production Auth mode always uses the Edge Function above.
+  // Use direct upsert to be_users for new user creation (auth-mode RPC is update-only)
   const {error: saveErr} = await sb.from('be_users').upsert({id:user.id, data:user});
   if (saveErr) { showToast('Σφάλμα αποθήκευσης: '+(saveErr.message||saveErr),'error'); return; }
   closeModal(); render(); showToast(`Χρήστης «${name}» αποθηκεύτηκε.`,'success');
@@ -9816,8 +10559,6 @@ window.modalSaveCrmCompany = async function(id) {
    'efka_username','efka_password','bank_name','bank_username','bank_password'].forEach(k=>{delete data[k];});
   try {
     await crmSaveCompany(data);
-    // Keep the current in-memory UI readable; only the database payload is ciphertext.
-    data.extra_creds_json=extras.length?JSON.stringify(extras):null;
     closeModal();
     render();
     showToast('Εταιρεία αποθηκεύτηκε.','success');
@@ -9990,8 +10731,6 @@ window.modalSaveCrmContact = async function(id) {
   });
   try {
     await crmSaveContact(data);
-    // The safe read RPC decrypts on reload. Preserve plaintext only in this active UI session.
-    Object.assign(data,rawCreds);
     closeModal();
     render();
     showToast('Επαφή αποθηκεύτηκε.','success');
@@ -10071,6 +10810,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const idx=state.db.users.findIndex(u=>u.id===profile.id);
         if(idx>=0) state.db.users[idx]=profile; else state.db.users.push(profile);
         state.view=profile.role==='client'?'client':'dashboard';
+        await loadNotebook();
+        await loadSafetyVisits();
         initPresence();
         initProjectsRealtime();
         startNotificationPolling();
@@ -10078,23 +10819,51 @@ document.addEventListener('DOMContentLoaded', async () => {
         await sb.auth.signOut({scope:'local'}).catch(()=>{});
         AUTH_MODE='legacy';
         state.cu=null;
-        state.db=emptyDbState();
-        state.view='login';
+        await loadFromDB();
+
+        const legacy=getCurrentUser();
+        if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
+          const fresh=state.db.users.find(u=>u.id===legacy.id);
+          if(fresh){
+            state.cu=fresh;
+            state.view=fresh.role==='client'?'client':'dashboard';
+            await loadSafetyVisits();
+            initPresence();
+            initProjectsRealtime();
+          } else clearCurrentUser();
+        } else clearCurrentUser();
       }
     } else {
       AUTH_MODE='legacy';
-      clearCurrentUser();
-      state.cu=null;
-      state.db=emptyDbState();
-      state.view='login';
+      await loadFromDB();
+
+      const legacy=getCurrentUser();
+      if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
+        const fresh=state.db.users.find(u=>u.id===legacy.id);
+        if(fresh){
+          state.cu=fresh;
+          state.view=fresh.role==='client'?'client':'dashboard';
+          await loadSafetyVisits();
+          initPresence();
+          initProjectsRealtime();
+        } else {
+          clearCurrentUser();
+          state.cu=null;
+          state.view='login';
+        }
+      } else {
+        clearCurrentUser();
+        state.cu=null;
+        state.view='login';
+      }
     }
   } catch(err) {
     console.error('Transition init failed',err);
     try { await sb.auth.signOut({scope:'local'}); } catch(e) {}
     AUTH_MODE='legacy';
     state.cu=null;
-    state.db=emptyDbState();
     state.view='login';
+    try { await loadFromDB(); } catch(e) { state.db=emptyDbState(); }
     showToast('Αποτυχία αρχικοποίησης: '+(err.message||err),'error');
   }
 
@@ -10105,8 +10874,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   sb.auth.onAuthStateChange((event)=>{
     if(event==='SIGNED_OUT' && isSupabaseAuthMode()){
+      cleanupNotebookReminders();
       AUTH_MODE='legacy';
       state.cu=null;
+      state.notebook=[];
+      state.notebookLoaded=false;
+      state.safetyVisits=[];
+      state.safetyLoaded=false;
+      state.safetyLoading=false;
       state.view='login';
     }
   });
