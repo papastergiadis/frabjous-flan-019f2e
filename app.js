@@ -441,7 +441,10 @@ async function dbDeleteClientCalEntry(entryId) {
 async function crmSaveCompany(data) {
   if (!data.id) data.id = crypto.randomUUID();
   data.updated_at = new Date().toISOString();
-  const {error} = await sb.from('companies').upsert(data);
+  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const {error} = delegated
+    ? await sb.rpc('app_crm_company_save_delegated',{p_data:data})
+    : await sb.from('companies').upsert(data);
   if (error) { showToast('Σφάλμα αποθήκευσης εταιρείας.','error'); throw error; }
   // update local state
   const idx = (state.db.crmCompanies||[]).findIndex(x=>x.id===data.id);
@@ -452,7 +455,10 @@ async function crmSaveCompany(data) {
 async function crmDeleteCompany(id) {
   if (!confirm('Διαγραφή εταιρείας;')) return;
   const now = new Date().toISOString();
-  const {error} = await sb.from('companies').update({deleted_at:now}).eq('id',id);
+  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const {error} = delegated
+    ? await sb.rpc('app_crm_company_delete_delegated',{p_id:id})
+    : await sb.from('companies').update({deleted_at:now}).eq('id',id);
   if (error) { showToast('Σφάλμα διαγραφής.','error'); throw error; }
   state.db.crmCompanies = (state.db.crmCompanies||[]).filter(x=>x.id!==id);
   if (state.view==='crm-company') navigate('crm-companies');
@@ -462,7 +468,10 @@ async function crmDeleteCompany(id) {
 async function crmSaveContact(data) {
   if (!data.id) data.id = crypto.randomUUID();
   data.updated_at = new Date().toISOString();
-  const {error} = await sb.from('contacts').upsert(data);
+  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const {error} = delegated
+    ? await sb.rpc('app_crm_contact_save_delegated',{p_data:data})
+    : await sb.from('contacts').upsert(data);
   if (error) { showToast('Σφάλμα αποθήκευσης επαφής.','error'); throw error; }
   // Push to Google Contacts asynchronously (non-blocking; won't affect save if it fails)
   pushContactToGoogle(data).catch(e => console.error('[google-contacts] push error:', e));
@@ -474,7 +483,10 @@ async function crmSaveContact(data) {
 async function crmDeleteContact(id) {
   if (!confirm('Διαγραφή επαφής;')) return;
   const now = new Date().toISOString();
-  const {error} = await sb.from('contacts').update({deleted_at:now}).eq('id',id);
+  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const {error} = delegated
+    ? await sb.rpc('app_crm_contact_delete_delegated',{p_id:id})
+    : await sb.from('contacts').update({deleted_at:now}).eq('id',id);
   if (error) { showToast('Σφάλμα διαγραφής.','error'); throw error; }
   state.db.crmContacts = (state.db.crmContacts||[]).filter(x=>x.id!==id);
   if (state.view==='crm-contact') navigate('crm-contacts');
@@ -1093,7 +1105,18 @@ function getTemplate(id) { return (state.db.templates||[]).find(t=>t.id===id); }
 // backward compat: projects may have managerId (old) or managerIds (new)
 function projManagerIds(proj) { return proj.managerIds || (proj.managerId ? [proj.managerId] : []); }
 function projManagerNames(proj) { return projManagerIds(proj).map(id=>getUser(id)?.name||'—').join(', ') || '—'; }
-function canManageTemplates() { return state.cu && ['admin','management'].includes(state.cu.role); }
+function hasTemplatesCrmPermission(user=state.cu) {
+  return !!user && user.role!=='client' && user.manageTemplatesAndCrm===true;
+}
+function canManageTemplatesAndCrm() {
+  return !!state.cu && (
+    ['admin','management'].includes(state.cu.role) || hasTemplatesCrmPermission(state.cu)
+  );
+}
+function canManageSensitiveCrmCredentials() {
+  return !!state.cu && ['admin','management'].includes(state.cu.role);
+}
+function canManageTemplates() { return canManageTemplatesAndCrm(); }
 function canViewTemplates()   { return state.cu && state.cu.role !== 'client'; }
 
 // Returns the effective role of a user for a given category.
@@ -8529,11 +8552,21 @@ function showModalEditUser(userId) {
     <div class="form-hint">✓ Ολόκληρη = πρόσβαση σε όλα τα έργα της κατηγορίας. Αποεπιλέξτε για να επιλέξετε συγκεκριμένα έργα.</div>
   </div>`;
 
+  const templatesCrmPermissionHtml = state.cu?.role==='admin' && user.role!=='client'
+    ? `<div class="form-group" style="border:1px solid var(--navy-line);border-radius:6px;padding:10px 12px">
+        <label class="form-label" style="display:flex;align-items:flex-start;gap:9px;cursor:pointer;margin:0">
+          <input type="checkbox" id="eu-manage-templates-crm"${user.manageTemplatesAndCrm===true?' checked':''} style="margin-top:2px">
+          <span><strong>Πλήρης διαχείριση Προτύπων και CRM</strong>
+          <span class="form-hint" style="display:block;margin-top:3px">Δημιουργία, επεξεργασία και διαγραφή Προτύπων, Εταιρειών, Επαφών και Προσφορών. Δεν παρέχει πρόσβαση σε αποθηκευμένους κωδικούς.</span></span>
+        </label>
+      </div>`
+    : '';
+
   showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία – ${esc(user.name)}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="eu-name" value="${esc(user.name)}"></div><div class="form-group"><label class="form-label">Username</label><input class="form-control" id="eu-user" value="${esc(user.username)}" autocomplete="off"></div>${isSupabaseAuthMode()
     ? `<div class="form-hint" style="margin-bottom:12px">Ο κωδικός διαχειρίζεται από Supabase Auth και δεν αλλάζει από αυτή τη φόρμα.</div>
        <div class="form-group"><label class="form-label">Email Auth</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}" readonly></div>`
     : `<div class="form-group"><label class="form-label">Νέος Κωδικός (κενό = χωρίς αλλαγή)</label><input class="form-control" type="password" id="eu-pass" placeholder="••••••••" autocomplete="new-password"></div>
-       <div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div>`}<div class="form-group"><label class="form-label">Global Ρόλος</label><select class="form-control" id="eu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}"${k===user.role?' selected':''}>${v.label}</option>`).join('')}</select><div class="form-hint">Ισχύει όπου δεν υπάρχει ειδικός ρόλος κατηγορίας.</div></div>${catRolesHtml}${accessHtml}</div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateUser('${userId}')">Αποθήκευση</button></div>`);
+       <div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div>`}<div class="form-group"><label class="form-label">Global Ρόλος</label><select class="form-control" id="eu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}"${k===user.role?' selected':''}>${v.label}</option>`).join('')}</select><div class="form-hint">Ισχύει όπου δεν υπάρχει ειδικός ρόλος κατηγορίας.</div></div>${catRolesHtml}${accessHtml}${templatesCrmPermissionHtml}</div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateUser('${userId}')">Αποθήκευση</button></div>`);
 }
 window.euToggleCat=function(cb, cid){
   const list=document.getElementById('cap-'+cid); if(!list) return;
@@ -8562,6 +8595,8 @@ window.modalUpdateUser=async function(userId){
     catRoleSelects.forEach(sel=>{ if(sel.value) roles[sel.dataset.cid]=sel.value; });
     user.categoryRoles=roles;
   }
+  const templatesCrmPermission=el('eu-manage-templates-crm');
+  if(templatesCrmPermission) user.manageTemplatesAndCrm=templatesCrmPermission.checked;
   if(state.cu?.id===userId){state.cu={...user};setCurrentUser(state.cu);}
   auditLog('Επεξεργασία χρήστη',user.name);
   await dbSaveUser(user); closeModal(); render(); showToast('Χρήστης αποθηκεύτηκε.','success');
@@ -9532,7 +9567,7 @@ function _crmExtrasCo(co) {
 
 // ── CRM — COMPANIES LIST ───────────────────────────────────────
 function renderCrmCompanies() {
-  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
+  const canEdit = canManageTemplatesAndCrm();
   const q = (state.crmSearch||'').toLowerCase();
   let companies = (state.db.crmCompanies||[]).filter(co=>{
     if (!q) return true;
@@ -9597,7 +9632,7 @@ function renderCrmCompanies() {
 function renderCrmCompany() {
   const co = (state.db.crmCompanies||[]).find(x=>x.id===state.crmCompanyId);
   if (!co) return `<div class="empty-state"><h3>Εταιρεία δεν βρέθηκε</h3></div>`;
-  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
+  const canEdit = canManageTemplatesAndCrm();
   const phones = _crmPhonesList(co);
   const emails = _crmEmailsList(co);
   const addrs  = _crmAddrsList(co);
@@ -9668,7 +9703,7 @@ function renderCrmCompany() {
 
 // ── CRM — CONTACTS LIST ───────────────────────────────────────
 function renderCrmContacts() {
-  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
+  const canEdit = canManageTemplatesAndCrm();
   const q = (state.crmContactSearch||'').toLowerCase();
   let contacts = (state.db.crmContacts||[]).filter(ct=>{
     if (!q) return true;
@@ -9725,7 +9760,7 @@ function renderCrmContacts() {
 function renderCrmContact() {
   const ct = (state.db.crmContacts||[]).find(x=>x.id===state.crmContactId);
   if (!ct) return `<div class="empty-state"><h3>Επαφή δεν βρέθηκε</h3></div>`;
-  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
+  const canEdit = canManageTemplatesAndCrm();
   const phones = _crmPhones(ct);
   const emails = _crmEmails(ct);
   const company = (state.db.crmCompanies||[]).find(co=>co.id===ct.company_id);
@@ -10041,7 +10076,7 @@ window.setTaskRankManual = async function(pid, phid, tid, total) {
 };
 
 function renderOffers() {
-  const canEdit = state.cu && ['admin','management'].includes(state.cu.role);
+  const canEdit = canManageTemplatesAndCrm();
   const q = (state.offersSearch||'').toLowerCase();
   const stFilter    = state.offersStatus||'';
   const fCat        = state.offersFilterCat||'';
@@ -10395,6 +10430,7 @@ window.offerFileClear = async function(oid) {
 // ── CRM — COMPANY MODAL ───────────────────────────────────────
 function showModalCrmCompany(id) {
   const co = id ? (state.db.crmCompanies||[]).find(x=>x.id===id) : null;
+  const canSensitive = canManageSensitiveCrmCredentials();
   const v = k => esc(co?.[k]||'');
   const phones = co?_crmPhonesList(co):[''];
   const emails = co?_crmEmailsList(co):[''];
@@ -10477,6 +10513,7 @@ function showModalCrmCompany(id) {
         '<input class=\\'form-control\\' id=\\'co-tk-'+i+'\\' placeholder=\\'ΤΚ\\'></div>'+
         '<button type=\\'button\\' class=\\'btn btn-ghost btn-sm\\' onclick=\\'this.parentElement.remove()\\' style=\\'font-size:.7rem;margin-top:4px\\'>Αφαίρεση</button></div>')">+ Διεύθυνση</button>
     </div>
+    <div id="crm-company-sensitive-fields">
     <hr style="border:none;border-top:1px solid var(--slate-200);margin:14px 0">
     <div class="form-group"><label class="form-label">🔐 Κωδικοί Πρόσβασης</label>
       <div id="co-extras-wrap">${extrasHtml}</div>
@@ -10489,13 +10526,14 @@ function showModalCrmCompany(id) {
         '<div style=\\'display:grid;grid-template-columns:1fr 1fr;gap:6px\\'>'+
         '<input class=\\'form-control\\' id=\\'co-ex-u-'+i+'\\' placeholder=\\'Username\\' autocomplete=\\'off\\'>'+
         '<input class=\\'form-control\\' id=\\'co-ex-p-'+i+'\\' placeholder=\\'Password\\' type=\\'password\\' autocomplete=\\'new-password\\'></div></div>')">+ Κωδικός</button>
-    </div>
+    </div></div>
     <div class="form-group"><label class="form-label">Σημειώσεις</label><textarea class="form-control" id="co-notes" rows="3">${v('notes')}</textarea></div>
   </div>
   <div class="modal-footer">
     <button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button>
     <button class="btn btn-primary" onclick='modalSaveCrmCompany(${JSON.stringify(id||null)})'>Αποθήκευση</button>
   </div>`);
+  if(!canSensitive) document.getElementById('crm-company-sensitive-fields')?.remove();
 }
 
 window.modalSaveCrmCompany = async function(id) {
@@ -10551,9 +10589,11 @@ window.modalSaveCrmCompany = async function(id) {
     phones_json: phones.length>1?JSON.stringify(phones):null,
     emails_json: emails.length>1?JSON.stringify(emails):null,
     addresses_json: addrs.length>1?JSON.stringify(addrs):null,
-    extra_creds_json: encExtras.length?JSON.stringify(encExtras):null,
     created_at: existing?.created_at||new Date().toISOString(),
   });
+  if(canManageSensitiveCrmCredentials()) {
+    data.extra_creds_json=encExtras.length?JSON.stringify(encExtras):null;
+  }
   // clear legacy credential columns to avoid confusion
   ['taxisnet_username','taxisnet_password','ergani_username','ergani_password',
    'efka_username','efka_password','bank_name','bank_username','bank_password'].forEach(k=>{delete data[k];});
@@ -10571,6 +10611,7 @@ window.modalSaveCrmCompany = async function(id) {
 // ── CRM — CONTACT MODAL ───────────────────────────────────────
 function showModalCrmContact(id) {
   const ct = id ? (state.db.crmContacts||[]).find(x=>x.id===id) : null;
+  const canSensitive = canManageSensitiveCrmCredentials();
   const v = k => esc(ct?.[k]||'');
   const phones = ct?_crmPhones(ct).map((p,i)=>({label:ct[`phone_${i+1}_label`]||'Mobile',value:p})):[{label:'Mobile',value:''}];
   const emails = ct?_crmEmails(ct).map((e,i)=>({label:ct[`email_${i+1}_label`]?.replace(/^\* /,'')||'Work',value:e})):[{label:'Work',value:''}];
@@ -10636,6 +10677,7 @@ function showModalCrmContact(id) {
       <div class="form-group"><label class="form-label">ΑΜΚΑ</label><input class="form-control crm-mono" id="ct-amka" value="${v('amka')}"></div>
     </div>
     <div class="form-group"><label class="form-label">Α.Δ.Τ.</label><input class="form-control crm-mono" id="ct-adt" value="${v('id_number')}"></div>
+    <div id="crm-contact-sensitive-fields">
     <div class="crm-cred-box crm-cred-edit">
       <div class="crm-cred-cat">Taxisnet</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
@@ -10656,13 +10698,14 @@ function showModalCrmContact(id) {
         <input class="form-control" id="ct-hma-u" value="${v('hma_username')}" placeholder="Username" autocomplete="off">
         <input class="form-control" id="ct-hma-p" value="${v('hma_password')}" placeholder="Password" type="password" autocomplete="new-password">
       </div>
-    </div>
+    </div></div>
     <div class="form-group" style="margin-top:14px"><label class="form-label">Σημειώσεις</label><textarea class="form-control" id="ct-notes" rows="3">${v('notes')}</textarea></div>
   </div>
   <div class="modal-footer">
     <button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button>
     <button class="btn btn-primary" onclick='modalSaveCrmContact(${JSON.stringify(id||null)})'>Αποθήκευση</button>
   </div>`);
+  if(!canSensitive) document.getElementById('crm-contact-sensitive-fields')?.remove();
 }
 
 window.modalSaveCrmContact = async function(id) {
@@ -10683,21 +10726,23 @@ window.modalSaveCrmContact = async function(id) {
     if(v){emails.push(v);emailLbls.push(l);}
     ei++;
   }
-  // encrypt taxisnet/hpm/hma passwords server-side before saving
-  const rawCreds = {
-    taxisnet_password: document.getElementById('ct-tx-p')?.value.trim()||null,
-    hpm_password: document.getElementById('ct-hpm-p')?.value.trim()||null,
-    hma_password: document.getElementById('ct-hma-p')?.value.trim()||null,
-  };
-  let encCreds = rawCreds;
-  try {
-    const {data: encData, error: encErr} = await sb.rpc('app_crm_encrypt_credentials', {p_fields: rawCreds});
-    if (encErr) throw encErr;
-    encCreds = encData || rawCreds;
-  } catch(err) {
-    console.error('app_crm_encrypt_credentials error:', err);
-    showToast('Σφάλμα κρυπτογράφησης κωδικών: ' + (err?.message||JSON.stringify(err)), 'error');
-    return;
+  // Only ADMIN/Management may submit encrypted CRM credentials.
+  let encCreds = null;
+  if(canManageSensitiveCrmCredentials()) {
+    const rawCreds = {
+      taxisnet_password: document.getElementById('ct-tx-p')?.value.trim()||null,
+      hpm_password: document.getElementById('ct-hpm-p')?.value.trim()||null,
+      hma_password: document.getElementById('ct-hma-p')?.value.trim()||null,
+    };
+    try {
+      const {data: encData, error: encErr} = await sb.rpc('app_crm_encrypt_credentials', {p_fields: rawCreds});
+      if (encErr) throw encErr;
+      encCreds = encData || rawCreds;
+    } catch(err) {
+      console.error('app_crm_encrypt_credentials error:', err);
+      showToast('Σφάλμα κρυπτογράφησης κωδικών: ' + (err?.message||JSON.stringify(err)), 'error');
+      return;
+    }
   }
   const data = Object.assign({},existing||{},{
     first_name: document.getElementById('ct-fn')?.value.trim()||null,
@@ -10720,15 +10765,19 @@ window.modalSaveCrmContact = async function(id) {
     afm:        document.getElementById('ct-afm')?.value.trim()||null,
     amka:       document.getElementById('ct-amka')?.value.trim()||null,
     id_number:  document.getElementById('ct-adt')?.value.trim()||null,
-    taxisnet_username: document.getElementById('ct-tx-u')?.value.trim()||null,
-    taxisnet_password: encCreds.taxisnet_password ?? null,
-    hpm_username: document.getElementById('ct-hpm-u')?.value.trim()||null,
-    hpm_password: encCreds.hpm_password ?? null,
-    hma_username: document.getElementById('ct-hma-u')?.value.trim()||null,
-    hma_password: encCreds.hma_password ?? null,
     notes: document.getElementById('ct-notes')?.value.trim()||null,
     created_at: existing?.created_at||new Date().toISOString(),
   });
+  if(canManageSensitiveCrmCredentials()) {
+    Object.assign(data, {
+      taxisnet_username: document.getElementById('ct-tx-u')?.value.trim()||null,
+      taxisnet_password: encCreds?.taxisnet_password ?? null,
+      hpm_username: document.getElementById('ct-hpm-u')?.value.trim()||null,
+      hpm_password: encCreds?.hpm_password ?? null,
+      hma_username: document.getElementById('ct-hma-u')?.value.trim()||null,
+      hma_password: encCreds?.hma_password ?? null,
+    });
+  }
   try {
     await crmSaveContact(data);
     closeModal();
