@@ -1883,6 +1883,10 @@ function notebookToInput(value) {
   const pad=n=>String(n).padStart(2,'0');
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+function notebookToDate(value){if(!value)return '';const d=new Date(value);if(Number.isNaN(d.getTime()))return '';const pad=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;}
+function notebookToTime(value){if(!value)return '08:00';const d=new Date(value);if(Number.isNaN(d.getTime()))return '08:00';const pad=n=>String(n).padStart(2,'0');const h=pad(d.getHours());const m=d.getMinutes()<30?'00':'30';return `${h}:${m}`;}
+function nbTimeOpts(sel){const opts=[];for(let h=8;h<=16;h++){for(let m=0;m<60;m+=30){if(h===16&&m>0)break;const hh=String(h).padStart(2,'0');const mm=String(m).padStart(2,'0');const v=`${hh}:${mm}`;opts.push(`<option value="${v}"${sel===v?' selected':''}>${v}</option>`);}}return opts.join('');}
+function notebookFromDatetime(dateVal,timeVal){if(!dateVal||!timeVal)return null;const d=new Date(`${dateVal}T${timeVal}:00`);return Number.isNaN(d.getTime())?null:d.toISOString();}
 
 function notebookFromInput(value) {
   if(!value) return null;
@@ -1911,10 +1915,8 @@ function showNotebookModal(noteId=null) {
     <div class="modal-body">
       <div class="form-group"><label class="form-label" for="nb-title">Τι πρέπει να κάνω <sup>*</sup></label><input class="form-control" id="nb-title" maxlength="180" value="${esc(note?.title||'')}" placeholder="π.χ. Τηλεφώνημα στον προμηθευτή"></div>
       <div class="form-group"><label class="form-label" for="nb-details">Λεπτομέρειες</label><textarea class="form-control" id="nb-details" rows="4" maxlength="3000" placeholder="Πρόσθετες πληροφορίες ή στοιχεία επικοινωνίας…">${esc(note?.details||'')}</textarea></div>
-      <div class="notebook-form-grid">
-        <div class="form-group"><label class="form-label" for="nb-due">Ημερομηνία & ώρα</label><input class="form-control" type="datetime-local" id="nb-due" value="${notebookToInput(note?.dueAt)}"></div>
-        <div class="form-group"><label class="form-label" for="nb-reminder">Υπενθύμιση στο site</label><input class="form-control" type="datetime-local" id="nb-reminder" value="${notebookToInput(note?.reminderAt)}"><div class="form-hint">Εμφανίζεται όσο είστε συνδεδεμένος στο site.</div></div>
-      </div>
+      <div class="form-group"><label class="form-label" for="nb-due-date">Ημερομηνία & ώρα</label><div style="display:flex;gap:8px"><input class="form-control" type="date" id="nb-due-date" value="${notebookToDate(note?.dueAt)}" style="flex:1"><select class="form-control" id="nb-due-time" style="width:110px">${nbTimeOpts(notebookToTime(note?.dueAt))}</select></div></div>
+      <div class="form-group"><label class="form-label" for="nb-reminder-date">Υπενθύμιση στο site</label><div style="display:flex;gap:8px"><input class="form-control" type="date" id="nb-reminder-date" value="${notebookToDate(note?.reminderAt)}" style="flex:1"><select class="form-control" id="nb-reminder-time" style="width:110px">${nbTimeOpts(notebookToTime(note?.reminderAt))}</select></div><div class="form-hint">Εμφανίζεται όσο είστε συνδεδεμένος στο site.</div></div>
       <div class="form-group"><label class="form-label" for="nb-priority">Προτεραιότητα</label><select class="form-control" id="nb-priority"><option value="low"${note?.priority==='low'?' selected':''}>Χαμηλή</option><option value="normal"${!note||note.priority==='normal'?' selected':''}>Κανονική</option><option value="high"${note?.priority==='high'?' selected':''}>Υψηλή</option><option value="critical"${note?.priority==='critical'?' selected':''}>Επείγουσα</option></select></div>
     </div>
     <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="saveNotebookModal('${note?.id||''}')">Αποθήκευση</button></div>`);
@@ -1930,8 +1932,8 @@ window.saveNotebookModal=async function(noteId='') {
     id:noteId||('note_'+uid()),
     title,
     details:(el('nb-details')?.value||'').trim(),
-    dueAt:notebookFromInput(el('nb-due')?.value),
-    reminderAt:notebookFromInput(el('nb-reminder')?.value),
+    dueAt:notebookFromDatetime(el('nb-due-date')?.value,el('nb-due-time')?.value),
+    reminderAt:notebookFromDatetime(el('nb-reminder-date')?.value,el('nb-reminder-time')?.value),
     priority:el('nb-priority')?.value||'normal',
     completed:false,
     createdAt:now,
@@ -3735,10 +3737,12 @@ function renderProject() {
           })()}
           ${(t.subtasks||[]).length?`<div class="subtasks-section"><div class="subtask-label">Υποεργασίες</div>${t.subtasks.map(st=>{
             const srs=st.reviewStatus;
+            const needsReview=!!st.requiresReview;
             const canActSt=unlocked&&!isComp&&canMod&&['project_manager','team_member'].includes(state.cu?.role);
-            const chkDisabled=!canActSt||(srs!=='approved'&&!st.done);
+            const canToggleReview=unlocked&&!isComp&&(isAdminOrMgmt||['project_manager'].includes(state.cu?.role));
+            const chkDisabled=!canActSt||(needsReview&&srs!=='approved'&&!st.done);
             let revHtml='';
-            if(!st.done){
+            if(!st.done&&needsReview){
               if(isAdminOrMgmt&&srs==='pending') revHtml=`<span class="st-review-acts"><button class="btn btn-primary btn-sm" onclick="resolveSubtaskReview('${proj.id}','${ph.id}','${t.id}','${st.id}','approved')">✅ Αποδοχή</button><button class="btn btn-danger btn-sm" onclick="resolveSubtaskReview('${proj.id}','${ph.id}','${t.id}','${st.id}','rejected')">❌ Απόρριψη</button></span>`;
               else if(isAdminOrMgmt&&srs==='approved') revHtml=`<span class="badge badge-green" style="font-size:.6rem;margin-left:6px">Εγκρίθηκε</span>`;
               else if(isAdminOrMgmt&&srs==='rejected') revHtml=`<span class="badge badge-red" style="font-size:.6rem;margin-left:6px">Απορρίφθηκε</span>`;
@@ -3749,7 +3753,8 @@ function renderProject() {
                 else if(srs==='rejected') revHtml=`<span style="font-size:.65rem;color:var(--red);margin-left:6px">❌ Απορρίφθηκε</span><button class="btn btn-ghost btn-sm" style="font-size:.65rem;padding:1px 8px;margin-left:4px" onclick="requestSubtaskReview('${proj.id}','${ph.id}','${t.id}','${st.id}')">↩ Νέο</button>`;
               }
             }
-            return `<div class="subtask-item"><input type="checkbox" class="subtask-check"${st.done?' checked':''}${chkDisabled?' disabled':''} data-action="toggle-subtask" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" data-stid="${st.id}"><span style="${st.done?'text-decoration:line-through;color:var(--slate-400)':''}">${esc(st.name)}</span>${revHtml}</div>`;
+            const reviewBadge=needsReview&&!st.done?`<span style="font-size:.58rem;background:#7c3aed22;color:#7c3aed;padding:1px 5px;border-radius:3px;margin-left:5px;font-weight:600">⚑</span>`:'';
+            return `<div class="subtask-item"><input type="checkbox" class="subtask-check"${st.done?' checked':''}${chkDisabled?' disabled':''} data-action="toggle-subtask" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" data-stid="${st.id}"><span style="${st.done?'text-decoration:line-through;color:var(--slate-400)':''}">${esc(st.name)}</span>${reviewBadge}${revHtml}</div>`;
           }).join('')}</div>`:''}
           ${docsHtml}
           ${(()=>{const rs=t.reviewStatus; const canReqRev=canMod&&['project_manager','team_member'].includes(state.cu?.role);
@@ -3960,7 +3965,7 @@ function renderClientPortalFix8() {
       const pending=requested.filter(d=>!d.done&&d.required).length;
       const isExp=!!state.clientExpanded[t.id];
       const requestedHtml=requested.map(d=>d.done
-        ? `<div class="client-doc-row client-doc-done"><span style="color:var(--green)">✓</span><span style="flex:1;font-size:.78rem">${esc(d.name)}</span><span class="text-sm text-muted">${esc(d.file||'')}</span></div>`
+        ? `<div class="client-doc-row client-doc-done"><span style="color:var(--green)">✓</span><span style="flex:1;font-size:.78rem">${esc(d.name)}</span><span class="text-sm text-muted" style="flex:1">${esc(d.file||'')}</span>${d.clientUploaded?`<button class="btn btn-ghost btn-sm" style="font-size:.7rem;color:var(--red);padding:2px 8px;margin-left:4px" onclick="clientDeleteDoc('${d.id}','${t.id}','${proj.id}')" title="Αφαίρεση αρχείου">🗑 Αφαίρεση</button>`:''}</div>`
         : `<div class="client-doc-row"><span style="color:var(--red)">✱</span><span style="flex:1;font-size:.78rem">${esc(d.name)}</span><label class="btn btn-primary btn-sm" style="cursor:pointer">⬆ Ανέβασμα<input type="file" style="display:none" accept=".pdf,.jpg,.jpeg,.png,.doc,.docx" onchange="clientUploadDoc('${d.id}','${t.id}','${proj.id}',this)"></label></div>`
       ).join('');
       const deliveredHtml=delivered.map(d=>`<div class="client-doc-row client-doc-done"><span style="color:var(--blue)">📄</span><span style="flex:1"><strong style="font-size:.78rem">${esc(d.fileName||'Έγγραφο')}</strong><span class="text-sm text-muted" style="display:block">Παράδοση v${d.version} · ${fmtDT(d.publishedAt)}</span></span><button class="btn btn-secondary btn-sm" data-action="open-client-delivery" data-delivery-id="${d.id}">Προβολή</button><button class="btn btn-ghost btn-sm" data-action="download-client-delivery" data-delivery-id="${d.id}">Λήψη</button></div>`).join('');
@@ -4804,7 +4809,7 @@ function renderTemplateDetail() {
           ${taskArrows}
           <div class="task-status-dot" style="background:var(--slate-400)"></div>
           <div class="task-info"><div class="task-name">${esc(tk.name)}</div><div class="task-meta">${(tk.subtasks||[]).length} υποεργ. · ${(tk.docs||[]).length} έγγρ.</div>
-          ${(tk.subtasks||[]).length?`<div class="tpl-subtasks">${(tk.subtasks||[]).map(st=>`<div class="tpl-subtask-item">◦ ${esc(st.name||st)}</div>`).join('')}</div>`:''}
+          ${(tk.subtasks||[]).length?`<div class="tpl-subtasks">${(tk.subtasks||[]).map(st=>`<div class="tpl-subtask-item">◦ ${esc(st.name||st)}${st.requiresReview?` <span style="font-size:.6rem;background:#7c3aed22;color:#7c3aed;padding:1px 5px;border-radius:3px;margin-left:3px;font-weight:700">⚑</span>`:''}</div>`).join('')}</div>`:''}
           ${tk.notes?`<div class="tpl-task-notes">💬 ${esc(tk.notes)}</div>`:''}</div>
           ${mgmt?`<div style="display:flex;gap:6px;margin-left:auto">
             <button class="btn btn-ghost btn-sm" data-action="modal-add-tpl-doc" data-tid="${tpl.id}" data-phid="${ph.id}" data-tkid="${tk.id}" style="font-size:.7rem">+ Έγγραφο</button>
@@ -7542,11 +7547,14 @@ async function deleteTplPhase(tid,phid) {
 }
 
 // Template tasks
+function tplSubHtml(st){return `<div class="proc-tpl-item" id="tstr-${st.id}" style="display:flex;align-items:center;gap:6px"><label title="Απαιτείται Έλεγχος Διοίκησης" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" class="tst-req-review" data-stid="${st.id}"${st.requiresReview?' checked':''}> ⚑</label><span style="flex:1">${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="tplRemoveSub('${st.id}')">✕</button></div>`;}
+window.tplAddSub=function(){const inp=el('ttk-sub-inp');const name=inp?.value.trim();if(!name)return;const id='ts_'+uid();const rr=el('ttk-sub-review')?.checked||false;const list=el('ttk-sub-list');if(list)list.insertAdjacentHTML('beforeend',tplSubHtml({id,name,requiresReview:rr}));inp.value='';if(el('ttk-sub-review'))el('ttk-sub-review').checked=false;};
+window.tplRemoveSub=function(stid){const row=el('tstr-'+stid);if(row)row.remove();};
 function showModalAddTplTask(tid,phid) {
   showModal(`<div class="modal-header"><div class="modal-title">Νέα Εργασία Προτύπου</div><button class="modal-close" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="ttk-name" placeholder="π.χ. Αίτηση βεβαίωσης"></div>
-    <div class="form-group"><label class="form-label">Υποεργασίες <span class="text-muted" style="font-size:.72rem">(μία ανά γραμμή)</span></label><textarea class="form-control" id="ttk-subs" rows="3" placeholder="Υποεργασία 1&#10;Υποεργασία 2"></textarea></div>
+    <div class="form-group"><label class="form-label">Υποεργασίες</label><div class="form-hint" style="margin-bottom:4px">⚑ = Απαιτείται Έλεγχος Διοίκησης πριν τσεκαριστεί</div><div id="ttk-sub-list"></div><div style="display:flex;gap:6px;margin-top:6px;align-items:center"><input class="form-control" id="ttk-sub-inp" placeholder="Νέα υποεργασία" style="flex:1"><label title="Απαιτείται Έλεγχος" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" id="ttk-sub-review"> ⚑</label><button class="btn btn-secondary btn-sm" onclick="tplAddSub()">+ Προσθήκη</button></div></div>
     <div class="form-group"><label class="form-label">Σχόλια / Οδηγίες</label><textarea class="form-control" id="ttk-notes" rows="3" placeholder="Προαιρετικές οδηγίες ή σημειώσεις για αυτήν την εργασία…"></textarea></div>
   </div>
   <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveTplTask('${tid}','${phid}')">Προσθήκη</button></div>`);
@@ -7554,18 +7562,19 @@ function showModalAddTplTask(tid,phid) {
 window.modalSaveTplTask=async function(tid,phid){
   const tpl=getTemplate(tid); const ph=tpl?.phases.find(p=>p.id===phid); if(!ph) return;
   const name=el('ttk-name').value.trim(); if(!name){alert('Συμπληρώστε τίτλο.');return;}
-  const subs=el('ttk-subs').value.split('\n').map(s=>s.trim()).filter(Boolean).map(s=>({id:'st_'+uid(),name:s,done:false}));
+  const subs=Array.from(document.querySelectorAll('#ttk-sub-list .proc-tpl-item')).map(row=>{const stid=row.id.replace('tstr-','');const nm=row.querySelector('span')?.textContent||'';const rr=row.querySelector('.tst-req-review')?.checked||false;return{id:'st_'+uid(),name:nm,done:false,requiresReview:rr};}).filter(s=>s.name);
   const notes=el('ttk-notes').value.trim();
   ph.tasks.push({id:'ttk_'+uid(),name,subtasks:subs,notes,docs:[]});
   await dbSaveTemplate(tpl); closeModal(); render(); showToast('Εργασία προστέθηκε.','success');
 };
 function showModalEditTplTask(tid,phid,tkid) {
   const tpl=getTemplate(tid); const ph=tpl?.phases.find(p=>p.id===phid); const tk=ph?.tasks.find(t=>t.id===tkid); if(!tk) return;
-  const subsVal=(tk.subtasks||[]).map(s=>s.name).join('\n');
+  const existingSubs=(tk.subtasks||[]).map(s=>({id:s.id||('ts_'+uid()),name:s.name||s,requiresReview:s.requiresReview||false}));
+  const subsHtml=existingSubs.map(s=>tplSubHtml(s)).join('');
   showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Εργασίας</div><button class="modal-close" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="etk-name" value="${esc(tk.name)}"></div>
-    <div class="form-group"><label class="form-label">Υποεργασίες <span class="text-muted" style="font-size:.72rem">(μία ανά γραμμή)</span></label><textarea class="form-control" id="etk-subs" rows="3">${esc(subsVal)}</textarea></div>
+    <div class="form-group"><label class="form-label">Υποεργασίες</label><div class="form-hint" style="margin-bottom:4px">⚑ = Απαιτείται Έλεγχος Διοίκησης πριν τσεκαριστεί</div><div id="ttk-sub-list">${subsHtml}</div><div style="display:flex;gap:6px;margin-top:6px;align-items:center"><input class="form-control" id="ttk-sub-inp" placeholder="Νέα υποεργασία" style="flex:1"><label title="Απαιτείται Έλεγχος" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" id="ttk-sub-review"> ⚑</label><button class="btn btn-secondary btn-sm" onclick="tplAddSub()">+ Προσθήκη</button></div></div>
     <div class="form-group"><label class="form-label">Σχόλια / Οδηγίες</label><textarea class="form-control" id="etk-notes" rows="3" placeholder="Προαιρετικές οδηγίες ή σημειώσεις…">${esc(tk.notes||'')}</textarea></div>
   </div>
   <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateTplTask('${tid}','${phid}','${tkid}')">Αποθήκευση</button></div>`);
@@ -7574,7 +7583,7 @@ window.modalUpdateTplTask=async function(tid,phid,tkid){
   const tpl=getTemplate(tid); const ph=tpl?.phases.find(p=>p.id===phid); const tk=ph?.tasks.find(t=>t.id===tkid); if(!tk) return;
   const name=el('etk-name').value.trim(); if(!name){alert('Συμπληρώστε τίτλο.');return;}
   tk.name=name;
-  tk.subtasks=el('etk-subs').value.split('\n').map(s=>s.trim()).filter(Boolean).map(s=>({id:'st_'+uid(),name:s,done:false}));
+  tk.subtasks=Array.from(document.querySelectorAll('#ttk-sub-list .proc-tpl-item')).map(row=>{const nm=row.querySelector('span')?.textContent||'';const rr=row.querySelector('.tst-req-review')?.checked||false;return{id:'st_'+uid(),name:nm,done:false,requiresReview:rr};}).filter(s=>s.name);
   tk.notes=el('etk-notes').value.trim();
   await dbSaveTemplate(tpl); closeModal(); render(); showToast('Εργασία ενημερώθηκε.','success');
 };
@@ -7634,7 +7643,7 @@ window.modalSaveProject=async function(catId){
   const tpl=tplId?getTemplate(tplId):null;
   let phases=[];
   if (tpl?.phases?.length) {
-    phases=tpl.phases.map((tph,pi)=>({id:'ph_'+uid(),name:tph.name,order:pi+1,tasks:(tph.tasks||[]).map(tt=>({id:'task_'+uid(),name:tt.name,assigneeId:managerIds[0]||null,status:'not_started',parallel:false,dependsOn:[],startDate:null,completedDate:null,plannedStart:null,plannedEnd:null,subtasks:(tt.subtasks||[]).map(sn=>({id:'st_'+uid(),name:sn.name||sn,done:false})),docs:(tt.docs||[]).map(d=>({id:'d_'+uid(),cat:d.cat,name:d.name,required:d.required!==false,done:false,type:d.type||'client',url:null,at:null}))}))}));
+    phases=tpl.phases.map((tph,pi)=>({id:'ph_'+uid(),name:tph.name,order:pi+1,tasks:(tph.tasks||[]).map(tt=>({id:'task_'+uid(),name:tt.name,assigneeId:managerIds[0]||null,status:'not_started',parallel:false,dependsOn:[],startDate:null,completedDate:null,plannedStart:null,plannedEnd:null,subtasks:(tt.subtasks||[]).map(sn=>({id:'st_'+uid(),name:sn.name||sn,done:false,requiresReview:sn.requiresReview||false})),docs:(tt.docs||[]).map(d=>({id:'d_'+uid(),cat:d.cat,name:d.name,required:d.required!==false,done:false,type:d.type||'client',url:null,at:null}))}))}));
   }
   const clientId=el('np-clientid').value; const clientName=el('np-client').value.trim()||(clientId?getUser(clientId)?.name:'')||'';
   const proj={id:'proj_'+uid(),categoryId:catId,code:el('np-code').value.trim(),name,clientId:clientId||null,clientName,managerIds,memberIds:[],status:'in_progress',startDate:el('np-start').value||today(),endDate:el('np-end')?.value||null,completedDate:null,phases};
@@ -7769,7 +7778,7 @@ function showModalEditTask(pid,phid,tid) {
   const otherTasks=(ph.tasks||[]).filter(t=>t.id!==tid);
   const curDeps=task.dependsOn||[];
   window._editTaskCtx={pid,phid,tid};
-  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Εργασίας</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος</label><input class="form-control" id="et-name" value="${esc(task.name)}"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="et-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}"${u.id===task.assigneeId?' selected':''}>${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="et-parallel" style="margin-right:6px"${task.parallel?' checked':''}>Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="et-dep-ck" value="${t.id}"${curDeps.includes(t.id)?' checked':''}> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-enforce-deps"${task.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Προγρ. Έναρξη</label><input type="date" class="form-control" id="et-pstart" value="${task.plannedStart||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Έναρξης</label><input type="time" class="form-control" id="et-stime" lang="en-GB" value="${task.startTime||'08:00'}"></div><div class="form-group"><label class="form-label">📅 Προγρ. Λήξη</label><input type="date" class="form-control" id="et-pend" value="${task.plannedEnd||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Λήξης</label><input type="time" class="form-control" id="et-etime" lang="en-GB" value="${task.endTime||'16:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Έναρξη</label><input type="date" class="form-control" id="et-start" value="${task.startDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Έναρξης</label><input type="time" class="form-control" id="et-atime" lang="en-GB" value="${task.actualStartTime||'08:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Ολοκλήρωση</label><input type="date" class="form-control" id="et-comp" value="${task.completedDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Ολοκλήρωσης</label><input type="time" class="form-control" id="et-ctime" lang="en-GB" value="${task.actualEndTime||'16:00'}"></div></div><div class="form-group"><label class="form-label">Υποεργασίες</label><div id="et-sub-list">${(task.subtasks||[]).map(st=>`<div class="proc-tpl-item" id="str-${st.id}"><span>${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`).join('')}</div><div style="display:flex;gap:8px;margin-top:8px"><input class="form-control" id="et-sub" placeholder="Νέα υποεργασία"><button class="btn btn-secondary btn-sm" onclick="modalAddSubtask()">+ Προσθήκη</button></div></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-mgmt-check" style="margin-right:2px"${task.mgmtCheck?' checked':''}>⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div><hr class="divider"><button class="btn btn-danger btn-sm" onclick="modalRemoveTask()">Αφαίρεση Εργασίας</button></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateTask()">Αποθήκευση</button></div>`);
+  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Εργασίας</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος</label><input class="form-control" id="et-name" value="${esc(task.name)}"></div><div class="form-group"><label class="form-label">Υπεύθυνος</label><select class="form-control" id="et-assignee"><option value="">— Χωρίς ανάθεση —</option>${members.map(u=>`<option value="${u.id}"${u.id===task.assigneeId?' selected':''}>${esc(u.name)}</option>`).join('')}</select></div>${membersHtml}<div class="form-group"><label class="form-label" style="cursor:pointer"><input type="checkbox" id="et-parallel" style="margin-right:6px"${task.parallel?' checked':''}>Παράλληλη εκτέλεση</label></div>${otherTasks.length?`<div class="form-group"><label class="form-label">Εξαρτάται από</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:160px;overflow-y:auto">${otherTasks.map(t=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="et-dep-ck" value="${t.id}"${curDeps.includes(t.id)?' checked':''}> ${esc(t.name)}</label>`).join('')}</div></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-enforce-deps"${task.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων</label><div class="form-hint">Κλειδώνει την εργασία μέχρι να ολοκληρωθούν οι εξαρτήσεις.</div></div>`:''}<div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Προγρ. Έναρξη</label><input type="date" class="form-control" id="et-pstart" value="${task.plannedStart||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Έναρξης</label><input type="time" class="form-control" id="et-stime" lang="en-GB" value="${task.startTime||'08:00'}"></div><div class="form-group"><label class="form-label">📅 Προγρ. Λήξη</label><input type="date" class="form-control" id="et-pend" value="${task.plannedEnd||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Λήξης</label><input type="time" class="form-control" id="et-etime" lang="en-GB" value="${task.endTime||'16:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Έναρξη</label><input type="date" class="form-control" id="et-start" value="${task.startDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Έναρξης</label><input type="time" class="form-control" id="et-atime" lang="en-GB" value="${task.actualStartTime||'08:00'}"></div><div class="form-group"><label class="form-label">Πραγμ. Ολοκλήρωση</label><input type="date" class="form-control" id="et-comp" value="${task.completedDate||''}"></div><div class="form-group"><label class="form-label">⏰ Ώρα Πραγμ. Ολοκλήρωσης</label><input type="time" class="form-control" id="et-ctime" lang="en-GB" value="${task.actualEndTime||'16:00'}"></div></div><div class="form-group"><label class="form-label">Υποεργασίες</label><div class="form-hint" style="margin-bottom:4px">⚑ = Απαιτείται Έλεγχος Διοίκησης πριν τσεκαριστεί</div><div id="et-sub-list">${(task.subtasks||[]).map(st=>`<div class="proc-tpl-item" id="str-${st.id}" style="display:flex;align-items:center;gap:6px"><label title="Απαιτείται Έλεγχος Διοίκησης" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" class="st-req-review" data-stid="${st.id}"${st.requiresReview?' checked':''}> ⚑</label><span style="flex:1">${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`).join('')}</div><div style="display:flex;gap:6px;margin-top:8px;align-items:center"><input class="form-control" id="et-sub" placeholder="Νέα υποεργασία" style="flex:1"><label title="Απαιτείται Έλεγχος Διοίκησης" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" id="et-sub-review"> ⚑</label><button class="btn btn-secondary btn-sm" onclick="modalAddSubtask()">+ Προσθήκη</button></div></div><div class="form-group" style="border:1px solid #7c3aed33;border-radius:6px;padding:10px 14px;background:#f5f3ff"><label class="form-label" style="cursor:pointer;color:#7c3aed;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-mgmt-check" style="margin-right:2px"${task.mgmtCheck?' checked':''}>⚑ Απαιτείται Έλεγχος από Διοίκηση</label></div><hr class="divider"><button class="btn btn-danger btn-sm" onclick="modalRemoveTask()">Αφαίρεση Εργασίας</button></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateTask()">Αποθήκευση</button></div>`);
   const mgmtField=el('et-mgmt-check')?.closest('.form-group');
   if(mgmtField){
     mgmtField.insertAdjacentHTML('beforebegin',`<div class="form-group" style="border:1px solid #dc262633;border-radius:6px;padding:10px 14px;background:#fef2f2"><label class="form-label" style="cursor:${canSetTaskUrgent(proj,task)?'pointer':'not-allowed'};color:#b91c1c;font-weight:700;display:flex;align-items:center;gap:8px"><input type="checkbox" id="et-urgent"${task.urgent?' checked':''}${canSetTaskUrgent(proj,task)?'':' disabled'}>⚡ Επείγουσα εργασία</label><div class="form-hint">Μπορεί να αλλάξει μόνο ο Υπεύθυνος Έργου ή ο Υπεύθυνος Εργασίας. Δεν επηρεάζει τη σειρά.</div></div>`);
@@ -7781,9 +7790,10 @@ function showModalEditTask(pid,phid,tid) {
 window.modalAddSubtask=async function(){
   const name=el('et-sub')?.value.trim(); if(!name) return;
   const {pid,phid,tid}=window._editTaskCtx||{}; const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); if(!task) return;
-  const st={id:'st_'+uid(),name,done:false}; task.subtasks.push(st); await dbSaveProject(proj);
-  const list=el('et-sub-list'); if(list) list.insertAdjacentHTML('beforeend',`<div class="proc-tpl-item" id="str-${st.id}"><span>${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`);
-  el('et-sub').value='';
+  const requiresReview=el('et-sub-review')?.checked||false;
+  const st={id:'st_'+uid(),name,done:false,requiresReview}; task.subtasks.push(st); await dbSaveProject(proj);
+  const list=el('et-sub-list'); if(list) list.insertAdjacentHTML('beforeend',`<div class="proc-tpl-item" id="str-${st.id}" style="display:flex;align-items:center;gap:6px"><label title="Απαιτείται Έλεγχος Διοίκησης" style="display:flex;align-items:center;gap:3px;cursor:pointer;font-size:.78rem;color:#7c3aed;white-space:nowrap;font-weight:600"><input type="checkbox" class="st-req-review" data-stid="${st.id}"${requiresReview?' checked':''}> ⚑</label><span style="flex:1">${esc(st.name)}</span><button class="btn btn-danger btn-icon btn-sm" onclick="modalRemoveSubtask('${st.id}')">✕</button></div>`);
+  el('et-sub').value=''; if(el('et-sub-review')) el('et-sub-review').checked=false;
 };
 window.modalRemoveSubtask=async function(stid){
   const {pid,phid,tid}=window._editTaskCtx||{}; const proj=getProject(pid); const ph=proj?.phases.find(p=>p.id===phid); const task=ph?.tasks.find(t=>t.id===tid); if(!task) return;
@@ -7803,6 +7813,7 @@ window.modalUpdateTask=async function(){
   task.startTime=el('et-stime')?.value||null; task.endTime=el('et-etime')?.value||null;
   task.startDate=el('et-start').value||null; task.actualStartTime=el('et-atime')?.value||null; task.completedDate=el('et-comp').value||null; task.actualEndTime=el('et-ctime')?.value||null;
   task.mgmtCheck=el('et-mgmt-check')?.checked||false;
+  document.querySelectorAll('.st-req-review').forEach(ck=>{const st=(task.subtasks||[]).find(s=>s.id===ck.dataset.stid);if(st) st.requiresReview=ck.checked;});
   task.priority=el('et-priority')?.value||'normal';
   task.estimatedHours = parseFloat(el('et-est-hours')?.value)||null;
   task.recurrence = el('et-recurrence')?.value||null;
@@ -9015,6 +9026,43 @@ window.clientUploadDoc=async function(docId,taskId,projId,inputEl){
     showToast('Το αρχείο ανέβηκε επιτυχώς! ✓','success');
   }catch(e){
     showToast('Σφάλμα: '+(e.message||e),'error');
+  }
+};
+
+// ── CLIENT DOCUMENT DELETE ────────────────────────────────────────
+window.clientDeleteDoc=async function(docId,taskId,projId){
+  if(!confirm('Σίγουρα θέλετε να αφαιρέσετε το αρχείο; Θα μπορείτε να ανεβάσετε νέο.')) return;
+  const proj=getProject(projId); if(!proj) return;
+
+  let targetDoc=null, targetPhase=null;
+  outer:for(const ph of proj.phases||[]){
+    for(const t of ph.tasks||[]){
+      const d=(t.docs||[]).find(x=>x.id===docId);
+      if(d){targetDoc=d;targetPhase=ph;break outer;}
+    }
+  }
+  if(!targetDoc||!targetPhase){showToast('Δεν βρέθηκε έγγραφο.','error');return;}
+
+  try{
+    if(isSupabaseAuthMode()){
+      await secureProjectRpc('app_document_client_reset',{
+        p_project_id:projId,p_phase_id:targetPhase.id,
+        p_task_id:taskId,p_document_id:docId
+      },projId);
+      // Προσπάθεια διαγραφής από Storage (όχι κρίσιμο αν αποτύχει)
+      sb.storage.from(BUCKET).remove([docId]).catch(()=>{});
+    } else {
+      targetDoc.done=false;
+      targetDoc.file=null;
+      targetDoc.url=null;
+      targetDoc.doneAt=null;
+      targetDoc.clientUploaded=false;
+      await dbSaveProject(proj);
+    }
+    render();
+    showToast('Το αρχείο αφαιρέθηκε. Μπορείτε να ανεβάσετε νέο.','success');
+  }catch(e){
+    showToast('Σφάλμα αφαίρεσης: '+(e.message||e),'error');
   }
 };
 
