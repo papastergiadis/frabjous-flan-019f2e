@@ -209,7 +209,7 @@ async function fetchTimesheetRowsForBilling(projectId,dateFrom,dateTo){
 async function loadFromDB() {
   try {
     if (isSupabaseAuthMode()) {
-      const [u, c, p, a, t, ts, tc, cc, comp, cont, off, notif, deliveries] = await Promise.all([
+      const [u, c, p, a, t, ts, tc, cc, comp, cont, off, notif, deliveries, mtg] = await Promise.all([
         sb.rpc('app_user_directory'),
         sb.from('be_categories').select('data'),
         sb.from('be_projects').select('data'),
@@ -224,6 +224,7 @@ async function loadFromDB() {
         sb.rpc('app_notifications_list',{p_limit:50}),
         Promise.resolve(sb.rpc('app_client_deliveries_list',{p_project_id:null}))
           .catch(error=>({data:[],error:null,_deliveryError:error})),
+        sb.from('be_meetings').select('data').order('id', {ascending:false}),
       ]);
 
       for (const [label,res] of Object.entries({
@@ -269,10 +270,11 @@ async function loadFromDB() {
           version:Number(r.version||1), publishedAt:r.published_at,
           publishedBy:r.published_by, active:r.active!==false
         })),
+        meetings: (mtg.data||[]).map(r=>r.data).filter(Boolean),
       };
     } else {
       // Temporary legacy loader for users not yet migrated to Supabase Auth.
-      const [u, c, p, a, t, ts, cc, comp, cont, off] = await Promise.all([
+      const [u, c, p, a, t, ts, cc, comp, cont, off, mtg] = await Promise.all([
         sb.from('be_users').select('data'),
         sb.from('be_categories').select('data'),
         sb.from('be_projects').select('data'),
@@ -283,6 +285,7 @@ async function loadFromDB() {
         sb.from('companies').select('*').is('deleted_at', null).order('company_name').limit(10000),
         sb.from('contacts').select('*').is('deleted_at', null).order('last_name').limit(10000),
         sb.from('be_offers').select('data').order('id', {ascending:false}),
+        sb.from('be_meetings').select('data').order('id', {ascending:false}),
       ]);
 
       for (const [label,res] of Object.entries({
@@ -306,6 +309,7 @@ async function loadFromDB() {
         offers:          (off.data||[]).map(r=>r.data),
         notifications:   [],
         clientDeliveries: [],
+        meetings:        (mtg.data||[]).map(r=>r.data).filter(Boolean),
       };
 
       // SECURITY: never auto-seed demo credentials in production.
@@ -429,12 +433,45 @@ async function dbDeleteCategory(cid) {
   await sb.from('be_categories').delete().eq('id', cid);
 }
 async function dbSaveClientCalEntry(entry) {
-  const {error} = await sb.from('be_client_calendar').upsert({id:entry.id, data:entry});
-  if (error) { showToast('Σφάλμα αποθήκευσης εγγραφής.','error'); throw error; }
+  if (isSupabaseAuthMode()) {
+    const {error} = await sb.rpc('app_ccal_save', {p_id: entry.id, p_data: entry});
+    if (error) { showToast('Σφάλμα αποθήκευσης εγγραφής.','error'); throw error; }
+  } else {
+    const {error} = await sb.from('be_client_calendar').upsert({id:entry.id, data:entry});
+    if (error) { showToast('Σφάλμα αποθήκευσης εγγραφής.','error'); throw error; }
+  }
 }
 async function dbDeleteClientCalEntry(entryId) {
-  const {error} = await sb.from('be_client_calendar').delete().eq('id',entryId);
-  if (error) { showToast('Σφάλμα διαγραφής εγγραφής.','error'); throw error; }
+  if (isSupabaseAuthMode()) {
+    const {error} = await sb.rpc('app_ccal_delete', {p_id: entryId});
+    if (error) { showToast('Σφάλμα διαγραφής εγγραφής.','error'); throw error; }
+  } else {
+    const {error} = await sb.from('be_client_calendar').delete().eq('id',entryId);
+    if (error) { showToast('Σφάλμα διαγραφής εγγραφής.','error'); throw error; }
+  }
+}
+
+// ── MEETINGS DB ───────────────────────────────────────────────────
+async function dbSaveMeeting(meeting) {
+  if (isSupabaseAuthMode()) {
+    const {error} = await sb.rpc('app_meeting_save', {p_id: meeting.id, p_data: meeting});
+    if (error) { showToast('Σφάλμα αποθήκευσης συνάντησης.','error'); throw error; }
+  } else {
+    const {error} = await sb.from('be_meetings').upsert({id: meeting.id, data: meeting});
+    if (error) { showToast('Σφάλμα αποθήκευσης συνάντησης.','error'); throw error; }
+  }
+  const idx = (state.db.meetings||[]).findIndex(m=>m.id===meeting.id);
+  if (idx>=0) state.db.meetings[idx]=meeting; else (state.db.meetings=state.db.meetings||[]).unshift(meeting);
+}
+async function dbDeleteMeeting(meetingId) {
+  if (isSupabaseAuthMode()) {
+    const {error} = await sb.rpc('app_meeting_delete', {p_id: meetingId});
+    if (error) { showToast('Σφάλμα διαγραφής συνάντησης.','error'); throw error; }
+  } else {
+    const {error} = await sb.from('be_meetings').delete().eq('id', meetingId);
+    if (error) { showToast('Σφάλμα διαγραφής συνάντησης.','error'); throw error; }
+  }
+  state.db.meetings = (state.db.meetings||[]).filter(m=>m.id!==meetingId);
 }
 
 // ── CRM DB ────────────────────────────────────────────────────────
@@ -1001,6 +1038,40 @@ function initProjectsRealtime() {
     .subscribe();
 }
 
+let _meetingsRealtimeChannel = null;
+function initMeetingsRealtime() {
+  if (_meetingsRealtimeChannel || !isSupabaseAuthMode()) return;
+  _meetingsRealtimeChannel = sb.channel('be-meetings-realtime')
+    .on('postgres_changes', {event:'*', schema:'public', table:'be_meetings'}, async (payload) => {
+      if (payload.eventType === 'DELETE') {
+        const deletedId = payload.old?.id;
+        if (deletedId) {
+          state.db.meetings = (state.db.meetings||[]).filter(m=>m.id!==deletedId);
+          if (state.view==='calendar') render();
+        }
+        return;
+      }
+      // Re-fetch the updated row to get latest data
+      const rowId = payload.new?.id; if (!rowId) return;
+      try {
+        const {data} = await sb.from('be_meetings').select('data').eq('id', rowId).single();
+        const mtg = data?.data; if (!mtg) return;
+        const wasKnown = (state.db.meetings||[]).some(m=>m.id===mtg.id);
+        const idx = (state.db.meetings||[]).findIndex(m=>m.id===mtg.id);
+        if (idx>=0) state.db.meetings[idx]=mtg; else (state.db.meetings=state.db.meetings||[]).unshift(mtg);
+        // Notify if the current user was just added as attendee and didn't create it
+        const cu = state.cu;
+        if (cu && !wasKnown && mtg.organizerId !== cu.id && (mtg.attendeeIds||[]).includes(cu.id)) {
+          const dateLabel = mtg.date ? ` · ${mtg.date}` : '';
+          const timeLabel = mtg.time ? ` ${mtg.time}` : '';
+          showToast(`🤝 Νέα συνάντηση: ${mtg.title}${dateLabel}${timeLabel}`, 'info');
+        }
+        if (state.view==='calendar') render();
+      } catch(e) { console.error('Meetings realtime error:', e); }
+    })
+    .subscribe();
+}
+
 function cleanupPresence() {
   if (_presenceChannel) {
     sb.removeChannel(_presenceChannel);
@@ -1167,18 +1238,10 @@ function canModifyProject(proj) {
   return false;
 }
 
-// Team members see only tasks assigned to them, and only when it's their turn
-// (i.e. all preceding tasks in the phase are terminal: completed/cancelled/not_required)
+// Team members (globally or per-category) see only tasks assigned to them
 function visibleTasksInPhase(phase, catId) {
   const tasks = phase.tasks || [];
-  if (cuEffectiveRole(catId) === 'team_member') {
-    const myId = state.cu.id;
-    return tasks.filter((t, idx) => {
-      const isMine = t.assigneeId === myId || (t.memberIds||[]).includes(myId);
-      if (!isMine) return false;
-      return tasks.slice(0, idx).every(prev => TERMINAL_TASK_STATUSES.has(prev.status));
-    });
-  }
+  if (cuEffectiveRole(catId) === 'team_member') return tasks.filter(t => t.assigneeId === state.cu.id || (t.memberIds||[]).includes(state.cu.id));
   return tasks;
 }
 
@@ -1916,6 +1979,175 @@ function notebookPriorityInfo(priority) {
     critical:{label:'Επείγουσα',cls:'critical'},
   }[priority]||{label:'Κανονική',cls:'normal'};
 }
+
+// ══ MEETINGS ══════════════════════════════════════════════════════════════════
+
+function showModalAddMeeting(prefillDate=null) {
+  if (!state.cu || state.cu.role==='client') return;
+  const users = sortByName(state.db.users.filter(u=>u.role!=='client'));
+  const projects = visibleProjects().filter(p=>p.status!=='completed');
+  const dateVal = prefillDate || today();
+  showModal(`<div class="modal-header"><div class="modal-title">🤝 Νέα Συνάντηση</div><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="mtg-title" placeholder="π.χ. Συνάντηση προόδου"></div>
+      <div class="modal-date-grid">
+        <div class="form-group"><label class="form-label">📅 Ημερομηνία <sup>*</sup></label><input type="date" class="form-control" id="mtg-date" value="${dateVal}"></div>
+        <div class="form-group"><label class="form-label">⏰ Ώρα</label><input type="time" class="form-control" id="mtg-time" value="10:00"></div>
+      </div>
+      <div class="form-group"><label class="form-label">⏱ Διάρκεια (λεπτά)</label><select class="form-control" id="mtg-duration"><option value="">—</option><option value="15">15 λεπτά</option><option value="30">30 λεπτά</option><option value="45">45 λεπτά</option><option value="60" selected>1 ώρα</option><option value="90">1,5 ώρα</option><option value="120">2 ώρες</option><option value="180">3 ώρες</option></select></div>
+      <div class="form-group"><label class="form-label">📍 Τόπος</label><input class="form-control" id="mtg-location" placeholder="π.χ. Γραφείο, Zoom, κλπ."></div>
+      <div class="form-group"><label class="form-label">🗂 Σχετικό Έργο (προαιρετικό)</label><select class="form-control" id="mtg-project"><option value="">— Χωρίς σύνδεση —</option>${projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="form-group"><label class="form-label">👥 Συμμετέχοντες</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:180px;overflow-y:auto">${users.map(u=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="mtg-attendee-cb" value="${u.id}"${u.id===state.cu.id?' checked disabled':''}> ${esc(u.name)} <span class="text-muted" style="font-size:.75rem">(${ROLE_INFO[u.role]?.label||u.role})</span></label>`).join('')}</div><div class="form-hint">Εσείς συμπεριλαμβάνεστε αυτόματα ως διοργανωτής.</div></div>
+      <div class="form-group"><label class="form-label">📝 Σημειώσεις</label><textarea class="form-control" id="mtg-notes" rows="2" placeholder="Θέματα συζήτησης, οδηγίες…"></textarea></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveMeeting()">Αποθήκευση</button></div>`);
+}
+
+window.modalSaveMeeting = async function(meetingId=null) {
+  const title = (el('mtg-title')?.value||'').trim();
+  if (!title) { alert('Συμπληρώστε τίτλο.'); return; }
+  const dateVal = el('mtg-date')?.value;
+  if (!dateVal) { alert('Επιλέξτε ημερομηνία.'); return; }
+  const attendeeCbs = Array.from(document.querySelectorAll('.mtg-attendee-cb:checked')).map(c=>c.value);
+  // Always include organizer
+  const organizerId = state.cu.id;
+  const attendeeIds = [...new Set([organizerId, ...attendeeCbs])];
+  const mtg = {
+    id: meetingId || ('mtg_' + uid()),
+    title,
+    date: dateVal,
+    time: el('mtg-time')?.value || '',
+    duration: el('mtg-duration')?.value ? Number(el('mtg-duration').value) : null,
+    location: (el('mtg-location')?.value||'').trim(),
+    projectId: el('mtg-project')?.value || null,
+    organizerId,
+    attendeeIds,
+    notes: (el('mtg-notes')?.value||'').trim(),
+    status: 'scheduled',
+    createdAt: meetingId ? undefined : new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  if (meetingId) {
+    const existing = (state.db.meetings||[]).find(m=>m.id===meetingId);
+    if (existing) mtg.createdAt = existing.createdAt;
+  }
+  await dbSaveMeeting(mtg);
+  closeModal();
+  if (state.view==='calendar') render();
+  showToast('Συνάντηση αποθηκεύτηκε.', 'success');
+};
+
+function showModalViewMeeting(meetingId) {
+  const mtg = (state.db.meetings||[]).find(m=>m.id===meetingId);
+  if (!mtg) return;
+  const canEdit = state.cu && (state.cu.id===mtg.organizerId || ['admin','management'].includes(state.cu.role));
+  const proj = mtg.projectId ? (state.db.projects||[]).find(p=>p.id===mtg.projectId) : null;
+  const organizer = getUser(mtg.organizerId);
+  const attendeeNames = (mtg.attendeeIds||[]).map(id=>{const u=getUser(id);return u?esc(u.name):null;}).filter(Boolean);
+  const dateLabel = mtg.date ? fmt(mtg.date) : '—';
+  const timeLabel = mtg.time ? mtg.time : '';
+  const durLabel = mtg.duration ? `(${mtg.duration >= 60 ? Math.floor(mtg.duration/60)+'ω'+(mtg.duration%60?mtg.duration%60+'λ':'') : mtg.duration+'λ'})` : '';
+  showModal(`<div class="modal-header"><div class="modal-title">🤝 ${esc(mtg.title)}</div><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div style="display:grid;gap:10px">
+        <div style="display:flex;align-items:center;gap:8px;font-size:.95rem"><span style="opacity:.6;min-width:80px;font-size:.8rem">📅 Ημ/νία</span><strong>${dateLabel}${timeLabel?' · '+timeLabel:''} ${durLabel}</strong></div>
+        ${mtg.location?`<div style="display:flex;align-items:center;gap:8px;font-size:.9rem"><span style="opacity:.6;min-width:80px;font-size:.8rem">📍 Τόπος</span>${esc(mtg.location)}</div>`:''}
+        ${proj?`<div style="display:flex;align-items:center;gap:8px;font-size:.9rem"><span style="opacity:.6;min-width:80px;font-size:.8rem">🗂 Έργο</span>${esc(proj.name)}</div>`:''}
+        <div style="display:flex;align-items:start;gap:8px;font-size:.9rem"><span style="opacity:.6;min-width:80px;font-size:.8rem">👤 Διοργ.</span>${esc(organizer?.name||mtg.organizerId)}</div>
+        <div style="display:flex;align-items:start;gap:8px;font-size:.9rem"><span style="opacity:.6;min-width:80px;font-size:.8rem">👥 Συμμετ.</span><div>${attendeeNames.join('<br>')}</div></div>
+        ${mtg.notes?`<div style="margin-top:6px;padding:10px 14px;background:var(--slate-50,#f8fafc);border-radius:6px;font-size:.88rem;white-space:pre-wrap">${esc(mtg.notes)}</div>`:''}
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" data-action="export-meeting-ics" data-mid="${mtg.id}">⬇ .ics</button>
+      ${canEdit?`<button class="btn btn-ghost" onclick="closeModal();showModalEditMeeting('${mtg.id}')">✏ Επεξεργασία</button><button class="btn btn-danger" onclick="closeModal();deleteMeeting('${mtg.id}')">Διαγραφή</button>`:''}
+      <button class="btn btn-secondary" onclick="closeModal()">Κλείσιμο</button>
+    </div>`);
+}
+
+function showModalEditMeeting(meetingId) {
+  const mtg = (state.db.meetings||[]).find(m=>m.id===meetingId);
+  if (!mtg) return;
+  const canEdit = state.cu && (state.cu.id===mtg.organizerId || ['admin','management'].includes(state.cu.role));
+  if (!canEdit) { showToast('Δεν μπορείτε να επεξεργαστείτε αυτή τη συνάντηση.','error'); return; }
+  const users = sortByName(state.db.users.filter(u=>u.role!=='client'));
+  const projects = visibleProjects().filter(p=>p.status!=='completed');
+  const durationOpts = [15,30,45,60,90,120,180];
+  showModal(`<div class="modal-header"><div class="modal-title">🤝 Επεξεργασία Συνάντησης</div><button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="mtg-title" value="${esc(mtg.title)}"></div>
+      <div class="modal-date-grid">
+        <div class="form-group"><label class="form-label">📅 Ημερομηνία <sup>*</sup></label><input type="date" class="form-control" id="mtg-date" value="${mtg.date||''}"></div>
+        <div class="form-group"><label class="form-label">⏰ Ώρα</label><input type="time" class="form-control" id="mtg-time" value="${mtg.time||''}"></div>
+      </div>
+      <div class="form-group"><label class="form-label">⏱ Διάρκεια (λεπτά)</label><select class="form-control" id="mtg-duration"><option value="">—</option>${durationOpts.map(v=>`<option value="${v}"${mtg.duration===v?' selected':''}>${v<60?v+' λεπτά':v===60?'1 ώρα':v===90?'1,5 ώρα':(v/60)+' ώρες'}</option>`).join('')}</select></div>
+      <div class="form-group"><label class="form-label">📍 Τόπος</label><input class="form-control" id="mtg-location" value="${esc(mtg.location||'')}"></div>
+      <div class="form-group"><label class="form-label">🗂 Σχετικό Έργο</label><select class="form-control" id="mtg-project"><option value="">— Χωρίς —</option>${projects.map(p=>`<option value="${p.id}"${p.id===mtg.projectId?' selected':''}>${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="form-group"><label class="form-label">👥 Συμμετέχοντες</label><div style="border:1px solid var(--navy-line);border-radius:6px;padding:8px 12px;max-height:180px;overflow-y:auto">${users.map(u=>`<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer"><input type="checkbox" class="mtg-attendee-cb" value="${u.id}"${(mtg.attendeeIds||[]).includes(u.id)?' checked':''}${u.id===mtg.organizerId?' disabled':''}> ${esc(u.name)} <span class="text-muted" style="font-size:.75rem">(${ROLE_INFO[u.role]?.label||u.role})</span></label>`).join('')}</div></div>
+      <div class="form-group"><label class="form-label">📝 Σημειώσεις</label><textarea class="form-control" id="mtg-notes" rows="2">${esc(mtg.notes||'')}</textarea></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalSaveMeeting('${meetingId}')">Αποθήκευση</button></div>`);
+}
+
+async function deleteMeeting(meetingId) {
+  const mtg = (state.db.meetings||[]).find(m=>m.id===meetingId);
+  if (!mtg) return;
+  if (!confirm(`Διαγραφή συνάντησης "${mtg.title}";`)) return;
+  await dbDeleteMeeting(meetingId);
+  if (state.view==='calendar') render();
+  showToast('Συνάντηση διαγράφηκε.', 'success');
+}
+
+function exportMeetingIcs(meetingId) {
+  const mtg = (state.db.meetings||[]).find(m=>m.id===meetingId);
+  if (!mtg) return;
+  const pad = n => String(n).padStart(2,'0');
+  const toIcsDate = (dateStr, timeStr) => {
+    if (!dateStr) return null;
+    const d = new Date(dateStr + (timeStr ? 'T'+timeStr+':00' : 'T00:00:00'));
+    if (isNaN(d)) return null;
+    return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
+  };
+  const dtStart = toIcsDate(mtg.date, mtg.time);
+  if (!dtStart) { showToast('Δεν υπάρχει ημερομηνία για εξαγωγή.','error'); return; }
+  let dtEnd = dtStart;
+  if (mtg.duration) {
+    const endMs = new Date(mtg.date + 'T' + (mtg.time||'00:00') + ':00').getTime() + mtg.duration * 60000;
+    const e = new Date(endMs);
+    dtEnd = `${e.getFullYear()}${pad(e.getMonth()+1)}${pad(e.getDate())}T${pad(e.getHours())}${pad(e.getMinutes())}00`;
+  }
+  const organizer = getUser(mtg.organizerId);
+  const attendeeLines = (mtg.attendeeIds||[]).map(id=>{
+    const u = getUser(id);
+    return u ? `ATTENDEE;CN=${u.name}:mailto:placeholder@example.com` : null;
+  }).filter(Boolean).join('\r\n');
+  const icsContent = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//BE Solutions//Meeting//GR',
+    'CALSCALE:GREGORIAN',
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    `UID:${mtg.id}@be-solutions`,
+    `DTSTART:${dtStart}`,
+    `DTEND:${dtEnd}`,
+    `SUMMARY:${mtg.title.replace(/,/g,'\\,')}`,
+    mtg.location ? `LOCATION:${mtg.location.replace(/,/g,'\\,')}` : '',
+    mtg.notes ? `DESCRIPTION:${mtg.notes.replace(/\n/g,'\\n').replace(/,/g,'\\,')}` : '',
+    organizer ? `ORGANIZER;CN=${organizer.name}:mailto:placeholder@example.com` : '',
+    attendeeLines,
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].filter(Boolean).join('\r\n');
+  const blob = new Blob([icsContent], {type:'text/calendar;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `synantisi_${mtg.date||'event'}.ics`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url), 5000);
+  showToast('Το αρχείο .ics κατεβαίνει…','success');
+}
+
+// ══ END MEETINGS ══════════════════════════════════════════════════════════════
 
 function showNotebookModal(noteId=null) {
   const note=(state.notebook||[]).find(n=>n.id===noteId)||null;
@@ -3809,6 +4041,22 @@ function renderProject() {
       <div class="cdh-mono" style="background:${cat?.bgLight||'rgba(255,255,255,.1)'};color:${cat?.color||'#fff'}">${init}</div>
       <div class="cdh-info"><div class="cdh-name">${esc(proj.name)} ${proj.status==='in_progress'?`<span style="font-size:.72rem;padding:2px 9px;border-radius:4px;background:${projectHealthScore(proj).color}20;color:${projectHealthScore(proj).color};font-weight:700;margin-left:6px">${projectHealthScore(proj).label}</span>`:''}</div><div class="cdh-sub">${proj.code?esc(proj.code)+' · ':''}Πελάτης: ${esc(proj.clientName||'—')} · Υπεύθυνος: ${esc(mgrNames)}${proj.startDate?` · 📅 Έναρξη: ${fmt(proj.startDate)}`:''}${proj.endDate?` · 🏁 Λήξη: ${fmt(proj.endDate)}`:''}</div>
       </div>
+      ${(()=>{
+        const cp = proj.contactPersonId ? (state.db.crmContacts||[]).find(c=>c.id===proj.contactPersonId) : null;
+        if (!cp) return '';
+        const cpPhones = _crmPhones(cp);
+        const cpEmails = _crmEmails(cp);
+        const cpPhoneLines = cpPhones.map((p,i)=>{
+          const lbl = cp[`phone_${i+1}_label`]||'';
+          return `<div style="display:flex;align-items:center;gap:5px;white-space:nowrap"><span style="opacity:.7;font-size:.7rem;min-width:52px">${esc(lbl||'Τηλ.')}</span><span style="font-size:.78rem;font-weight:600;letter-spacing:.01em">${esc(p)}</span></div>`;
+        }).join('');
+        const cpEmailLines = cpEmails.map(e=>`<div style="display:flex;align-items:center;gap:5px;white-space:nowrap;overflow:hidden"><span style="opacity:.7;font-size:.7rem;min-width:52px">Email</span><span style="font-size:.78rem;overflow:hidden;text-overflow:ellipsis">${esc(e)}</span></div>`).join('');
+        return `<div style="display:flex;flex-direction:column;gap:3px;padding:8px 14px;background:rgba(255,255,255,.1);border-radius:8px;border:1px solid rgba(255,255,255,.18);min-width:180px;max-width:260px;align-self:center;color:#fff">
+          <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;opacity:.7;margin-bottom:3px">Υπεύθ. Επικοινωνίας</div>
+          <div style="font-size:.82rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(crmContactName(cp))}</div>
+          ${cpPhoneLines}${cpEmailLines}
+        </div>`;
+      })()}
       <div class="cdh-actions">${isComp?'<span class="badge badge-green" style="font-size:.75rem;padding:5px 12px">Ολοκληρωμένο</span>':'<span class="badge badge-orange" style="font-size:.75rem;padding:5px 12px">Σε Εξέλιξη</span>'}<button class="btn btn-secondary btn-sm" data-action="export-project" data-pid="${proj.id}" title="Εξαγωγή έργου σε Excel">⬇ Excel</button><button class="btn btn-secondary btn-sm" data-action="export-project-pdf" data-pid="${proj.id}" title="Εξαγωγή έργου σε PDF">⬇ PDF</button>${state.cu.role!=='client'?`<button class="btn btn-secondary btn-sm" data-action="project-to-template" data-pid="${proj.id}" title="Αποθήκευση ως Πρότυπο Έργου">📋 Σε Πρότυπο</button>`:''}<button class="btn ${state.ganttView?'btn-primary':'btn-secondary'} btn-sm" data-action="toggle-gantt" title="Gantt Chart">📊 Gantt</button>${canMod?`<button class="btn btn-secondary btn-sm" data-action="modal-edit-project" data-pid="${proj.id}" title="Επεξεργασία έργου">✏ Επεξεργασία</button><button class="btn btn-secondary btn-sm" data-action="apply-template-to-project" data-pid="${proj.id}" title="Εφαρμογή ή ενημέρωση προτύπου">📋 Πρότυπο</button>`:''}${canMod&&!isComp&&proj.clientId?`<button class="btn btn-secondary btn-sm" data-action="send-client-reminder" data-pid="${proj.id}" title="Αποστολή υπενθύμισης στον πελάτη">🔔 Υπενθύμιση</button>`:''}${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-phase" data-pid="${proj.id}">+ Φάση</button>`:''}${canMod?`<button class="btn btn-danger btn-sm" data-action="delete-project" data-pid="${proj.id}">Διαγραφή</button>`:''}</div>
     </div>
     <div class="cdh-progress-full">${renderProjectProgressChart(proj, prog)}</div>
@@ -4287,6 +4535,21 @@ function _calPersonalEvents() {
       });
     });
   }
+  // Meetings: show to current user if they are organizer or attendee
+  const cu = state.cu;
+  if (cu) {
+    (state.db.meetings||[]).forEach(mtg=>{
+      if (!mtg.date) return;
+      if (mtg.organizerId !== cu.id && !(mtg.attendeeIds||[]).includes(cu.id)) return;
+      events.push({
+        id:mtg.id,kind:'meeting',date:mtg.date,time:mtg.time||'',
+        title:mtg.title||'Συνάντηση',
+        subtitle:mtg.location||'',
+        completed: mtg.status==='cancelled',
+        _meeting: mtg,
+      });
+    });
+  }
   return events.sort((a,b)=>a.date.localeCompare(b.date)||a.time.localeCompare(b.time)||a.title.localeCompare(b.title,'el'));
 }
 
@@ -4298,45 +4561,54 @@ function _calPersonalEventsByDate() {
 }
 
 function _calPersonalActionAttrs(event) {
-  return event.kind==='safety'
-    ? `data-action="modal-edit-safety-visit" data-sid="${esc(event.id)}"`
-    : `data-action="modal-edit-notebook" data-nid="${esc(event.id)}"`;
+  if (event.kind==='safety')   return `data-action="modal-edit-safety-visit" data-sid="${esc(event.id)}"`;
+  if (event.kind==='meeting')  return `data-action="modal-view-meeting" data-mid="${esc(event.id)}" style="cursor:pointer"`;
+  return `data-action="modal-edit-notebook" data-nid="${esc(event.id)}"`;
 }
 
 function _calPersonalMonthPill(event) {
-  const icon=event.kind==='safety'?'🛡️':'📝';
-  const short=event.title.length>17?event.title.slice(0,16)+'…':event.title;
-  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
-  return `<div class="cal-task cal-personal-event ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}${event.subtitle?' · '+esc(event.subtitle):''}">${icon} ${esc(event.time)} ${esc(short)}</div>`;
+  const icon = event.kind==='safety'?'🛡️':event.kind==='meeting'?'🤝':'📝';
+  const short = event.title.length>17?event.title.slice(0,16)+'…':event.title;
+  const kindClass = event.kind==='safety'?'cal-personal-safety':event.kind==='meeting'?'cal-personal-meeting':'cal-personal-note';
+  return `<div class="cal-task cal-personal-event ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}${event.subtitle?' · '+esc(event.subtitle):''}">${icon} ${event.time?esc(event.time)+' ':''}${esc(short)}</div>`;
 }
 
 function _calPersonalWeekCard(event) {
-  const icon=event.kind==='safety'?'🛡️':'📝';
-  const label=event.kind==='safety'?'Τεχνικός Ασφάλειας':'Σημειωματάριο';
-  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
+  const icon  = event.kind==='safety'?'🛡️':event.kind==='meeting'?'🤝':'📝';
+  const label = event.kind==='safety'?'Τεχνικός Ασφάλειας':event.kind==='meeting'?'Συνάντηση':'Σημειωματάριο';
+  const kindClass = event.kind==='safety'?'cal-personal-safety':event.kind==='meeting'?'cal-personal-meeting':'cal-personal-note';
+  const mtg = event._meeting;
+  const dur = mtg?.duration ? ` · ${mtg.duration}λ` : '';
+  const attendeeNames = mtg ? (mtg.attendeeIds||[]).map(id=>{const u=getUser(id);return u?u.name:null;}).filter(Boolean).join(', ') : '';
   return `<div class="cwc cal-personal-card ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}">
     <div class="cwc-name">${icon} ${esc(event.title)}</div>
-    <div class="cwc-time">⏰ ${esc(event.time)}</div>
+    ${event.time?`<div class="cwc-time">⏰ ${esc(event.time)}${dur}</div>`:''}
     <div class="cwc-proj">${label}${event.subtitle?` · ${esc(event.subtitle)}`:''}</div>
+    ${attendeeNames?`<div class="cwc-proj" style="font-size:.68rem;opacity:.8">👥 ${esc(attendeeNames)}</div>`:''}
   </div>`;
 }
 
 function _calPersonalDayCard(event) {
-  const icon=event.kind==='safety'?'🛡️':'📝';
-  const label=event.kind==='safety'?'Τεχνικός Ασφάλειας':'Σημειωματάριο';
-  const kindClass=event.kind==='safety'?'cal-personal-safety':'cal-personal-note';
+  const icon  = event.kind==='safety'?'🛡️':event.kind==='meeting'?'🤝':'📝';
+  const label = event.kind==='safety'?'Τεχνικός Ασφάλειας':event.kind==='meeting'?'Συνάντηση':'Σημειωματάριο';
+  const kindClass = event.kind==='safety'?'cal-personal-safety':event.kind==='meeting'?'cal-personal-meeting':'cal-personal-note';
+  const mtg = event._meeting;
+  const dur = mtg?.duration ? ` (${mtg.duration}λ)` : '';
+  const attendeeNames = mtg ? (mtg.attendeeIds||[]).map(id=>{const u=getUser(id);return u?u.name:null;}).filter(Boolean).join(', ') : '';
   return `<div class="cal-day-card cal-day-card-compact cal-personal-card ${kindClass}${event.completed?' is-completed':''}" ${_calPersonalActionAttrs(event)} title="${esc(event.title)}">
     <div class="cal-day-mainline">
       <span class="cal-day-path">${icon} ${esc(event.title)}</span>
-      <span class="cal-day-inline-meta">⏰ ${esc(event.time)}</span>
+      ${event.time?`<span class="cal-day-inline-meta">⏰ ${esc(event.time)}${dur}</span>`:''}
       <span class="cal-day-inline-meta">${label}</span>
     </div>
-    ${event.subtitle?`<div class="cal-day-subtask-lines"><span class="cal-day-subtask-item">${esc(event.subtitle)}</span></div>`:''}
+    ${attendeeNames?`<div class="cal-day-subtask-lines"><span class="cal-day-subtask-item">👥 ${esc(attendeeNames)}</span></div>`:''}
+    ${event.subtitle&&!attendeeNames?`<div class="cal-day-subtask-lines"><span class="cal-day-subtask-item">${esc(event.subtitle)}</span></div>`:''}
   </div>`;
 }
 
 function renderCalendar() {
   if (!state.cu || state.cu.role === 'client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+  ensureCalMeetingStyle();
   const vm = state.calViewMode || 'month';
   if (vm === 'week') return _renderCalWeek();
   if (vm === 'day')  return _renderCalDay();
@@ -4345,6 +4617,44 @@ function renderCalendar() {
 
 // Palette for phase bars (cycles if more phases than colors)
 const PHASE_COLORS = ['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16'];
+
+/**
+ * Calendar task filter for project_manager / team_member roles.
+ *
+ * Returns null  → admin/management: show every task as-is.
+ * Returns Map<projId, Set<taskId>>  → show ONLY the listed task(s) per project.
+ *
+ * Rule: per project, find the FIRST incomplete task (in phases/tasks array order)
+ * that the current user is personally responsible for:
+ *   • project_manager → any task in their project
+ *   • team_member     → tasks where they are assigneeId or in memberIds
+ * Completed / cancelled / not_required tasks are always excluded.
+ */
+function _calUserTaskFilter() {
+  const cu = state.cu;
+  if (!cu || ['admin','management','client'].includes(cu.role)) return null;
+
+  const result = new Map(); // projId -> Set<taskId>
+  visibleProjects().forEach(proj => {
+    const isManager = projManagerIds(proj).includes(cu.id);
+    const allowed = new Set();
+    let found = false;
+
+    outer:
+    for (const ph of (proj.phases||[])) {
+      for (const t of (ph.tasks||[])) {
+        if (TERMINAL_TASK_STATUSES.has(t.status) || t.status==='cancelled') continue;
+        const mine = isManager
+          || t.assigneeId === cu.id
+          || (t.memberIds||[]).includes(cu.id);
+        if (mine) { allowed.add(t.id); found = true; break outer; }
+      }
+    }
+    if (found) result.set(proj.id, allowed);
+  });
+
+  return result;
+}
 
 function _datesBetween(startStr, endStr) {
   // Returns array of 'YYYY-MM-DD' strings inclusive
@@ -4387,10 +4697,18 @@ function _renderCalMonth() {
 
   // Build tasksByDay: day -> [{task, proj}]  (tasks appear on each day they span)
   const tasksByDay = {};
+  const _calFilter = _calUserTaskFilter(); // null = show all; Map = show only listed IDs
   visibleProjects().forEach(proj => {
+    const projAllowed = _calFilter ? _calFilter.get(proj.id) : null;
     (proj.phases||[]).forEach(ph => {
       (ph.tasks||[]).forEach(t => {
         if (t.status==='cancelled') return;
+        // For pm/team_member: skip tasks not in their "next task" set
+        if (_calFilter) {
+          if (!projAllowed || !projAllowed.has(t.id)) return;
+        }
+        // For all roles: skip terminal statuses (completed/not_required)
+        if (_calFilter && TERMINAL_TASK_STATUSES.has(t.status)) return;
         // Determine date range to show task
         const ts = t.plannedStart || t.startDate;
         const te = t.plannedEnd || t.startDate;
@@ -4460,10 +4778,26 @@ function _renderCalMonth() {
         <button class="btn btn-ghost btn-sm" data-action="cal-next">›</button>
       </div>
       <button class="btn btn-secondary btn-sm" data-action="cal-today">Σήμερα</button>
+      ${state.cu && state.cu.role!=='client' ? `<button class="btn btn-primary btn-sm" data-action="modal-add-meeting">🤝 + Συνάντηση</button>` : ''}
     </div>
   </div>
   <div class="cal-grid">${cells}</div>
   ${_calLegend()}`;
+}
+
+function ensureCalMeetingStyle() {
+  if (document.getElementById('be-cal-meeting-style')) return;
+  const s = document.createElement('style');
+  s.id = 'be-cal-meeting-style';
+  s.textContent = `
+    .cal-personal-meeting {
+      background: #7c3aed18 !important;
+      border-left: 3px solid #7c3aed !important;
+      color: #5b21b6 !important;
+    }
+    .cal-personal-meeting.is-completed { opacity: .45; text-decoration: line-through; }
+  `;
+  document.head.appendChild(s);
 }
 
 function ensureCalWeekWorkdaysStyle() {
@@ -4513,10 +4847,18 @@ function _renderCalWeek() {
   // Tasks by workday. Multi-day tasks are shown only on Monday–Friday,
   // because Saturday/Sunday do not exist in this weekly view.
   const tasksByDate = {};
+  const _calFilter = _calUserTaskFilter(); // null = show all; Map = show only listed IDs
   visibleProjects().forEach(proj => {
+    const projAllowed = _calFilter ? _calFilter.get(proj.id) : null;
     (proj.phases||[]).forEach(ph => {
       (ph.tasks||[]).forEach(t => {
         if (t.status==='cancelled') return;
+        // For pm/team_member: skip tasks not in their "next task" set
+        if (_calFilter) {
+          if (!projAllowed || !projAllowed.has(t.id)) return;
+        }
+        // Skip terminal statuses for filtered users
+        if (_calFilter && TERMINAL_TASK_STATUSES.has(t.status)) return;
 
         const ts = t.plannedStart || t.startDate;
         const te = t.plannedEnd || t.startDate;
@@ -4595,6 +4937,7 @@ function _renderCalWeek() {
         <button class="btn btn-ghost btn-sm" data-action="cal-next">›</button>
       </div>
       <button class="btn btn-secondary btn-sm" data-action="cal-today">Σήμερα</button>
+      ${state.cu && state.cu.role!=='client' ? `<button class="btn btn-primary btn-sm" data-action="modal-add-meeting">🤝 + Συνάντηση</button>` : ''}
     </div>
   </div>
   <div class="cal-week-grid cal-week-workdays">${cols}</div>
@@ -4661,10 +5004,16 @@ function _renderCalDay() {
   const isToday=dateStr===todayStr;
 
   const dayTasks=[];
+  const _calFilter=_calUserTaskFilter(); // null = show all; Map = show only listed IDs
   visibleProjects().forEach(proj=>{
+    const projAllowed=_calFilter?_calFilter.get(proj.id):null;
     (proj.phases||[]).forEach(ph=>{
       (ph.tasks||[]).forEach(t=>{
         if(t.status==='cancelled') return;
+        if(_calFilter){
+          if(!projAllowed||!projAllowed.has(t.id)) return;
+          if(TERMINAL_TASK_STATUSES.has(t.status)) return;
+        }
         const ts=t.plannedStart||t.startDate;
         const te=t.plannedEnd||t.startDate;
         if(!te) return;
@@ -4743,6 +5092,7 @@ function _renderCalDay() {
         <button class="btn btn-ghost btn-sm" data-action="cal-next">›</button>
       </div>
       <button class="btn btn-secondary btn-sm" data-action="cal-today">Σήμερα</button>
+      ${state.cu && state.cu.role!=='client' ? `<button class="btn btn-primary btn-sm" data-action="modal-add-meeting" data-date="${dateStr}">🤝 + Συνάντηση</button>` : ''}
     </div>
   </div>
   ${personalGrid}${timeGrid}${untimedGrid}${empty}`;
@@ -5007,6 +5357,7 @@ async function doLogin() {
 
     initPresence();
     initProjectsRealtime();
+    initMeetingsRealtime();
     startNotificationPolling();
     auditLog('Σύνδεση',`Ο χρήστης ${profile.name} συνδέθηκε μέσω Supabase Auth`);
     render();
@@ -5416,6 +5767,11 @@ function handleClick(e) {
     case 'modal-edit-notebook':      showNotebookModal(btn.dataset.nid);            break;
     case 'toggle-notebook':          toggleNotebookItem(btn.dataset.nid);           break;
     case 'delete-notebook':          deleteNotebookItem(btn.dataset.nid);           break;
+    case 'modal-add-meeting':        showModalAddMeeting(btn.dataset.date||null);   break;
+    case 'modal-view-meeting':       showModalViewMeeting(btn.dataset.mid);         break;
+    case 'modal-edit-meeting':       showModalEditMeeting(btn.dataset.mid);         break;
+    case 'delete-meeting':           deleteMeeting(btn.dataset.mid);                break;
+    case 'export-meeting-ics':       exportMeetingIcs(btn.dataset.mid);             break;
     case 'modal-add-safety-visit':   showSafetyVisitModal();                        break;
     case 'modal-edit-safety-visit':  showSafetyVisitModal(btn.dataset.sid);         break;
     case 'toggle-safety-visit':      toggleSafetyVisit(btn.dataset.sid);            break;
@@ -7677,7 +8033,8 @@ function showModalEditProject(pid) {
   const pms=sortByName(state.db.users.filter(u=>['admin','management','project_manager'].includes(u.role)));
   const clients=sortByName(state.db.users.filter(u=>u.role==='client'));
   const curMgrIds = projManagerIds(proj);
-  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Έργου</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="ep-name" value="${esc(proj.name)}"></div><div class="form-group"><label class="form-label">Κωδικός</label><input class="form-control" id="ep-code" value="${esc(proj.code||'')}"></div><div class="form-group"><label class="form-label">Ονοματεπώνυμο Πελάτη</label><input class="form-control" id="ep-client" value="${esc(proj.clientName||'')}"></div><div class="form-group"><label class="form-label">Λογαριασμός Πελάτη</label><select class="form-control" id="ep-clientid"><option value="">— Χωρίς —</option>${clients.map(c=>`<option value="${c.id}"${c.id===proj.clientId?' selected':''}>${esc(c.name)}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">Υπεύθυνοι Έργου <sup>*</sup></label><div class="member-check-list">${pms.map(u=>`<label class="member-check-item"><input type="checkbox" class="ep-mgr-cb" value="${u.id}"${curMgrIds.includes(u.id)?' checked':''}> ${esc(u.name)}</label>`).join('')}</div></div><div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Ημ. Έναρξης</label><input type="date" class="form-control" id="ep-start" value="${proj.startDate||''}"></div><div class="form-group"><label class="form-label">🏁 Ημ. Λήξης</label><input type="date" class="form-control" id="ep-end" value="${proj.endDate||''}"></div></div><div class="form-group"><label class="form-label">Κατάσταση</label><select class="form-control" id="ep-status"><option value="in_progress"${proj.status==='in_progress'?' selected':''}>Σε Εξέλιξη</option><option value="completed"${proj.status==='completed'?' selected':''}>Ολοκληρωμένο</option><option value="on_hold"${proj.status==='on_hold'?' selected':''}>Σε Αναστολή</option></select></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="ep-enforce-deps"${proj.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων εργασιών</label><div class="form-hint">Όταν ενεργό, εργασία με εξάρτηση δεν μπορεί να αλλάξει κατάσταση μέχρι να ολοκληρωθεί η προηγούμενη.</div></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateProject('${pid}')">Αποθήκευση</button></div>`);
+  const crmCts = sortByName((state.db.crmContacts||[]).map(c=>({...c,_name:crmContactName(c)})),'_name');
+  showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία Έργου</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Τίτλος <sup>*</sup></label><input class="form-control" id="ep-name" value="${esc(proj.name)}"></div><div class="form-group"><label class="form-label">Κωδικός</label><input class="form-control" id="ep-code" value="${esc(proj.code||'')}"></div><div class="form-group"><label class="form-label">Ονοματεπώνυμο Πελάτη</label><input class="form-control" id="ep-client" value="${esc(proj.clientName||'')}"></div><div class="form-group"><label class="form-label">Λογαριασμός Πελάτη</label><select class="form-control" id="ep-clientid"><option value="">— Χωρίς —</option>${clients.map(c=>`<option value="${c.id}"${c.id===proj.clientId?' selected':''}>${esc(c.name)}</option>`).join('')}</select></div><div class="form-group"><label class="form-label">👤 Υπεύθυνος Επικοινωνίας</label><select class="form-control" id="ep-contactperson"><option value="">— Χωρίς —</option>${crmCts.map(c=>`<option value="${c.id}"${c.id===proj.contactPersonId?' selected':''}>${esc(c._name)}${c.organization_title?' – '+esc(c.organization_title):''}</option>`).join('')}</select><div class="form-hint">Επιλέξτε επαφή από το CRM για να εμφανίζονται τα στοιχεία της στην κεφαλίδα του έργου.</div></div><div class="form-group"><label class="form-label">Υπεύθυνοι Έργου <sup>*</sup></label><div class="member-check-list">${pms.map(u=>`<label class="member-check-item"><input type="checkbox" class="ep-mgr-cb" value="${u.id}"${curMgrIds.includes(u.id)?' checked':''}> ${esc(u.name)}</label>`).join('')}</div></div><div class="modal-date-grid"><div class="form-group"><label class="form-label">📅 Ημ. Έναρξης</label><input type="date" class="form-control" id="ep-start" value="${proj.startDate||''}"></div><div class="form-group"><label class="form-label">🏁 Ημ. Λήξης</label><input type="date" class="form-control" id="ep-end" value="${proj.endDate||''}"></div></div><div class="form-group"><label class="form-label">Κατάσταση</label><select class="form-control" id="ep-status"><option value="in_progress"${proj.status==='in_progress'?' selected':''}>Σε Εξέλιξη</option><option value="completed"${proj.status==='completed'?' selected':''}>Ολοκληρωμένο</option><option value="on_hold"${proj.status==='on_hold'?' selected':''}>Σε Αναστολή</option></select></div><div class="form-group"><label class="form-label" style="cursor:pointer;display:flex;align-items:center;gap:8px"><input type="checkbox" id="ep-enforce-deps"${proj.enforceDeps?' checked':''}> Επιβολή εξαρτήσεων εργασιών</label><div class="form-hint">Όταν ενεργό, εργασία με εξάρτηση δεν μπορεί να αλλάξει κατάσταση μέχρι να ολοκληρωθεί η προηγούμενη.</div></div></div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateProject('${pid}')">Αποθήκευση</button></div>`);
 }
 window.modalUpdateProject=async function(pid){
   const proj=getProject(pid); if(!proj) return;
@@ -7688,6 +8045,7 @@ window.modalUpdateProject=async function(pid){
   proj.clientId=el('ep-clientid').value||null; proj.managerIds=managerIds; delete proj.managerId; proj.status=el('ep-status').value;
   proj.startDate=el('ep-start')?.value||proj.startDate||null; proj.endDate=el('ep-end')?.value||null;
   proj.enforceDeps=el('ep-enforce-deps')?.checked||false;
+  proj.contactPersonId=el('ep-contactperson')?.value||null;
   auditLog('Επεξεργασία έργου',name);
   await dbSaveProject(proj); closeModal(); render(); showToast('Έργο ενημερώθηκε.','success');
 };
@@ -9340,7 +9698,7 @@ function renderClientCalendar() {
     const title    = _ccalTitle(e);
     const category = _ccalCategory(e);
     return `<div class="ccal-row${_rowCls(e.expiryDate)}">
-      <div class="ccal-client"><div class="ccal-name">${esc(title)}</div></div>
+      <div class="ccal-client" style="max-width:180px;min-width:100px;overflow:hidden"><div class="ccal-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(title)}">${esc(title)}</div></div>
       <div class="ccal-company">${category?`<span class="ccal-cat-tag">${esc(category)}</span>`:'<span class="text-muted">—</span>'}</div>
       <div class="ccal-date">
         <div style="font-weight:700;font-size:.85rem">${fmt(e.expiryDate)}</div>
@@ -9368,12 +9726,12 @@ function renderClientCalendar() {
   ].map(s=>`<button class="crm-filter-btn${sort===s.k?' active':''}" title="${s.title}" onclick="state.ccalSort='${s.k}';render()">${s.label}</button>`).join('');
 
   // Helper: clickable sort header
-  const _sortHd = (label, keyAsc, keyDesc) => {
+  const _sortHd = (label, keyAsc, keyDesc, extraStyle='') => {
     const isAsc  = sort === keyAsc;
     const isDesc = sort === keyDesc;
     const arrow  = isAsc ? ' ↑' : isDesc ? ' ↓' : '';
     const next   = isAsc ? keyDesc : keyAsc;
-    return `<div class="ccal-hd-sortable${isAsc||isDesc?' ccal-hd-active':''}" onclick="state.ccalSort='${next}';render()" title="Ταξινόμηση">${label}${arrow}</div>`;
+    return `<div class="ccal-hd-sortable${isAsc||isDesc?' ccal-hd-active':''}" onclick="state.ccalSort='${next}';render()" title="Ταξινόμηση"${extraStyle?` style="${extraStyle}"`:''} >${label}${arrow}</div>`;
   };
 
   return `
@@ -9394,7 +9752,7 @@ function renderClientCalendar() {
   ${entries.length ? `
   <div class="ccal-table">
     <div class="ccal-head">
-      ${_sortHd('Τίτλος','title-asc','title-desc')}
+      ${_sortHd('Επωνυμία Εταιρίας','title-asc','title-desc','max-width:180px;min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap')}
       ${_sortHd('Κατηγορία','category-asc','category-desc')}
       ${_sortHd('Ημ. Λήξης','date-asc','date-desc')}
       <div>Αρχείο</div><div>Σημειώσεις</div><div></div>
@@ -9427,7 +9785,7 @@ function showModalAddCcal() {
 
 window.modalSaveCcal = async function() {
   const title      = (el('cc-title')?.value||'').trim();
-  const expiryDate = el('cc-expiry').value;
+  const expiryDate = (el('cc-expiry')?.value||'').trim();
   if (!title||!expiryDate) { alert('Συμπληρώστε τον Τίτλο και την Ημερομηνία Λήξης.'); return; }
 
   let fileId = null, fileName = null;
@@ -9486,7 +9844,7 @@ function showModalEditCcal(ccId) {
 window.modalUpdateCcal = async function(ccId) {
   const entry = (state.db.clientCalendar||[]).find(x=>x.id===ccId); if (!entry) return;
   const title      = (el('cc-title')?.value||'').trim();
-  const expiryDate = el('cc-expiry').value;
+  const expiryDate = (el('cc-expiry')?.value||'').trim();
   if (!title||!expiryDate) { alert('Συμπληρώστε τον Τίτλο και την Ημερομηνία Λήξης.'); return; }
   entry.title      = title;
   entry.category   = (el('cc-category')?.value||'').trim();
@@ -9770,22 +10128,20 @@ function renderCrmContacts() {
         || (ct.afm||'').includes(q);
   });
 
+  const _ctd = 'font-size:.78rem;padding:4px 8px;vertical-align:middle;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis';
   const rows = contacts.map(ct=>{
     const phones = _crmPhones(ct);
     const emails = _crmEmails(ct);
     const company = (state.db.crmCompanies||[]).find(co=>co.id===ct.company_id);
-    return `<tr class="crm-tr" data-action="crm-ct-open" data-ctid="${ct.id}" style="cursor:pointer">
-      <td class="crm-td">
-        <div class="crm-co-name">${esc(crmContactName(ct))}</div>
-        ${ct.organization_title?`<div class="crm-sub">${esc(ct.organization_title)}</div>`:''}
-      </td>
-      <td class="crm-td">${company?`<span class="crm-co-link">${esc(company.company_name)}</span>`:ct.organization_name?esc(ct.organization_name):'—'}</td>
-      <td class="crm-td">${phones.length?esc(phones[0]):'—'}</td>
-      <td class="crm-td">${emails.length?`<a href="mailto:${esc(emails[0])}" onclick="event.stopPropagation()" style="color:var(--blue)">${esc(emails[0])}</a>`:'—'}</td>
-      <td class="crm-td crm-mono">${ct.afm?esc(ct.afm):'—'}</td>
-      <td class="crm-td" style="text-align:right">
-        ${canEdit?`<button class="btn btn-ghost btn-sm" data-action="crm-ct-edit" data-ctid="${ct.id}" style="font-size:.72rem">✏</button>
-        <button class="btn btn-danger btn-sm" data-action="crm-ct-delete" data-ctid="${ct.id}" style="font-size:.72rem">✕</button>`:''}
+    const nameLabel = esc(crmContactName(ct)) + (ct.organization_title ? `<span style="color:var(--muted);font-weight:400;font-size:.72rem;margin-left:5px">${esc(ct.organization_title)}</span>` : '');
+    return `<tr class="crm-tr" data-action="crm-ct-open" data-ctid="${ct.id}" style="cursor:pointer;line-height:1.2">
+      <td class="crm-td" style="${_ctd};font-weight:600;max-width:260px">${nameLabel}</td>
+      <td class="crm-td" style="${_ctd}">${company?`<span class="crm-co-link">${esc(company.company_name)}</span>`:ct.organization_name?esc(ct.organization_name):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd}">${phones.length?esc(phones[0]):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd}">${emails.length?`<a href="mailto:${esc(emails[0])}" onclick="event.stopPropagation()" style="color:var(--blue)">${esc(emails[0])}</a>`:'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td crm-mono" style="${_ctd}">${ct.afm?esc(ct.afm):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd};text-align:right;padding-right:6px;white-space:nowrap">
+        ${canEdit?`<button class="btn btn-ghost btn-sm" data-action="crm-ct-edit" data-ctid="${ct.id}" style="font-size:.7rem;padding:2px 6px;margin:0">✏</button><button class="btn btn-danger btn-sm" data-action="crm-ct-delete" data-ctid="${ct.id}" style="font-size:.7rem;padding:2px 6px;margin:0 0 0 2px">✕</button>`:''}
       </td>
     </tr>`;
   }).join('');
@@ -9803,10 +10159,14 @@ function renderCrmContacts() {
   <div class="crm-toolbar">
     <input class="form-control crm-search" placeholder="🔍 Αναζήτηση επαφής…" value="${esc(state.crmContactSearch||'')}" oninput="state.crmContactSearch=this.value;render()" style="max-width:320px">
   </div>
-  ${contacts.length?`<div class="crm-table-wrap"><table class="crm-table">
-    <thead><tr>
-      <th class="crm-th">Όνομα</th><th class="crm-th">Εταιρεία</th><th class="crm-th">Τηλέφωνο</th>
-      <th class="crm-th">Email</th><th class="crm-th">ΑΦΜ</th><th class="crm-th"></th>
+  ${contacts.length?`<div class="crm-table-wrap"><table class="crm-table" style="width:100%">
+    <thead><tr style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;line-height:1.2">
+      <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Όνομα</th>
+      <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Εταιρεία</th>
+      <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Τηλέφωνο</th>
+      <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Email</th>
+      <th class="crm-th" style="padding:4px 8px;white-space:nowrap">ΑΦΜ</th>
+      <th class="crm-th" style="padding:4px 8px"></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`:`<div class="empty-state"><div class="es-icon">👤</div><h3>Δεν βρέθηκαν επαφές</h3>${canEdit?`<button class="btn btn-primary" data-action="crm-ct-add">+ Νέα Επαφή</button>`:''}</div>`}`;
@@ -10140,7 +10500,7 @@ function renderOffers() {
   const fPaid       = state.offersFilterPaid||'';
   const fCompleted  = state.offersFilterCompleted||'';
   const sortCol     = state.offersSortCol||'code';
-  const sortDir     = state.offersSortDir||'desc';
+  const sortDir     = state.offersSortDir||'asc';
 
   const allOffers = state.db.offers||[];
   const allCats   = [...new Set(allOffers.map(o=>o.category).filter(Boolean))].sort();
@@ -10205,10 +10565,10 @@ function renderOffers() {
       ? `<button class="btn btn-ghost btn-sm" data-action="offer-file" data-oid="${o.id}" title="Σύνδεση αρχείου" style="font-size:.72rem;padding:2px 6px">${fileHref?'📎':'📁'}</button>`
       : (fileHref ? `<a href="${esc(fileHref)}" target="_blank" title="${esc(fileHref)}" style="font-size:.85rem">📎</a>` : '');
     return `<tr class="crm-tr">
-      <td class="crm-td" style="${tdCtr};position:sticky;left:0;z-index:2;background:var(--white);width:50px">${fileBtn}</td>
-      <td class="crm-td" style="${tdStyle};white-space:nowrap;font-weight:600;position:sticky;left:50px;z-index:2;background:var(--white);width:115px">${esc(o.code||'—')}</td>
-      <td class="crm-td" style="${tdStyle};white-space:nowrap;position:sticky;left:165px;z-index:2;background:var(--white);width:110px">${fmt(o.date)}</td>
-      <td class="crm-td" style="${tdStyle};position:sticky;left:275px;z-index:2;background:var(--white);width:170px;box-shadow:2px 0 6px rgba(0,0,0,.1)">${esc(o.clientName||'—')}</td>
+      <td class="crm-td" style="${tdCtr}">${fileBtn}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap;font-weight:600">${esc(o.code||'—')}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap">${fmt(o.date)}</td>
+      <td class="crm-td" style="${tdStyle}">${esc(o.clientName||'—')}</td>
       <td class="crm-td" style="${tdStyle}">${esc(o.clientVia||'—')}</td>
       <td class="crm-td" style="${tdStyle}">${esc(o.category||'—')}</td>
       <td class="crm-td" style="${tdStyle};max-width:200px">${esc(o.title||'—')}</td>
@@ -10247,14 +10607,14 @@ function renderOffers() {
     </div>
   </div>
   ${offers.length ? `
-  <div id="offers-top-scroll" style="overflow-x:auto;overflow-y:hidden;height:28px;border-bottom:1px solid var(--border)"><div id="offers-top-inner" style="height:27px;min-width:1400px"></div></div>
+  <div id="offers-top-scroll" style="overflow-x:auto;overflow-y:hidden;height:14px;border-bottom:1px solid var(--border)"><div id="offers-top-inner" style="height:1px;min-width:1400px"></div></div>
   <div id="offers-table-wrap" class="crm-table-wrap" style="overflow-x:auto;overflow-y:auto;max-height:calc(100vh - 300px)">
     <table class="crm-table" style="min-width:1400px">
     <thead><tr>
-      <th class="crm-th" style="${thStyle};text-align:center;position:sticky;left:0;z-index:3;background:var(--white);width:50px">Αρχείο</th>
-      ${thSort('code','Offer No.','position:sticky;left:50px;z-index:3;background:var(--white);width:115px')}
-      ${thSort('date','Ημερομηνία','position:sticky;left:165px;z-index:3;background:var(--white);width:110px')}
-      ${thSort('clientName','Επωνυμία','position:sticky;left:275px;z-index:3;background:var(--white);width:170px;box-shadow:2px 0 6px rgba(0,0,0,.1)')}
+      <th class="crm-th" style="${thStyle};text-align:center">Αρχείο</th>
+      ${thSort('code','Offer No.')}
+      ${thSort('date','Ημερομηνία')}
+      ${thSort('clientName','Επωνυμία')}
       ${thSort('clientVia','Μέσω')}
       ${thSort('category','Κατηγορία Έργου')}
       ${thSort('title','Περιγραφή Έργου')}
