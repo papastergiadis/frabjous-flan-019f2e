@@ -1,0 +1,4 @@
+project_id = "project-tracking"
+
+[functions.technical-safety-sync]
+verify_jwt = false

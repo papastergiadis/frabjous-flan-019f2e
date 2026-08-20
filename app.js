@@ -1687,18 +1687,22 @@ function normalizeSafetyVisit(item) {
   return {
     id:String(item.id||('safety_'+uid())),
     company:String(item.company||'').slice(0,180),
-    visitAt:item.visitAt||null,
-    durationMinutes:Math.max(0,Math.min(1440,Number(item.durationMinutes||60))),
+    visitAt:item.visitAt||item.visit_at||null,
+    durationMinutes:Math.max(0,Math.min(1440,Number(item.durationMinutes??item.duration_minutes??60))),
     location:String(item.location||'').slice(0,300),
     notes:String(item.notes||'').slice(0,2000),
-    reminderAt:item.reminderAt||null,
+    reminderAt:item.reminderAt??item.reminder_at??null,
     completed:!!item.completed,
-    announcementPath:item.announcementPath||null,
-    announcementName:item.announcementName?String(item.announcementName).slice(0,220):null,
-    announcementType:item.announcementType||null,
-    announcementSize:Number(item.announcementSize||0),
-    createdAt:item.createdAt||nowTS(),
-    updatedAt:item.updatedAt||item.createdAt||nowTS(),
+    announcementPath:item.announcementPath??item.announcement_path??null,
+    announcementName:(item.announcementName??item.announcement_name)?String(item.announcementName??item.announcement_name).slice(0,220):null,
+    announcementType:item.announcementType??item.announcement_type??null,
+    announcementSize:Number(item.announcementSize??item.announcement_size??0),
+    syncSource:item.syncSource??item.sync_source??null,
+    sourceFile:item.sourceFile??item.source_file??null,
+    syncKey:item.syncKey??item.sync_key??null,
+    sourcePayloadHash:item.sourcePayloadHash??item.source_payload_hash??null,
+    createdAt:item.createdAt||item.created_at||nowTS(),
+    updatedAt:item.updatedAt||item.updated_at||item.createdAt||item.created_at||nowTS(),
   };
 }
 
@@ -1741,9 +1745,48 @@ async function persistNotebook() {
   state.notebook=clean;
 }
 
-function safetyVisitDbRow(item) {
+function safetyVisitDbRow(item,ownerAuthUserId) {
   const visit=normalizeSafetyVisit(item);
-  return visit||null;
+  if(!visit) return null;
+  return {
+    id:visit.id,
+    owner_auth_user_id:ownerAuthUserId,
+    company:visit.company,
+    visit_at:visit.visitAt,
+    duration_minutes:visit.durationMinutes,
+    location:visit.location,
+    notes:visit.notes,
+    reminder_at:visit.reminderAt,
+    completed:visit.completed,
+    announcement_path:visit.announcementPath,
+    announcement_name:visit.announcementName,
+    announcement_type:visit.announcementType,
+    announcement_size:visit.announcementSize,
+    sync_source:visit.syncSource,
+    source_file:visit.sourceFile,
+    sync_key:visit.syncKey,
+    source_payload_hash:visit.sourcePayloadHash,
+    created_at:visit.createdAt,
+    updated_at:visit.updatedAt,
+  };
+}
+
+function safetyVisitFromDb(row) {
+  return normalizeSafetyVisit(row);
+}
+
+function safetyTableUnavailable(error) {
+  const code=String(error?.code||'');
+  const message=String(error?.message||'');
+  return code==='42P01'||code==='PGRST205'||/be_safety_visits.*(not found|schema cache|does not exist)/i.test(message);
+}
+
+async function persistSafetyMetadataFallback(user) {
+  const clean=(state.safetyVisits||[]).slice(0,300).map(normalizeSafetyVisit).filter(Boolean);
+  const metadata={...(user.user_metadata||{}),[SAFETY_METADATA_KEY]:clean};
+  const {error}=await sb.auth.updateUser({data:metadata});
+  if(error) throw error;
+  state.safetyVisits=clean;
 }
 
 function safetyStorage() {
@@ -1845,16 +1888,33 @@ async function persistSafetyVisit(item) {
   if(error) throw error;
   const user=data?.user;
   if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
-  const clean=(state.safetyVisits||[]).slice(0,300).map(safetyVisitDbRow).filter(Boolean);
-  const metadata={...(user.user_metadata||{}),[SAFETY_METADATA_KEY]:clean};
-  const {error:updateError}=await sb.auth.updateUser({data:metadata});
-  if(updateError) throw updateError;
-  state.safetyVisits=clean;
-  return safetyVisitDbRow(item);
+
+  const visit=safetyVisitDbRow(item,user.id);
+  if(!visit) throw new Error('Η επίσκεψη δεν είναι έγκυρη.');
+
+  const {error:saveError}=await sb.from('be_safety_visits').upsert(visit,{onConflict:'id'});
+  if(saveError) {
+    if(!safetyTableUnavailable(saveError)) throw saveError;
+    await persistSafetyMetadataFallback(user);
+  } else {
+    state.safetyVisits=(state.safetyVisits||[]).slice(0,300).map(normalizeSafetyVisit).filter(Boolean);
+  }
+  return normalizeSafetyVisit(item);
 }
 
 async function removeSafetyVisit(visitId) {
-  await persistSafetyVisit(null);
+  if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') throw new Error('Απαιτείται ασφαλής εσωτερικός λογαριασμός.');
+  const {data,error}=await sb.auth.getUser();
+  if(error) throw error;
+  const user=data?.user;
+  if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
+
+  const {error:deleteError}=await sb.from('be_safety_visits')
+    .delete().eq('owner_auth_user_id',user.id).eq('id',visitId);
+  if(deleteError) {
+    if(!safetyTableUnavailable(deleteError)) throw deleteError;
+    await persistSafetyMetadataFallback(user);
+  }
 }
 
 async function loadSafetyVisits() {
@@ -1866,8 +1926,30 @@ async function loadSafetyVisits() {
   try {
     const {data,error}=await sb.auth.getUser();
     if(error) throw error;
-    const raw=data?.user?.user_metadata?.[SAFETY_METADATA_KEY];
-    state.safetyVisits=(Array.isArray(raw)?raw:[]).map(normalizeSafetyVisit).filter(Boolean);
+    const user=data?.user;
+    if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
+
+    const legacyRaw=user.user_metadata?.[SAFETY_METADATA_KEY];
+    const legacy=(Array.isArray(legacyRaw)?legacyRaw:[]).map(normalizeSafetyVisit).filter(Boolean);
+    const {data:rows,error:tableError}=await sb.from('be_safety_visits')
+      .select('*').eq('owner_auth_user_id',user.id).order('visit_at',{ascending:true});
+
+    if(tableError) {
+      if(!safetyTableUnavailable(tableError)) throw tableError;
+      state.safetyVisits=legacy;
+    } else if((rows||[]).length) {
+      state.safetyVisits=(rows||[]).map(safetyVisitFromDb).filter(Boolean);
+    } else if(legacy.length) {
+      const migrationRows=legacy.map(item=>{
+        const manual={...item,syncSource:null,sourceFile:null,syncKey:null,sourcePayloadHash:null};
+        return safetyVisitDbRow(manual,user.id);
+      });
+      const {error:migrationError}=await sb.from('be_safety_visits').upsert(migrationRows,{onConflict:'id'});
+      if(migrationError) throw migrationError;
+      state.safetyVisits=legacy;
+    } else {
+      state.safetyVisits=[];
+    }
   } catch(error) {
     console.warn('safety visits load:',error);
     state.safetyVisits=[];
