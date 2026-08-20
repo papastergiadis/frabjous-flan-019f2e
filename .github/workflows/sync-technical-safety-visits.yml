@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type SYNC-35 to create the 35 validated visits in production"
+        description: "Type SYNC-BOTH-35 to synchronize 35 visits for elias and thomas"
         required: true
         type: string
 
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync 35 September visits to production
+    name: Sync 35 September visits for both owners
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 10
@@ -30,8 +30,8 @@ jobs:
       - name: Require explicit production confirmation
         shell: bash
         run: |
-          if [ "${{ inputs.confirmation }}" != "SYNC-35" ]; then
-            echo "::error::Production sync stopped. Enter exactly SYNC-35."
+          if [ "${{ inputs.confirmation }}" != "SYNC-BOTH-35" ]; then
+            echo "::error::Production sync stopped. Enter exactly SYNC-BOTH-35."
             exit 1
           fi
 
@@ -48,95 +48,121 @@ jobs:
           done
           exit "$missing"
 
-      - name: Prepare and validate payloads
+      - name: Prepare canonical payload
         id: payload
         shell: bash
         run: |
-          dry_file="$RUNNER_TEMP/technical-safety-dry-run.json"
-          live_file="$RUNNER_TEMP/technical-safety-live.json"
-
-          printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$dry_file"
+          base_file="$RUNNER_TEMP/technical-safety-base.json"
+          canonical_file="$RUNNER_TEMP/technical-safety-canonical.json"
+          printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$base_file"
 
           jq -e '
             .dryRun == true
             and .sourceFile == "2026_09.pdf"
             and (.visits | type == "array")
             and (.visits | length == 35)
-            and ([.visits[].syncKey] | unique | length == 35)
-          ' "$dry_file" >/dev/null
+          ' "$base_file" >/dev/null
 
-          jq '.dryRun = false' "$dry_file" > "$live_file"
-
-          echo "dry_file=$dry_file" >> "$GITHUB_OUTPUT"
-          echo "live_file=$live_file" >> "$GITHUB_OUTPUT"
-
-      - name: Reconfirm safe preflight
-        shell: bash
-        run: |
-          response_file="$RUNNER_TEMP/technical-safety-preflight-response.json"
-          status="$(
-            curl --silent --show-error --location               --output "$response_file"               --write-out '%{http_code}'               --request POST               "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync"               --header "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY"               --header "Content-Type: application/json"               --data-binary "@${{ steps.payload.outputs.dry_file }}"
-          )"
-
-          if [ "$status" != "200" ]; then
-            safe_error="$(jq -c '{error, message}' "$response_file" 2>/dev/null || printf '{"error":"invalid_response"}')"
-            echo "::error::Preflight returned HTTP $status: $safe_error"
-            exit 1
-          fi
+          jq '
+            .sourceFile as $source
+            | .visits |= map(
+                .company |= gsub("\\s+"; " ")
+                | .location |= (gsub("\\s+,"; ",") | gsub(",?\\s*null\\s*$"; ""))
+                | .syncKey = ("TA-SYNC|" + $source + "|" + .visitAt + "|" + .company)
+                | .notes = .syncKey
+              )
+          ' "$base_file" > "$canonical_file"
 
           jq -e '
-            .dryRun == true
-            and .sourceFile == "2026_09.pdf"
-            and .created == 35
-            and .updated == 0
-            and .deleted == 0
-            and .unchanged == 0
-            and .total == 35
-          ' "$response_file" >/dev/null || {
-            echo "::error::Production state changed since approval. No live sync was performed."
-            jq -c '{created, updated, deleted, unchanged, total}' "$response_file"
-            exit 1
-          }
+            ([.visits[].syncKey] | unique | length) == 35
+            and all(.visits[]; .notes == .syncKey)
+          ' "$canonical_file" >/dev/null
 
-      - name: Apply production sync
+          echo "payload_file=$canonical_file" >> "$GITHUB_OUTPUT"
+
+      - name: Reconfirm both owners without writes
         shell: bash
         run: |
-          response_file="$RUNNER_TEMP/technical-safety-live-response.json"
-          status="$(
-            curl --silent --show-error --location               --output "$response_file"               --write-out '%{http_code}'               --request POST               "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync"               --header "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY"               --header "Content-Type: application/json"               --data-binary "@${{ steps.payload.outputs.live_file }}"
-          )"
+          for owner in elias thomas
+          do
+            request_file="$RUNNER_TEMP/preflight-request-$owner.json"
+            response_file="$RUNNER_TEMP/preflight-response-$owner.json"
+            jq --arg owner "$owner" '.owner = $owner | .dryRun = true' \
+              "${{ steps.payload.outputs.payload_file }}" > "$request_file"
 
-          if [ "$status" != "200" ]; then
-            safe_error="$(jq -c '{error, message}' "$response_file" 2>/dev/null || printf '{"error":"invalid_response"}')"
-            echo "::error::Production sync returned HTTP $status: $safe_error"
-            exit 1
-          fi
+            status="$(curl --silent --show-error --location \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --request POST \
+              "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync" \
+              --header "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$request_file")"
 
-          jq -e '
-            .dryRun == false
-            and .sourceFile == "2026_09.pdf"
-            and .total == 35
-          ' "$response_file" >/dev/null
+            if [ "$status" != "200" ]; then
+              safe_error="$(jq -c '{error, owner, message}' "$response_file" 2>/dev/null || printf '{"error":"invalid_response"}')"
+              echo "::error::Preflight for $owner returned HTTP $status: $safe_error"
+              exit 1
+            fi
 
-          created="$(jq -r '.created' "$response_file")"
-          updated="$(jq -r '.updated' "$response_file")"
-          deleted="$(jq -r '.deleted' "$response_file")"
-          unchanged="$(jq -r '.unchanged' "$response_file")"
-          total="$(jq -r '.total' "$response_file")"
+            jq -e --arg owner "$owner" '
+              .owner == $owner
+              and .dryRun == true
+              and .sourceFile == "2026_09.pdf"
+              and .total == 35
+            ' "$response_file" >/dev/null || {
+              echo "::error::Unexpected preflight response for $owner. No live sync was performed."
+              exit 1
+            }
+          done
 
+      - name: Apply production sync to both owners
+        shell: bash
+        run: |
+          for owner in elias thomas
+          do
+            request_file="$RUNNER_TEMP/live-request-$owner.json"
+            response_file="$RUNNER_TEMP/live-response-$owner.json"
+            jq --arg owner "$owner" '.owner = $owner | .dryRun = false' \
+              "${{ steps.payload.outputs.payload_file }}" > "$request_file"
+
+            status="$(curl --silent --show-error --location \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --request POST \
+              "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync" \
+              --header "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY" \
+              --header "Content-Type: application/json" \
+              --data-binary "@$request_file")"
+
+            if [ "$status" != "200" ]; then
+              safe_error="$(jq -c '{error, owner, message}' "$response_file" 2>/dev/null || printf '{"error":"invalid_response"}')"
+              echo "::error::Production sync for $owner returned HTTP $status: $safe_error"
+              exit 1
+            fi
+
+            jq -e --arg owner "$owner" '
+              .owner == $owner
+              and .dryRun == false
+              and .sourceFile == "2026_09.pdf"
+              and .total == 35
+            ' "$response_file" >/dev/null
+
+            jq -r '"- " + .owner + ": created " + (.created|tostring) + ", updated " + (.updated|tostring) + ", deleted " + (.deleted|tostring) + ", unchanged " + (.unchanged|tostring)' \
+              "$response_file" >> "$RUNNER_TEMP/summary-lines.txt"
+          done
+
+      - name: Write production summary
+        shell: bash
+        run: |
           {
-            echo "## Technical Safety production sync"
+            echo "## Technical Safety two-owner production sync"
             echo
-            echo "- Source: `2026_09.pdf`"
-            echo "- Created: $created"
-            echo "- Updated: $updated"
-            echo "- Deleted: $deleted"
-            echo "- Unchanged: $unchanged"
-            echo "- Total: $total"
+            echo "- Source: 2026_09.pdf"
+            cat "$RUNNER_TEMP/summary-lines.txt"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove temporary files
         if: always()
         shell: bash
-        run: |
-          rm -f             "$RUNNER_TEMP/technical-safety-dry-run.json"             "$RUNNER_TEMP/technical-safety-live.json"             "$RUNNER_TEMP/technical-safety-preflight-response.json"             "$RUNNER_TEMP/technical-safety-live-response.json"
+        run: rm -f "$RUNNER_TEMP"/technical-safety-*.json "$RUNNER_TEMP"/*-request-*.json "$RUNNER_TEMP"/*-response-*.json "$RUNNER_TEMP/summary-lines.txt"
