@@ -1167,10 +1167,18 @@ function canModifyProject(proj) {
   return false;
 }
 
-// Team members (globally or per-category) see only tasks assigned to them
+// Team members see only tasks assigned to them, and only when it's their turn
+// (i.e. all preceding tasks in the phase are terminal: completed/cancelled/not_required)
 function visibleTasksInPhase(phase, catId) {
   const tasks = phase.tasks || [];
-  if (cuEffectiveRole(catId) === 'team_member') return tasks.filter(t => t.assigneeId === state.cu.id || (t.memberIds||[]).includes(state.cu.id));
+  if (cuEffectiveRole(catId) === 'team_member') {
+    const myId = state.cu.id;
+    return tasks.filter((t, idx) => {
+      const isMine = t.assigneeId === myId || (t.memberIds||[]).includes(myId);
+      if (!isMine) return false;
+      return tasks.slice(0, idx).every(prev => TERMINAL_TASK_STATUSES.has(prev.status));
+    });
+  }
   return tasks;
 }
 
@@ -10132,7 +10140,7 @@ function renderOffers() {
   const fPaid       = state.offersFilterPaid||'';
   const fCompleted  = state.offersFilterCompleted||'';
   const sortCol     = state.offersSortCol||'code';
-  const sortDir     = state.offersSortDir||'asc';
+  const sortDir     = state.offersSortDir||'desc';
 
   const allOffers = state.db.offers||[];
   const allCats   = [...new Set(allOffers.map(o=>o.category).filter(Boolean))].sort();
@@ -10197,10 +10205,10 @@ function renderOffers() {
       ? `<button class="btn btn-ghost btn-sm" data-action="offer-file" data-oid="${o.id}" title="Σύνδεση αρχείου" style="font-size:.72rem;padding:2px 6px">${fileHref?'📎':'📁'}</button>`
       : (fileHref ? `<a href="${esc(fileHref)}" target="_blank" title="${esc(fileHref)}" style="font-size:.85rem">📎</a>` : '');
     return `<tr class="crm-tr">
-      <td class="crm-td" style="${tdCtr}">${fileBtn}</td>
-      <td class="crm-td" style="${tdStyle};white-space:nowrap;font-weight:600">${esc(o.code||'—')}</td>
-      <td class="crm-td" style="${tdStyle};white-space:nowrap">${fmt(o.date)}</td>
-      <td class="crm-td" style="${tdStyle}">${esc(o.clientName||'—')}</td>
+      <td class="crm-td" style="${tdCtr};position:sticky;left:0;z-index:2;background:var(--white);width:50px">${fileBtn}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap;font-weight:600;position:sticky;left:50px;z-index:2;background:var(--white);width:115px">${esc(o.code||'—')}</td>
+      <td class="crm-td" style="${tdStyle};white-space:nowrap;position:sticky;left:165px;z-index:2;background:var(--white);width:110px">${fmt(o.date)}</td>
+      <td class="crm-td" style="${tdStyle};position:sticky;left:275px;z-index:2;background:var(--white);width:170px;box-shadow:2px 0 6px rgba(0,0,0,.1)">${esc(o.clientName||'—')}</td>
       <td class="crm-td" style="${tdStyle}">${esc(o.clientVia||'—')}</td>
       <td class="crm-td" style="${tdStyle}">${esc(o.category||'—')}</td>
       <td class="crm-td" style="${tdStyle};max-width:200px">${esc(o.title||'—')}</td>
@@ -10239,14 +10247,14 @@ function renderOffers() {
     </div>
   </div>
   ${offers.length ? `
-  <div id="offers-top-scroll" style="overflow-x:auto;overflow-y:hidden;height:14px;border-bottom:1px solid var(--border)"><div id="offers-top-inner" style="height:1px;min-width:1400px"></div></div>
+  <div id="offers-top-scroll" style="overflow-x:auto;overflow-y:hidden;height:28px;border-bottom:1px solid var(--border)"><div id="offers-top-inner" style="height:27px;min-width:1400px"></div></div>
   <div id="offers-table-wrap" class="crm-table-wrap" style="overflow-x:auto;overflow-y:auto;max-height:calc(100vh - 300px)">
     <table class="crm-table" style="min-width:1400px">
     <thead><tr>
-      <th class="crm-th" style="${thStyle};text-align:center">Αρχείο</th>
-      ${thSort('code','Offer No.')}
-      ${thSort('date','Ημερομηνία')}
-      ${thSort('clientName','Επωνυμία')}
+      <th class="crm-th" style="${thStyle};text-align:center;position:sticky;left:0;z-index:3;background:var(--white);width:50px">Αρχείο</th>
+      ${thSort('code','Offer No.','position:sticky;left:50px;z-index:3;background:var(--white);width:115px')}
+      ${thSort('date','Ημερομηνία','position:sticky;left:165px;z-index:3;background:var(--white);width:110px')}
+      ${thSort('clientName','Επωνυμία','position:sticky;left:275px;z-index:3;background:var(--white);width:170px;box-shadow:2px 0 6px rgba(0,0,0,.1)')}
       ${thSort('clientVia','Μέσω')}
       ${thSort('category','Κατηγορία Έργου')}
       ${thSort('title','Περιγραφή Έργου')}
