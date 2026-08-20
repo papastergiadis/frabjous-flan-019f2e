@@ -1,0 +1,100 @@
+name: Deploy Technical Safety Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type DEPLOY to apply the production migration and deploy the function"
+        required: true
+        type: string
+      run_db_dry_run:
+        description: "Run Supabase db push --dry-run before applying"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: technical-safety-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Supabase production
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      TECHNICAL_SAFETY_OWNER_USER_ID: ${{ secrets.TECHNICAL_SAFETY_OWNER_USER_ID }}
+      TECHNICAL_SAFETY_SYNC_KEY: ${{ secrets.TECHNICAL_SAFETY_SYNC_KEY }}
+
+    steps:
+      - name: Require explicit production confirmation
+        shell: bash
+        run: |
+          if [ "${{ inputs.confirmation }}" != "DEPLOY" ]; then
+            echo "::error::Deployment stopped. Enter exactly DEPLOY."
+            exit 1
+          fi
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in             SUPABASE_ACCESS_TOKEN             SUPABASE_PROJECT_REF             SUPABASE_DB_PASSWORD             TECHNICAL_SAFETY_OWNER_USER_ID             TECHNICAL_SAFETY_SYNC_KEY
+          do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing GitHub secret: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.115.0
+
+      - name: Link Supabase project
+        shell: bash
+        run: |
+          supabase link             --project-ref "$SUPABASE_PROJECT_REF"             --password "$SUPABASE_DB_PASSWORD"
+
+      - name: Preview database migration
+        if: ${{ inputs.run_db_dry_run }}
+        shell: bash
+        run: supabase db push --dry-run --password "$SUPABASE_DB_PASSWORD"
+
+      - name: Apply database migration
+        shell: bash
+        run: supabase db push --password "$SUPABASE_DB_PASSWORD"
+
+      - name: Configure Edge Function secrets
+        shell: bash
+        run: |
+          supabase secrets set             "TECHNICAL_SAFETY_OWNER_USER_ID=$TECHNICAL_SAFETY_OWNER_USER_ID"             "TECHNICAL_SAFETY_SYNC_KEY=$TECHNICAL_SAFETY_SYNC_KEY"             --project-ref "$SUPABASE_PROJECT_REF"
+
+      - name: Deploy Technical Safety function
+        shell: bash
+        run: |
+          supabase functions deploy technical-safety-sync             --project-ref "$SUPABASE_PROJECT_REF"             --no-verify-jwt
+
+      - name: Write deployment summary
+        shell: bash
+        run: |
+          {
+            echo "## Technical Safety Sync"
+            echo
+            echo "- Database migration applied"
+            echo "- Edge Function secrets configured"
+            echo "- `technical-safety-sync` deployed"
+            echo "- Next step: execute a dry-run request for the target PDF"
+          } >> "$GITHUB_STEP_SUMMARY"
