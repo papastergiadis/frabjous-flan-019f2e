@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type DEPLOY to apply the production migration and deploy the function"
+        description: "Type DEPLOY-BOTH to deploy support for elias and thomas"
         required: true
         type: string
       run_db_dry_run:
@@ -30,15 +30,16 @@ jobs:
       SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
       SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
       SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-      TECHNICAL_SAFETY_OWNER_USER_ID: ${{ secrets.TECHNICAL_SAFETY_OWNER_USER_ID }}
+      TECHNICAL_SAFETY_ELIAS_USER_ID: ${{ secrets.TECHNICAL_SAFETY_OWNER_USER_ID }}
+      TECHNICAL_SAFETY_THOMAS_USER_ID: ${{ secrets.TECHNICAL_SAFETY_THOMAS_USER_ID }}
       TECHNICAL_SAFETY_SYNC_KEY: ${{ secrets.TECHNICAL_SAFETY_SYNC_KEY }}
 
     steps:
       - name: Require explicit production confirmation
         shell: bash
         run: |
-          if [ "${{ inputs.confirmation }}" != "DEPLOY" ]; then
-            echo "::error::Deployment stopped. Enter exactly DEPLOY."
+          if [ "${{ inputs.confirmation }}" != "DEPLOY-BOTH" ]; then
+            echo "::error::Deployment stopped. Enter exactly DEPLOY-BOTH."
             exit 1
           fi
 
@@ -46,7 +47,13 @@ jobs:
         shell: bash
         run: |
           missing=0
-          for name in             SUPABASE_ACCESS_TOKEN             SUPABASE_PROJECT_REF             SUPABASE_DB_PASSWORD             TECHNICAL_SAFETY_OWNER_USER_ID             TECHNICAL_SAFETY_SYNC_KEY
+          for name in \
+            SUPABASE_ACCESS_TOKEN \
+            SUPABASE_PROJECT_REF \
+            SUPABASE_DB_PASSWORD \
+            TECHNICAL_SAFETY_ELIAS_USER_ID \
+            TECHNICAL_SAFETY_THOMAS_USER_ID \
+            TECHNICAL_SAFETY_SYNC_KEY
           do
             if [ -z "${!name}" ]; then
               echo "::error::Missing GitHub secret: $name"
@@ -54,6 +61,22 @@ jobs:
             fi
           done
           exit "$missing"
+
+      - name: Validate owner IDs
+        shell: bash
+        run: |
+          uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+          for name in TECHNICAL_SAFETY_ELIAS_USER_ID TECHNICAL_SAFETY_THOMAS_USER_ID
+          do
+            if ! [[ "${!name}" =~ $uuid_re ]]; then
+              echo "::error::$name must be a Supabase Auth UUID."
+              exit 1
+            fi
+          done
+          if [ "$TECHNICAL_SAFETY_ELIAS_USER_ID" = "$TECHNICAL_SAFETY_THOMAS_USER_ID" ]; then
+            echo "::error::The elias and thomas Auth UUIDs must be different."
+            exit 1
+          fi
 
       - name: Check out repository
         uses: actions/checkout@v4
@@ -66,7 +89,9 @@ jobs:
       - name: Link Supabase project
         shell: bash
         run: |
-          supabase link             --project-ref "$SUPABASE_PROJECT_REF"             --password "$SUPABASE_DB_PASSWORD"
+          supabase link \
+            --project-ref "$SUPABASE_PROJECT_REF" \
+            --password "$SUPABASE_DB_PASSWORD"
 
       - name: Preview database migration
         if: ${{ inputs.run_db_dry_run }}
@@ -80,12 +105,18 @@ jobs:
       - name: Configure Edge Function secrets
         shell: bash
         run: |
-          supabase secrets set             "TECHNICAL_SAFETY_OWNER_USER_ID=$TECHNICAL_SAFETY_OWNER_USER_ID"             "TECHNICAL_SAFETY_SYNC_KEY=$TECHNICAL_SAFETY_SYNC_KEY"             --project-ref "$SUPABASE_PROJECT_REF"
+          supabase secrets set \
+            "TECHNICAL_SAFETY_ELIAS_USER_ID=$TECHNICAL_SAFETY_ELIAS_USER_ID" \
+            "TECHNICAL_SAFETY_THOMAS_USER_ID=$TECHNICAL_SAFETY_THOMAS_USER_ID" \
+            "TECHNICAL_SAFETY_SYNC_KEY=$TECHNICAL_SAFETY_SYNC_KEY" \
+            --project-ref "$SUPABASE_PROJECT_REF"
 
       - name: Deploy Technical Safety function
         shell: bash
         run: |
-          supabase functions deploy technical-safety-sync             --project-ref "$SUPABASE_PROJECT_REF"             --no-verify-jwt
+          supabase functions deploy technical-safety-sync \
+            --project-ref "$SUPABASE_PROJECT_REF" \
+            --no-verify-jwt
 
       - name: Write deployment summary
         shell: bash
@@ -93,8 +124,8 @@ jobs:
           {
             echo "## Technical Safety Sync"
             echo
-            echo "- Database migration applied"
-            echo "- Edge Function secrets configured"
-            echo "- `technical-safety-sync` deployed"
-            echo "- Next step: execute a dry-run request for the target PDF"
+            echo "- Edge Function configured for elias and thomas"
+            echo "- Database migrations applied"
+            echo "- technical-safety-sync deployed"
+            echo "- Next step: run the two-owner dry-run workflow"
           } >> "$GITHUB_STEP_SUMMARY"

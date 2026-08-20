@@ -5,6 +5,8 @@ const JSON_HEADERS = {
   "cache-control": "no-store",
 };
 
+type SyncOwner = "elias" | "thomas";
+
 type SyncVisitInput = {
   syncKey: string;
   company: string;
@@ -17,6 +19,7 @@ type SyncVisitInput = {
 };
 
 type SyncRequest = {
+  owner: SyncOwner;
   sourceFile: string;
   sourceChecksum?: string;
   dryRun?: boolean;
@@ -96,6 +99,10 @@ function duration(value: unknown) {
 function validateRequest(value: unknown): SyncRequest {
   if (!value || typeof value !== "object") throw new Error("Request body must be an object");
   const body = value as Record<string, unknown>;
+  if (body.owner !== "elias" && body.owner !== "thomas") {
+    throw new Error("owner must be elias or thomas");
+  }
+  const owner = body.owner;
   const sourceFile = requireText(body.sourceFile, "sourceFile", 64);
   if (!/^[0-9]{4}_[0-9]{2}\.pdf$/.test(sourceFile)) {
     throw new Error("sourceFile must use the YYYY_MM.pdf format");
@@ -109,6 +116,9 @@ function validateRequest(value: unknown): SyncRequest {
     if (!raw || typeof raw !== "object") throw new Error(`visits[${index}] must be an object`);
     const item = raw as Record<string, unknown>;
     const syncKey = requireText(item.syncKey, `visits[${index}].syncKey`, 180);
+    if (!syncKey.startsWith(`TA-SYNC|${sourceFile}|`)) {
+      throw new Error(`visits[${index}].syncKey must start with TA-SYNC|${sourceFile}|`);
+    }
     if (seen.has(syncKey)) throw new Error(`Duplicate syncKey: ${syncKey}`);
     seen.add(syncKey);
     return {
@@ -124,6 +134,7 @@ function validateRequest(value: unknown): SyncRequest {
   });
 
   return {
+    owner,
     sourceFile,
     sourceChecksum:
       body.sourceChecksum == null ? undefined : requireText(body.sourceChecksum, "sourceChecksum", 128),
@@ -138,11 +149,17 @@ Deno.serve(async (request) => {
   }
 
   const expectedKey = Deno.env.get("TECHNICAL_SAFETY_SYNC_KEY") || "";
-  const ownerUserId = Deno.env.get("TECHNICAL_SAFETY_OWNER_USER_ID") || "";
+  const ownerUserIds: Record<SyncOwner, string> = {
+    elias:
+      Deno.env.get("TECHNICAL_SAFETY_ELIAS_USER_ID") ||
+      Deno.env.get("TECHNICAL_SAFETY_OWNER_USER_ID") ||
+      "",
+    thomas: Deno.env.get("TECHNICAL_SAFETY_THOMAS_USER_ID") || "",
+  };
   const supabaseUrl = Deno.env.get("SUPABASE_URL") || "";
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
 
-  if (!expectedKey || !ownerUserId || !supabaseUrl || !serviceRoleKey) {
+  if (!expectedKey || !supabaseUrl || !serviceRoleKey) {
     console.error("Technical Safety sync is missing required server-side configuration");
     return reply(503, { error: "service_not_configured" });
   }
@@ -156,12 +173,19 @@ Deno.serve(async (request) => {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
+  let owner: SyncOwner | null = null;
+  let ownerUserId = "";
   let sourceFile = "unknown";
   let sourceChecksum: string | null = null;
   let dryRun = false;
 
   try {
     const payload = validateRequest(await request.json());
+    owner = payload.owner;
+    ownerUserId = ownerUserIds[owner];
+    if (!ownerUserId) {
+      return reply(503, { error: "owner_not_configured", owner });
+    }
     sourceFile = payload.sourceFile;
     sourceChecksum = payload.sourceChecksum || null;
     dryRun = payload.dryRun === true;
@@ -248,6 +272,7 @@ Deno.serve(async (request) => {
     }
 
     const result = {
+      owner,
       sourceFile,
       dryRun,
       created: created.length,
@@ -275,7 +300,7 @@ Deno.serve(async (request) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error("Technical Safety sync failed", message);
 
-    if (sourceFile !== "unknown") {
+    if (ownerUserId && sourceFile !== "unknown") {
       await supabase.from("be_safety_sync_runs").insert({
         owner_auth_user_id: ownerUserId,
         source_file: sourceFile,
@@ -288,6 +313,6 @@ Deno.serve(async (request) => {
       });
     }
 
-    return reply(400, { error: "sync_failed", message });
+    return reply(400, { error: "sync_failed", owner, message });
   }
 });

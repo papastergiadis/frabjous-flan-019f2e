@@ -1,54 +1,47 @@
 # Technical Safety sync
 
-This integration replaces browser automation with a scoped server-side endpoint.
+This integration replaces browser automation with a scoped server-side endpoint for the
+`elias` and `thomas` Project Tracking users.
 
 ## Security model
 
 - Visits are stored in `public.be_safety_visits` and protected by Row Level Security.
 - Signed-in users can access only rows whose `owner_auth_user_id` equals `auth.uid()`.
 - The Edge Function uses the Supabase service role only on the server.
+- Requests may select only the allow-listed aliases `elias` or `thomas`; the corresponding
+  Auth UUIDs remain server-side secrets.
 - The sync endpoint can manage only rows marked `sync_source = 'TA-SYNC'`.
 - Full-sync deletions are additionally limited to one owner and one `YYYY_MM.pdf` source file.
-- Never commit the service-role key or the sync key.
+- Manual visits are never deleted by this endpoint.
+- Never commit the service-role key, owner UUIDs, or the sync key.
 
-## Deployment
+## Required Edge Function secrets
 
-1. Apply `supabase/migrations/20260820120000_technical_safety_sync.sql`.
-2. In Supabase Authentication → Users, copy the UUID of the Auth user that owns the
-   `elias` Project Tracking profile.
-3. Generate a high-entropy random secret for the integration.
-4. Configure these Edge Function secrets:
-
-   - `TECHNICAL_SAFETY_OWNER_USER_ID`: the Auth UUID from step 2.
-   - `TECHNICAL_SAFETY_SYNC_KEY`: the generated integration secret.
-   - `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are supplied by Supabase.
-
-5. Deploy `technical-safety-sync` with Supabase JWT verification disabled. The function
-   performs its own Bearer-key verification. Do not expose the key to the frontend.
-6. Deploy the updated frontend after the migration is live.
+- `TECHNICAL_SAFETY_ELIAS_USER_ID`: Supabase Auth UUID for `elias`. During migration,
+  `TECHNICAL_SAFETY_OWNER_USER_ID` remains a supported fallback for this owner.
+- `TECHNICAL_SAFETY_THOMAS_USER_ID`: Supabase Auth UUID for `thomas`.
+- `TECHNICAL_SAFETY_SYNC_KEY`: high-entropy Bearer key for the integration.
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are supplied by Supabase.
 
 ## Request format
 
-Send `POST /functions/v1/technical-safety-sync` with:
-
-```http
-Authorization: Bearer <TECHNICAL_SAFETY_SYNC_KEY>
-Content-Type: application/json
-```
+Send `POST /functions/v1/technical-safety-sync` with the integration Bearer key and a body
+like this:
 
 ```json
 {
+  "owner": "elias",
   "sourceFile": "2026_09.pdf",
-  "sourceChecksum": "sha256-of-the-pdf",
+  "sourceChecksum": "dropbox-revision-or-checksum",
   "dryRun": true,
   "visits": [
     {
-      "syncKey": "row-001",
+      "syncKey": "TA-SYNC|2026_09.pdf|2026-09-01T08:00:00+03:00|AXL IMPERIAL LTD ΥΠΟΚΑΤΑΣΤΗΜΑ ΕΛΛΑΔΟΣ",
       "company": "AXL IMPERIAL LTD ΥΠΟΚΑΤΑΣΤΗΜΑ ΕΛΛΑΔΟΣ",
       "visitAt": "2026-09-01T08:00:00+03:00",
       "durationMinutes": 120,
-      "location": "5ο χλμ Π.Ε.Ο. Θηβών Χαλκίδας, 32200",
-      "notes": "",
+      "location": "5οχλμ Π.Ε.Ο. Θηβών Χαλκίδας, 32200",
+      "notes": "TA-SYNC|2026_09.pdf|2026-09-01T08:00:00+03:00|AXL IMPERIAL LTD ΥΠΟΚΑΤΑΣΤΗΜΑ ΕΛΛΑΔΟΣ",
       "reminderAt": null,
       "completed": false
     }
@@ -56,37 +49,25 @@ Content-Type: application/json
 }
 ```
 
-All timestamps must contain a timezone. Run once with `dryRun: true`, review the counts,
-then repeat the identical request with `dryRun: false`.
+`owner` must be `elias` or `thomas`. Every `syncKey` must start with
+`TA-SYNC|<sourceFile>|`.
+
+## Deployment and execution
+
+1. Add `TECHNICAL_SAFETY_THOMAS_USER_ID` as a protected GitHub Actions secret.
+2. Run **Deploy Technical Safety Sync** with confirmation `DEPLOY-BOTH`.
+3. Run **Dry Run Technical Safety Sync** with confirmation `DRY-RUN-BOTH`.
+4. Review both owner summaries.
+5. Run **Sync Technical Safety Visits** with confirmation `SYNC-BOTH-35`.
+
+The two-owner workflows validate both dry-run responses before any production visit write.
+The stored Base64 payload is canonicalized at runtime so the stable `TA-SYNC` identifier is
+used as both `syncKey` and `notes` without exposing visit content in the repository.
 
 ## Idempotency and deletion rules
 
-- `syncKey` must be stable for the same PDF row across reruns.
-- The function derives a deterministic row ID from owner, source file, and sync key.
+- The function derives a deterministic row ID from owner UUID, source file, and sync key.
 - Identical rows are returned as `unchanged`.
-- Missing rows are deleted only when they were previously created by `TA-SYNC` for the
-  same owner and source file.
-- Manual visits are never deleted by this endpoint.
-
-## Rollback
-
-The frontend retains a compatibility fallback to existing Supabase Auth metadata if the
-new table has not yet been deployed. Once the migration is live, existing metadata visits
-are copied into the table on the user's first successful sign-in.
-
-
-## GitHub Actions deployment
-
-After this branch is merged, add the following repository or protected
-`production` environment secrets in GitHub:
-
-- `SUPABASE_ACCESS_TOKEN`
-- `SUPABASE_PROJECT_REF`
-- `SUPABASE_DB_PASSWORD`
-- `TECHNICAL_SAFETY_OWNER_USER_ID`
-- `TECHNICAL_SAFETY_SYNC_KEY`
-
-Then open Actions → **Deploy Technical Safety Sync** → **Run workflow**. Enter exactly
-`DEPLOY`. The workflow first validates configuration, optionally previews the database
-migration, applies it, sets the Edge Function secrets, and deploys the function. It is
-manual-only and never runs on a push or pull request.
+- Missing rows are deleted only when they were created by `TA-SYNC` for the same owner and
+  source file.
+- Manual or unrelated rows are outside the deletion query.
