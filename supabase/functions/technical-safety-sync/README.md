@@ -73,3 +73,20 @@ then repeat the identical request with `dryRun: false`.
 The frontend retains a compatibility fallback to existing Supabase Auth metadata if the
 new table has not yet been deployed. Once the migration is live, existing metadata visits
 are copied into the table on the user's first successful sign-in.
+
+
+## GitHub Actions deployment
+
+After this branch is merged, add the following repository or protected
+`production` environment secrets in GitHub:
+
+- `SUPABASE_ACCESS_TOKEN`
+- `SUPABASE_PROJECT_REF`
+- `SUPABASE_DB_PASSWORD`
+- `TECHNICAL_SAFETY_OWNER_USER_ID`
+- `TECHNICAL_SAFETY_SYNC_KEY`
+
+Then open Actions → **Deploy Technical Safety Sync** → **Run workflow**. Enter exactly
+`DEPLOY`. The workflow first validates configuration, optionally previews the database
+migration, applies it, sets the Edge Function secrets, and deploys the function. It is
+manual-only and never runs on a push or pull request.
