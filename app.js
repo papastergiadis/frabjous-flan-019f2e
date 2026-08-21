@@ -1,6 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
+   Last Revision: 21/08/2026 18:37
    ================================================================ */
 'use strict';
 
@@ -821,6 +822,7 @@ const state = {
   sortByPriority: false,
   ganttView:    false,
   ganttScale:   'month',
+  projectTab:   'tasks',
   dashSortMode: 'deadline',
   dashSortOpen: false,
   asgnSortMode: 'smart',
@@ -2492,7 +2494,7 @@ function navigate(view, opts={}) {
   if (view!=='login' && !state.cu) { state.view='login'; render(); return; }
   state.view=view;
   if (opts.categoryId  !==undefined) state.categoryId  =opts.categoryId;
-  if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) state.ganttView=false; state.projectId=opts.projectId; }
+  if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) { state.ganttView=false; state.projectTab='tasks'; } state.projectId=opts.projectId; }
   if (opts.templateId  !==undefined) state.templateId  =opts.templateId;
   if (opts.crmCompanyId!==undefined) state.crmCompanyId=opts.crmCompanyId;
   if (opts.crmContactId!==undefined) state.crmContactId=opts.crmContactId;
@@ -4100,9 +4102,123 @@ function renderProject() {
     </div>
     <div class="cdh-progress-full">${renderProjectProgressChart(proj, prog)}</div>
   </div>
-  ${state.ganttView ? renderGantt(proj) : `<div class="phases-list">${phases}</div>`}
-  ${!isComp&&state.cu.role!=='client'?`<div class="card" style="margin-top:24px"><div class="section-hd" style="cursor:pointer" onclick="state._auditOpen=!state._auditOpen;this.nextElementSibling.style.display=state._auditOpen?'':'none'"><h3>📋 Ιστορικό Αλλαγών</h3><span style="color:var(--muted);font-size:.8rem">${state._auditOpen?'▲':'▼'}</span></div><div style="display:${state._auditOpen===true?'block':'none'};padding:0 4px">${renderProjectAuditTimeline(proj)}</div></div>`:''}
+  ${(()=>{
+    const msgCount=(proj.messages||[]).length;
+    const canSeeMessages=['admin','management','project_manager','team_member'].includes(state.cu?.role);
+    if(!canSeeMessages) return state.ganttView?renderGantt(proj):`<div class="phases-list">${phases}</div>`;
+    const activeTab=state.projectTab||'tasks';
+    const tabsHtml=`<div class="proj-tabs" style="display:flex;gap:0;border-bottom:2px solid var(--slate-200);margin-bottom:0;margin-top:8px">
+      <button class="proj-tab-btn${activeTab==='tasks'?' proj-tab-active':''}" onclick="state.projectTab='tasks';render()" style="padding:10px 20px;border:none;background:none;cursor:pointer;font-size:.88rem;font-weight:600;color:${activeTab==='tasks'?'var(--orange)':'var(--muted)'};border-bottom:${activeTab==='tasks'?'2px solid var(--orange)':'2px solid transparent'};margin-bottom:-2px;transition:color .15s">📋 Εργασίες</button>
+      <button class="proj-tab-btn${activeTab==='messages'?' proj-tab-active':''}" onclick="state.projectTab='messages';render()" style="padding:10px 20px;border:none;background:none;cursor:pointer;font-size:.88rem;font-weight:600;color:${activeTab==='messages'?'var(--orange)':'var(--muted)'};border-bottom:${activeTab==='messages'?'2px solid var(--orange)':'2px solid transparent'};margin-bottom:-2px;transition:color .15s">💬 Μηνύματα${msgCount>0?` <span style="display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:9px;font-size:.68rem;font-weight:700;background:${activeTab==='messages'?'var(--orange)':'var(--slate-400)'};color:#fff;margin-left:5px">${msgCount}</span>`:''}</button>
+    </div>`;
+    if(activeTab==='messages') return tabsHtml+renderProjectMessages(proj);
+    return tabsHtml+(state.ganttView?renderGantt(proj):`<div class="phases-list">${phases}</div>`);
+  })()}
+  ${state.projectTab!=='messages'&&!isComp&&state.cu.role!=='client'?`<div class="card" style="margin-top:24px"><div class="section-hd" style="cursor:pointer" onclick="state._auditOpen=!state._auditOpen;this.nextElementSibling.style.display=state._auditOpen?'':'none'"><h3>📋 Ιστορικό Αλλαγών</h3><span style="color:var(--muted);font-size:.8rem">${state._auditOpen?'▲':'▼'}</span></div><div style="display:${state._auditOpen===true?'block':'none'};padding:0 4px">${renderProjectAuditTimeline(proj)}</div></div>`:''}
   ${renderBulkBar()}`;
+}
+
+// ── PROJECT MESSAGES ─────────────────────────────────────────────
+function renderProjectMessages(proj) {
+  const canPost=['admin','management','project_manager'].includes(state.cu?.role);
+  const isTeamMember=state.cu?.role==='team_member';
+  const msgs=(proj.messages||[]).slice().reverse(); // νεώτερα πρώτα
+
+  const ROLE_LABELS={admin:'Διαχειριστής',management:'Διοίκηση',project_manager:'Υπ. Έργου',team_member:'Μέλος Ομάδας',client:'Πελάτης'};
+  const ROLE_COLORS={admin:'#7c3aed',management:'#0284c7',project_manager:'#059669',team_member:'#ea580c',client:'#6b7280'};
+
+  const msgsHtml=msgs.length===0
+    ? '<div class="empty-state" style="padding:48px 20px"><div class="es-icon">💬</div><h3>Δεν υπάρχουν μηνύματα</h3><p>Ξεκινήστε μια συζήτηση για το έργο.</p></div>'
+    : msgs.map(m=>{
+        const initials=(m.userName||'?').split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();
+        const roleLbl=ROLE_LABELS[m.role]||m.role;
+        const roleColor=ROLE_COLORS[m.role]||'#6b7280';
+        const canDel=(state.cu?.id===m.userId)||(['admin','management'].includes(state.cu?.role));
+        return `<div class="proj-msg-row" style="display:flex;gap:12px;padding:14px 0;border-bottom:1px solid var(--slate-100)">
+          <div style="flex-shrink:0;width:38px;height:38px;border-radius:50%;background:${roleColor}22;color:${roleColor};display:flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:700">${initials}</div>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:5px">
+              <span style="font-weight:700;font-size:.88rem">${esc(m.userName||'—')}</span>
+              <span style="font-size:.68rem;font-weight:600;padding:1px 7px;border-radius:9px;background:${roleColor}18;color:${roleColor}">${roleLbl}</span>
+              <span style="font-size:.72rem;color:var(--muted);margin-left:auto">${fmtDT(m.at)}</span>
+              ${canDel?`<button class="btn btn-ghost btn-icon btn-sm" data-action="delete-project-message" data-pid="${proj.id}" data-mid="${m.id}" title="Διαγραφή μηνύματος" style="color:var(--muted);font-size:.7rem;padding:2px 6px">🗑</button>`:''}
+            </div>
+            <div style="font-size:.88rem;line-height:1.55;white-space:pre-wrap;word-break:break-word">${esc(m.text)}</div>
+          </div>
+        </div>`;
+      }).join('');
+
+  const inputHtml=canPost
+    ? `<div style="display:flex;gap:10px;align-items:flex-end;margin-top:16px">
+        <textarea id="proj-msg-input" class="form-control" rows="2" placeholder="Γράψτε μήνυμα…" style="flex:1;resize:vertical;min-height:60px;font-size:.88rem" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendProjectMessage('${proj.id}')}"></textarea>
+        <button class="btn btn-primary" onclick="sendProjectMessage('${proj.id}')" style="height:60px;padding:0 18px">Αποστολή</button>
+      </div>`
+    : isTeamMember
+    ? `<div style="margin-top:16px;padding:12px 16px;background:var(--slate-50);border-radius:8px;font-size:.83rem;color:var(--muted)">💬 Για να στείλετε μήνυμα, επικοινωνήστε με τον Υπεύθυνο Έργου.</div>`
+    : '';
+
+  return `<div class="card" style="margin-top:0;border-top-left-radius:0;border-top-right-radius:0">
+    <div style="padding:16px 20px 0 20px;max-height:520px;overflow-y:auto" id="proj-msgs-list">${msgsHtml}</div>
+    <div style="padding:0 20px 20px 20px">${inputHtml}</div>
+  </div>`;
+}
+
+async function sendProjectMessage(pid) {
+  const proj=getProject(pid); if(!proj) return;
+  const inp=document.getElementById('proj-msg-input');
+  const text=(inp?.value||'').trim(); if(!text) return;
+  if(!['admin','management','project_manager'].includes(state.cu?.role)){
+    showToast('Δεν έχετε δικαίωμα αποστολής μηνύματος.','error'); return;
+  }
+  const msg={id:'msg_'+uid(),userId:state.cu.id,userName:state.cu.name,role:state.cu.role,text,at:nowTS()};
+  if(!proj.messages) proj.messages=[];
+  proj.messages.push(msg);
+  inp.value='';
+  try {
+    await dbSaveProject(proj);
+    // Ειδοποίηση σε όλα τα μέλη του έργου
+    const managerIds=projManagerIds(proj);
+    const memberIds=[...new Set((proj.phases||[]).flatMap(ph=>(ph.tasks||[]).flatMap(t=>[t.assigneeId,...(t.memberIds||[])]).filter(Boolean)))];
+    const managementIds=(state.db.users||[]).filter(u=>u.role==='management'&&u.active!==false).map(u=>u.id);
+    const recipients=uniqRecipients([...managerIds,...memberIds,...managementIds],state.cu.id);
+    const actor=state.cu;
+    const notifTitle=`💬 Μήνυμα από ${actor.name}: ${proj.name}`;
+    const notifBody=text.length>100?text.slice(0,97)+'…':text;
+    if(isSupabaseAuthMode()){
+      await sb.rpc('app_notification_emit',{
+        p_event_type:'project_message',
+        p_project_id:proj.id,
+        p_phase_id:null,
+        p_task_id:null,
+        p_subtask_id:null,
+        p_message:notifBody
+      }).catch(e=>console.warn('project_message notify:',e));
+    } else {
+      for(const uid2 of recipients){
+        await pushLegacyNotificationToUser(uid2,{
+          id:'n_'+uid(),type:'project_message',priority:'normal',
+          title:notifTitle,sub:notifBody,
+          projId:proj.id,at:nowTS(),read:false
+        }).catch(e=>console.warn('project_message legacy notify:',e));
+      }
+    }
+    render();
+  } catch(e){ showToast('Σφάλμα αποστολής μηνύματος.','error'); console.error(e); }
+}
+
+async function deleteProjectMessage(pid, msgId) {
+  const proj=getProject(pid); if(!proj) return;
+  const msg=(proj.messages||[]).find(m=>m.id===msgId);
+  if(!msg) return;
+  const isOwner=state.cu?.id===msg.userId;
+  const isAdmin=['admin','management'].includes(state.cu?.role);
+  if(!isOwner&&!isAdmin){ showToast('Δεν έχετε δικαίωμα διαγραφής.','error'); return; }
+  proj.messages=(proj.messages||[]).filter(m=>m.id!==msgId);
+  try {
+    await dbSaveProject(proj);
+    render();
+    showToast('Μήνυμα διαγράφηκε.','');
+  } catch(e){ showToast('Σφάλμα διαγραφής μηνύματος.','error'); console.error(e); }
 }
 
 // ── VIEW: USERS ───────────────────────────────────────────────────
@@ -5794,6 +5910,7 @@ function handleClick(e) {
     case 'send-client-reminder':    showModalClientReminder(pid); break;
     case 'toggle-notif':       navigate('notifications'); break;
     case 'delete-project':     confirmDeleteProject(pid);                   break;
+    case 'delete-project-message': deleteProjectMessage(pid, btn.dataset.mid); break;
     case 'delete-user':        confirmDeleteUser(uidVal);                   break;
     case 'clear-audit':        clearAudit();                                break;
     case 'modal-add-timesheet':      showModalAddTimesheet();                       break;
