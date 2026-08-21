@@ -1,7 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
-   Last Revision: 21/08/2026 18:37
+   Last Revision: 21/08/2026 22:45
    ================================================================ */
 'use strict';
 
@@ -479,7 +479,7 @@ async function dbDeleteMeeting(meetingId) {
 async function crmSaveCompany(data) {
   if (!data.id) data.id = crypto.randomUUID();
   data.updated_at = new Date().toISOString();
-  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const delegated = !canManageSensitiveCrmCredentials();
   const {error} = delegated
     ? await sb.rpc('app_crm_company_save_delegated',{p_data:data})
     : await sb.from('companies').upsert(data);
@@ -493,7 +493,7 @@ async function crmSaveCompany(data) {
 async function crmDeleteCompany(id) {
   if (!confirm('Διαγραφή εταιρείας;')) return;
   const now = new Date().toISOString();
-  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const delegated = !canManageSensitiveCrmCredentials();
   const {error} = delegated
     ? await sb.rpc('app_crm_company_delete_delegated',{p_id:id})
     : await sb.from('companies').update({deleted_at:now}).eq('id',id);
@@ -506,7 +506,7 @@ async function crmDeleteCompany(id) {
 async function crmSaveContact(data) {
   if (!data.id) data.id = crypto.randomUUID();
   data.updated_at = new Date().toISOString();
-  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const delegated = !canManageSensitiveCrmCredentials();
   const {error} = delegated
     ? await sb.rpc('app_crm_contact_save_delegated',{p_data:data})
     : await sb.from('contacts').upsert(data);
@@ -516,17 +516,19 @@ async function crmSaveContact(data) {
   const idx = (state.db.crmContacts||[]).findIndex(x=>x.id===data.id);
   if (idx>=0) state.db.crmContacts[idx]=data;
   else state.db.crmContacts.push(data);
+  state._crmContactIndex = null; // invalidate cache
   return data;
 }
 async function crmDeleteContact(id) {
   if (!confirm('Διαγραφή επαφής;')) return;
   const now = new Date().toISOString();
-  const delegated = hasTemplatesCrmPermission() && !canManageSensitiveCrmCredentials();
+  const delegated = !canManageSensitiveCrmCredentials();
   const {error} = delegated
     ? await sb.rpc('app_crm_contact_delete_delegated',{p_id:id})
     : await sb.from('contacts').update({deleted_at:now}).eq('id',id);
   if (error) { showToast('Σφάλμα διαγραφής.','error'); throw error; }
   state.db.crmContacts = (state.db.crmContacts||[]).filter(x=>x.id!==id);
+  state._crmContactIndex = null; // invalidate cache
   if (state.view==='crm-contact') navigate('crm-contacts');
   else render();
   showToast('Επαφή διαγράφηκε.','');
@@ -655,6 +657,104 @@ function contactToGooglePerson(c) {
   return p;
 }
 
+// Convert Google Person → CRM contact fields
+function googlePersonToCrmContact(person) {
+  const c = {};
+  const name = (person.names||[])[0]||{};
+  c.first_name  = name.givenName||'';
+  c.last_name   = name.familyName||'';
+  if (name.middleName) c.middle_name = name.middleName;
+  const org = (person.organizations||[])[0]||{};
+  c.organization_name  = org.name||'';
+  c.organization_title = org.title||'';
+  const PHONE_LABEL={mobile:'κινητό',home:'σπίτι',work:'εργασία',main:'κύριο',workFax:'φαξ',other:'άλλο'};
+  (person.phoneNumbers||[]).slice(0,5).forEach((ph,i)=>{
+    c[`phone_${i+1}_value`]=ph.value||'';
+    c[`phone_${i+1}_label`]=PHONE_LABEL[ph.type]||ph.type||'';
+  });
+  const EMAIL_LABEL={work:'εργασία',home:'σπίτι',other:'άλλο'};
+  (person.emailAddresses||[]).slice(0,3).forEach((em,i)=>{
+    c[`email_${i+1}_value`]=em.value||'';
+    c[`email_${i+1}_label`]=EMAIL_LABEL[em.type]||em.type||'';
+  });
+  const addr=(person.addresses||[])[0]||{};
+  if (addr.streetAddress||addr.city||addr.postalCode) {
+    c.address_1_street      = addr.streetAddress||'';
+    c.address_1_city        = addr.city||'';
+    c.address_1_postal_code = addr.postalCode||'';
+  }
+  const bday=((person.birthdays||[])[0]||{}).date;
+  if (bday?.year&&bday?.month&&bday?.day)
+    c.birthday=`${bday.year}-${String(bday.month).padStart(2,'0')}-${String(bday.day).padStart(2,'0')}`;
+  const bio=(person.biographies||[])[0];
+  if (bio) c.notes=bio.value||'';
+  c.google_resource_name=person.resourceName;
+  c.google_etag=person.etag||null;
+  c.google_synced_at=new Date().toISOString();
+  return c;
+}
+
+// Get the latest updateTime from a Google Person's metadata
+function _googlePersonUpdateTime(person) {
+  let latest=0;
+  for (const src of (person.metadata?.sources||[])) {
+    if (src.updateTime) { const t=new Date(src.updateTime).getTime(); if(t>latest) latest=t; }
+  }
+  return latest||null;
+}
+
+// Sync all Google Contacts → CRM (last write wins by timestamp)
+async function syncFromGoogle() {
+  if (!googleConnected()) return;
+  showToast('⏳ Συγχρονισμός από Google Contacts…','');
+  let pageToken=null, allPersons=[];
+  try {
+    do {
+      const url='https://people.googleapis.com/v1/people/me/connections'
+        +'?personFields=names,organizations,phoneNumbers,emailAddresses,addresses,birthdays,biographies,metadata'
+        +'&pageSize=1000'+(pageToken?'&pageToken='+encodeURIComponent(pageToken):'');
+      const res=await _googleFetch('GET',url,undefined);
+      if (!res) break;
+      allPersons=allPersons.concat(res.connections||[]);
+      pageToken=res.nextPageToken||null;
+    } while(pageToken);
+  } catch(e) {
+    console.error('[google-contacts] syncFromGoogle:',e);
+    showToast('Σφάλμα ανάκτησης από Google Contacts.','error'); return;
+  }
+  let created=0,updated=0,skipped=0;
+  const now=new Date().toISOString();
+  for (const person of allPersons) {
+    if (!person.resourceName) continue;
+    const gTime=_googlePersonUpdateTime(person);
+    const existing=(state.db.crmContacts||[]).find(c=>c.google_resource_name===person.resourceName);
+    if (existing) {
+      const crmTime=existing.updated_at?new Date(existing.updated_at).getTime():0;
+      if (gTime&&gTime>crmTime) {
+        const fields=googlePersonToCrmContact(person);
+        const merged={...existing,...fields,updated_at:now};
+        try {
+          await sb.from('contacts').update(merged).eq('id',existing.id);
+          const idx=(state.db.crmContacts||[]).findIndex(x=>x.id===existing.id);
+          if(idx>=0) state.db.crmContacts[idx]=merged;
+          updated++;
+        } catch(e){ console.error('[google-contacts] update:',e); }
+      } else { skipped++; }
+    } else {
+      const fields=googlePersonToCrmContact(person);
+      const newC={id:uid(),...fields,created_at:now,updated_at:now};
+      try {
+        await sb.from('contacts').insert(newC);
+        state.db.crmContacts.push(newC);
+        created++;
+      } catch(e){ console.error('[google-contacts] insert:',e); }
+    }
+  }
+  state._crmContactIndex=null;
+  showToast(`✅ Google Sync: ${created} νέες, ${updated} ενημερώθηκαν, ${skipped} χωρίς αλλαγή`,'success');
+  render();
+}
+
 // Token state (persisted in localStorage)
 let _googleTokenClient = null;
 let _googleAccessToken = localStorage.getItem('g_access_token')||null;
@@ -677,6 +777,7 @@ function gsiLoaded() {
           localStorage.setItem('g_token_expiry', String(_googleTokenExpiry));
           showToast('Google Contacts συνδέθηκε ✓','success');
           render(); // refresh button state
+          syncFromGoogle();
         }
       },
     });
@@ -716,6 +817,7 @@ window.connectGoogle = function() {
             localStorage.setItem('g_token_expiry', String(_googleTokenExpiry));
             showToast('Google Contacts συνδέθηκε ✓','success');
             render();
+            syncFromGoogle();
           }
         },
       });
@@ -823,6 +925,9 @@ const state = {
   ganttView:    false,
   ganttScale:   'month',
   projectTab:   'tasks',
+  phaseTabs:    {},
+  crmContactPage: 1,
+  _crmContactIndex: null,
   dashSortMode: 'deadline',
   dashSortOpen: false,
   asgnSortMode: 'smart',
@@ -838,6 +943,7 @@ const state = {
   notificationFilter: 'all',
   notifSearch:  '',
   onlineUsers:  new Set(),
+  _userStatuses: {},  // { userId: status } — φορτώνεται στο users view
   storageStats: null, // { usedBytes, fileCount } loaded async
   offersSearch: '',
   offersStatus: '',
@@ -1188,6 +1294,12 @@ function canManageTemplatesAndCrm() {
 }
 function canManageSensitiveCrmCredentials() {
   return !!state.cu && ['admin','management'].includes(state.cu.role);
+}
+// Επεξεργασία/προσθήκη επαφών & εταιρειών CRM — επιτρέπεται και σε project_manager/team_member
+function canEditCrm() {
+  return !!state.cu && (
+    ['admin','management','project_manager','team_member'].includes(state.cu.role) || hasTemplatesCrmPermission(state.cu)
+  );
 }
 function canManageTemplates() { return canManageTemplatesAndCrm(); }
 function canViewTemplates()   { return state.cu && state.cu.role !== 'client'; }
@@ -2489,15 +2601,439 @@ function renderSafetyVisits() {
     <div class="notebook-table-wrap"><table class="notebook-table safety-table"><thead><tr><th></th><th>Εταιρεία / Τοποθεσία</th><th>Ημερομηνία & ώρα</th><th>Διάρκεια</th><th>Σημειώσεις</th><th>Υπενθύμιση</th><th>Αναγγελία</th><th>Ενέργειες</th></tr></thead><tbody>${rows||'<tr><td colspan="8"><div class="notebook-empty"><div>🛡️</div><strong>Δεν υπάρχουν επισκέψεις σε αυτή την προβολή</strong><span>Πατήστε «Νέα επίσκεψη» για την πρώτη καταχώριση.</span></div></td></tr>'}</tbody></table></div>`;
 }
 
+
+// ══════════════════════════════════════════════════════════════════════
+// TIME TRACKER — Phase 1  (navigation-based, no idle detection)
+// ══════════════════════════════════════════════════════════════════════
+
+/* ── View → context mapper ──────────────────────────────────────────── */
+const _TT_VIEW_MAP = {
+  // Έργα
+  'project':        () => ({ type:'project', id: state.projectId,  label: _ttProjectLabel(state.projectId) }),
+  'project-gantt':  () => ({ type:'project', id: state.projectId,  label: _ttProjectLabel(state.projectId) }),
+  'assigned':       () => ({ type:'project', id: state.projectId,  label: _ttProjectLabel(state.projectId) }),
+  // Γενικές ενότητες → ΓΡΑΦΕΙΟ
+  'dashboard':      () => ({ type:'office', id:'dashboard',  label:'ΓΡΑΦΕΙΟ – Dashboard' }),
+  'crm':            () => ({ type:'office', id:'crm',        label:'ΓΡΑΦΕΙΟ – CRM' }),
+  'crm-contacts':   () => ({ type:'office', id:'crm',        label:'ΓΡΑΦΕΙΟ – CRM' }),
+  'offers':         () => ({ type:'office', id:'offers',     label:'ΓΡΑΦΕΙΟ – Offers' }),
+  'timesheet':      () => ({ type:'office', id:'timesheet',  label:'ΓΡΑΦΕΙΟ – Timesheet' }),
+  'documents':      () => ({ type:'office', id:'documents',  label:'ΓΡΑΦΕΙΟ – Έγγραφα' }),
+  'reports':        () => ({ type:'office', id:'reports',    label:'ΓΡΑΦΕΙΟ – Reports' }),
+  'workload':       () => ({ type:'office', id:'workload',   label:'ΓΡΑΦΕΙΟ – Workload' }),
+  'notebook':       () => ({ type:'office', id:'notebook',   label:'ΓΡΑΦΕΙΟ – Notebook' }),
+  'safety':         () => ({ type:'office', id:'safety',     label:'ΓΡΑΦΕΙΟ – Safety' }),
+  'settings':       () => ({ type:'office', id:'settings',   label:'ΓΡΑΦΕΙΟ – Ρυθμίσεις' }),
+  'admin':          () => ({ type:'office', id:'admin',      label:'ΓΡΑΦΕΙΟ – Admin' }),
+  'audit':          () => ({ type:'office', id:'audit',      label:'ΓΡΑΦΕΙΟ – Audit Log' }),
+  'users':          () => ({ type:'office', id:'users',      label:'ΓΡΑΦΕΙΟ – Χρήστες' }),
+  'client-portal':  () => ({ type:'office', id:'client',    label:'ΓΡΑΦΕΙΟ – Client Portal' }),
+  'tt-reports':     () => ({ type:'office', id:'tt-reports',label:'ΓΡΑΦΕΙΟ – Αναφορές Χρόνου' }),
+};
+
+/* Views χωρίς timer */
+const _TT_NO_TRACK = new Set(['login','reset-password']);
+
+/* ── Status Layer (επεκτάσιμο: leave/sick/remote/training) ─────────── */
+/* ── Status metadata ─────────────────────────────────────────────────── */
+const _TT_STATUS_META = {
+  leave:    { label:'Άδεια',       emoji:'🏖️',  color:'#ef4444', timerOff:true  },
+  sick:     { label:'Ασθένεια',    emoji:'🤒',  color:'#f97316', timerOff:true  },
+  remote:   { label:'Τηλεργασία',  emoji:'🏠',  color:'#3b82f6', timerOff:false },
+  training: { label:'Εκπαίδευση', emoji:'📚',  color:'#8b5cf6', timerOff:false },
+};
+
+const StatusLayer = {
+  /* Διαβάζει state.cu.workStatus (ενημερώνεται από _ttLoadUserStatus) */
+  check() {
+    const s = state.cu && state.cu.workStatus;
+    if (!s) return { allowed: true, flag: null };
+    const meta = _TT_STATUS_META[s];
+    if (!meta) return { allowed: true, flag: null };
+    if (meta.timerOff) return { allowed: false, flag: null };
+    return { allowed: true, flag: s };
+  },
+
+  /* Φόρτωση status από be_user_status (καλείται μετά login) */
+  async loadMine() {
+    if (!isSupabaseAuthMode() || typeof sb === 'undefined' || !sb || !state.cu) return;
+    try {
+      const { data } = await sb.from('be_user_status')
+        .select('status, note').eq('user_id', state.cu.id).maybeSingle();
+      const newStatus = data ? data.status : null;
+      if (state.cu.workStatus !== newStatus) {
+        state.cu.workStatus = newStatus;
+        _updateSidebarFooter();
+        // Αν ο timer τρέχει και το νέο status το ακυρώνει → σταμάτα
+        if (TimeTracker._current && !this.check().allowed) {
+          TimeTracker.stopAll().catch(()=>{});
+        }
+        // Αν ο timer ΔΕΝ τρέχει και το νέο status το επιτρέπει → ξεκίνα
+        if (!TimeTracker._current && this.check().allowed) {
+          TimeTracker.switchTo(state.view).catch(()=>{});
+        }
+      }
+    } catch(e) {}
+  },
+
+  /* Αλλαγή status (ο ίδιος ο χρήστης: μόνο remote/training, ή admin) */
+  async setStatus(userId, status, note, adminMode) {
+    if (!isSupabaseAuthMode() || typeof sb === 'undefined' || !sb) return;
+    const payload = { user_id: userId, status: status || null, note: note || null,
+      set_by: state.cu && state.cu.id, updated_at: new Date().toISOString() };
+    try {
+      await sb.from('be_user_status').upsert(payload, { onConflict: 'user_id' });
+      if (!adminMode && state.cu && state.cu.id === userId) {
+        state.cu.workStatus = status || null;
+        _updateSidebarFooter();
+        if (!status || !this.check().allowed) {
+          await TimeTracker.stopAll();
+        } else {
+          await TimeTracker.switchTo(state.view);
+        }
+      }
+      showToast(status ? ('Status: ' + (_TT_STATUS_META[status]?.label || status)) : 'Status αφαιρέθηκε', 'success');
+    } catch(e) {
+      showToast('Αποτυχία αλλαγής status', 'error');
+    }
+  },
+
+  /* Φόρτωση status ΟΛΩΝ των χρηστών (μόνο για admin/management) */
+  async loadAll() {
+    if (!isSupabaseAuthMode() || typeof sb === 'undefined' || !sb || !isAdmin()) return [];
+    try {
+      const { data } = await sb.from('be_user_status').select('user_id, status, note, updated_at');
+      return data || [];
+    } catch(e) { return []; }
+  }
+};
+
+/* ── Helpers ─────────────────────────────────────────────────────────── */
+function _ttProjectLabel(pid) {
+  if (!pid) return 'ΓΡΑΦΕΙΟ';
+  const p = (state.projects || []).find(x => x.id === pid);
+  return p ? p.name : ('Έργο #' + pid);
+}
+function _ttFmt(s) {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+  return `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+}
+
+/* ── CSS injection ───────────────────────────────────────────────────── */
+(function _ttInjectCSS() {
+  if (document.getElementById('tt-bar-style')) return;
+  const s = document.createElement('style');
+  s.id = 'tt-bar-style';
+  s.textContent = `
+    #tt-bar {
+      position:fixed; bottom:0; left:0; right:0; z-index:9999;
+      background:#1a2332; color:#e2e8f0;
+      display:flex; align-items:center; gap:12px;
+      padding:6px 16px; font-size:13px; font-family:monospace;
+      box-shadow:0 -2px 8px rgba(0,0,0,.4); transition:transform .3s;
+    }
+    #tt-bar.tt-hidden { transform:translateY(100%); }
+    #tt-bar .tt-dot {
+      width:10px; height:10px; border-radius:50%; background:#22c55e;
+      animation:tt-pulse 1.4s ease-in-out infinite; flex-shrink:0;
+    }
+    #tt-bar .tt-dot.tt-flag   { background:#f59e0b; }
+    #tt-bar .tt-dot.tt-stopped{ background:#6b7280; animation:none; }
+    @keyframes tt-pulse {
+      0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.6)}
+      50%{box-shadow:0 0 0 6px rgba(34,197,94,0)}
+    }
+    #tt-bar .tt-label { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #tt-bar .tt-time  { font-weight:700; letter-spacing:.05em; min-width:60px; text-align:right; }
+    #tt-bar .tt-flag-badge {
+      background:#f59e0b; color:#1a2332; border-radius:4px;
+      padding:1px 6px; font-size:11px; font-weight:700;
+    }
+    #tt-bar .tt-log-btn {
+      cursor:pointer; opacity:.7; font-size:12px;
+      padding:2px 6px; border-radius:4px; background:rgba(255,255,255,.1);
+      transition:opacity .15s;
+    }
+    #tt-bar .tt-log-btn:hover { opacity:1; }
+    #tt-log-panel {
+      position:fixed; bottom:42px; right:0; left:0; z-index:9998;
+      background:#1e293b; color:#e2e8f0; border-top:1px solid #334155;
+      padding:10px 16px; max-height:220px; overflow-y:auto;
+      box-shadow:0 -4px 16px rgba(0,0,0,.5);
+      font-family:monospace; font-size:12px;
+    }
+  `;
+  document.head.appendChild(s);
+})();
+
+/* ── BroadcastChannel — multi-tab awareness ──────────────────────────── */
+const _ttChannel = (() => {
+  try { return new BroadcastChannel('be_time_tracker'); } catch(e) { return null; }
+})();
+// Άλλα tabs: δέχονται ειδοποίηση αλλά ΔΕΝ σταματούν (τρέχουν παράλληλα)
+if (_ttChannel) {
+  _ttChannel.onmessage = (ev) => {
+    const { type, label } = ev.data || {};
+    if (type === 'started') _ttShowOtherTabBadge(label);
+    if (type === 'stopped') _ttHideOtherTabBadge();
+  };
+}
+function _ttBroadcast(type, label) {
+  try { if (_ttChannel) _ttChannel.postMessage({ type, label }); } catch(e) {}
+}
+function _ttShowOtherTabBadge(label) {
+  let el2 = document.getElementById('tt-other-tab');
+  if (!el2) {
+    el2 = document.createElement('div');
+    el2.id = 'tt-other-tab';
+    el2.style.cssText = 'position:fixed;bottom:42px;right:16px;z-index:9998;' +
+      'background:#334155;color:#94a3b8;font-size:11px;font-family:monospace;' +
+      'padding:3px 8px;border-radius:4px;pointer-events:none';
+    document.body.appendChild(el2);
+  }
+  el2.textContent = '⊞ Άλλο tab: ' + label;
+}
+function _ttHideOtherTabBadge() {
+  const el2 = document.getElementById('tt-other-tab');
+  if (el2) el2.remove();
+}
+
+/* ── Σημερινό log (in-memory, ανανεώνεται αυτόματα) ─────────────────── */
+const _ttTodayLog = [];  // [ { label, startedAt, elapsed, flag, isProject, projectId } ]
+
+/* ── TimeTracker ─────────────────────────────────────────────────────── */
+const TimeTracker = {
+  _current: null,  // { sessionId, view, context, startedAt, elapsed, flag }
+  _ticker:  null,
+  _logOpen: false,
+
+  async switchTo(view) {
+    if (_TT_NO_TRACK.has(view) || !state.cu) { await this.stopAll(); return; }
+    const sc = StatusLayer.check();
+    if (!sc.allowed) { await this.stopAll(); return; }
+    const ctxFn = _TT_VIEW_MAP[view];
+    if (!ctxFn) { await this.stopAll(); return; }
+    const ctx = ctxFn();
+    if (this._current && this._current.view === view &&
+        this._current.context.id === ctx.id) return;
+    await this.stopAll();
+    await this._start(view, ctx, sc.flag);
+  },
+
+  async _start(view, ctx, flag) {
+    const now = new Date().toISOString();
+    let sessionId = null;
+    if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
+      try {
+        const { data, error } = await sb.from('be_time_sessions').insert({
+          user_id: state.cu.id, context_type: ctx.type, context_id: String(ctx.id || ''),
+          context_label: ctx.label, started_at: now, flag: flag || null,
+        }).select('id').single();
+        if (!error && data) sessionId = data.id;
+      } catch(e) {}
+    }
+    try {
+      localStorage.setItem('tt_' + (state.cu && state.cu.id),
+        JSON.stringify({ sessionId, view, ctx, startedAt: now, flag }));
+    } catch(e) {}
+    this._current = { sessionId, view, context: ctx, startedAt: Date.parse(now), elapsed: 0, flag };
+    _ttBroadcast('started', ctx.label);
+    this._tick();
+    this._ticker = setInterval(() => this._tick(), 1000);
+    this._renderBar();
+  },
+
+  async stopAll() {
+    if (!this._current) return;
+    clearInterval(this._ticker); this._ticker = null;
+    const cur = this._current; this._current = null;
+    const endedAt = new Date().toISOString();
+    const elapsed = Math.round((Date.now() - cur.startedAt) / 1000);
+
+    if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb && cur.sessionId) {
+      try {
+        await sb.from('be_time_sessions')
+          .update({ ended_at: endedAt, duration_s: elapsed })
+          .eq('id', cur.sessionId);
+      } catch(e) {}
+    }
+
+    // ── Auto-timesheet για project sessions (>= 2 λεπτά) ──────────
+    if (cur.context.type === 'project' && cur.context.id && elapsed >= 120) {
+      await this._autoTimesheet(cur, endedAt, elapsed);
+    }
+
+    // Προσθήκη στο log της ημέρας
+    _ttTodayLog.push({
+      label: cur.context.label,
+      startedAt: cur.startedAt,
+      elapsed,
+      flag: cur.flag,
+      isProject: cur.context.type === 'project',
+      projectId: cur.context.type === 'project' ? cur.context.id : null,
+    });
+
+    try { localStorage.removeItem('tt_' + (state.cu && state.cu.id)); } catch(e) {}
+    _ttBroadcast('stopped', cur.context.label);
+    this._renderBar(true);
+    this._renderLog();
+  },
+
+  /* Αυτόματη δημιουργία timesheet entry από project session */
+  async _autoTimesheet(cur, endedAt, elapsed) {
+    try {
+      const proj = (state.projects || []).find(p => p.id === cur.context.id);
+      if (!proj) return;
+
+      // Ώρες έναρξης / λήξης σε HH:MM (τοπική ώρα)
+      const toHHMM = ts => {
+        const d = new Date(ts);
+        return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+      };
+      const toDateStr = ts => {
+        const d = new Date(ts);
+        return d.getFullYear() + '-' +
+          String(d.getMonth()+1).padStart(2,'0') + '-' +
+          String(d.getDate()).padStart(2,'0');
+      };
+
+      const timeFrom = toHHMM(cur.startedAt);
+      const timeTo   = toHHMM(new Date(endedAt));
+      const date     = toDateStr(cur.startedAt);
+      const hours    = parseFloat((elapsed / 3600).toFixed(2));
+
+      // Χρησιμοποιούμε την πρώτη κατηγορία timesheet που βρίσκουμε (ή null)
+      const cats = timesheetCategoryList ? timesheetCategoryList() : [];
+      const defaultCat = cats[0] || null;
+
+      const entry = {
+        id: 'ts_auto_' + Date.now(),
+        userId: state.cu.id, userName: state.cu.name,
+        projectId: proj.id, projectName: proj.name,
+        projectCategoryId: defaultCat ? defaultCat.id : null,
+        projectCategoryName: defaultCat ? defaultCat.name : null,
+        date, timeFrom, timeTo,
+        hours,
+        desc: '[Auto] ' + cur.context.label + (cur.flag ? ' [' + cur.flag + ']' : ''),
+        km: null, comments: null, taskId: null, taskName: null,
+        createdAt: endedAt,
+        autoGenerated: true,
+      };
+
+      if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
+        await sb.from('be_timesheets').upsert({ id: entry.id, data: entry });
+      } else if (state.db) {
+        if (!state.db.timesheets) state.db.timesheets = [];
+        state.db.timesheets.push(entry);
+      }
+
+      showToast('⏱ Timesheet αυτόματα καταχωρήθηκε: ' + proj.name + ' (' + _ttFmt(elapsed) + ')', 'success');
+    } catch(e) { /* non-fatal */ }
+  },
+
+  async recoverOrphaned() {
+    if (!isSupabaseAuthMode() || typeof sb === 'undefined' || !sb || !state.cu) return;
+    try {
+      const { data } = await sb.from('be_time_sessions')
+        .select('id, started_at').eq('user_id', state.cu.id).is('ended_at', null);
+      if (!data || !data.length) return;
+      const now = new Date().toISOString();
+      for (const row of data) {
+        const elapsed = Math.round((Date.now() - Date.parse(row.started_at)) / 1000);
+        await sb.from('be_time_sessions')
+          .update({ ended_at: now, duration_s: elapsed, flag: 'crash_recovery' })
+          .eq('id', row.id);
+      }
+    } catch(e) {}
+  },
+
+  _tick() {
+    if (!this._current) return;
+    this._current.elapsed = Math.round((Date.now() - this._current.startedAt) / 1000);
+    const el2 = document.getElementById('tt-time');
+    if (el2) el2.textContent = _ttFmt(this._current.elapsed);
+  },
+
+  _renderBar(stopped = false) {
+    let bar = document.getElementById('tt-bar');
+    if (!bar) { bar = document.createElement('div'); bar.id = 'tt-bar'; document.body.appendChild(bar); }
+    if (stopped || !this._current) { bar.classList.add('tt-hidden'); this._renderLog(); return; }
+    const cur = this._current;
+    const dotCls = cur.flag ? 'tt-dot tt-flag' : 'tt-dot';
+    const badge  = cur.flag ? `<span class="tt-flag-badge">${cur.flag.toUpperCase()}</span>` : '';
+    const logCount = _ttTodayLog.length ? `<span class="tt-log-btn" id="tt-log-btn" title="Ιστορικό σήμερα" onclick="TimeTracker._toggleLog()">📋 ${_ttTodayLog.length}</span>` : '';
+    bar.innerHTML = `
+      <span class="${dotCls}"></span>
+      <span class="tt-label">${cur.context.label}</span>
+      ${badge}
+      ${logCount}
+      <span class="tt-time" id="tt-time">${_ttFmt(cur.elapsed)}</span>
+    `;
+    bar.classList.remove('tt-hidden');
+  },
+
+  _toggleLog() {
+    this._logOpen = !this._logOpen;
+    this._renderLog();
+  },
+
+  _renderLog() {
+    let panel = document.getElementById('tt-log-panel');
+    if (!this._logOpen || !_ttTodayLog.length) {
+      if (panel) panel.remove();
+      return;
+    }
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'tt-log-panel';
+      document.body.appendChild(panel);
+    }
+    const totalSecs = _ttTodayLog.reduce((s, e) => s + e.elapsed, 0);
+    const rows = _ttTodayLog.slice().reverse().map(e => {
+      const t = new Date(e.startedAt);
+      const hhmm = String(t.getHours()).padStart(2,'0') + ':' + String(t.getMinutes()).padStart(2,'0');
+      return `<tr>
+        <td style="color:#94a3b8;font-size:11px;white-space:nowrap">${hhmm}</td>
+        <td style="padding:0 8px">${e.label}</td>
+        <td style="text-align:right;font-weight:700;white-space:nowrap">${_ttFmt(e.elapsed)}</td>
+        ${e.isProject ? '<td style="color:#22c55e;font-size:10px">✓TS</td>' : '<td></td>'}
+      </tr>`;
+    }).join('');
+    panel.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <strong style="font-size:12px">Σήμερα — Σύνολο: ${_ttFmt(totalSecs)}</strong>
+        <span style="cursor:pointer;color:#94a3b8" onclick="TimeTracker._toggleLog()">✕</span>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;font-family:monospace">${rows}</table>
+    `;
+  }
+};
+
+/* beforeunload — προειδοποίηση αν κλείσει το browser με ανοιχτή session */
+window.addEventListener('beforeunload', (e) => {
+  if (TimeTracker._current) {
+    e.preventDefault();
+    e.returnValue = 'Ο χρονομετρητής εργασίας τρέχει. Είσαι σίγουρος ότι θέλεις να κλείσεις;';
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+
+
 // ── NAVIGATION ────────────────────────────────────────────────────
 function navigate(view, opts={}) {
   if (view!=='login' && !state.cu) { state.view='login'; render(); return; }
   state.view=view;
+  TimeTracker.switchTo(view).catch(()=>{});   // ← Time Tracker hook
   if (opts.categoryId  !==undefined) state.categoryId  =opts.categoryId;
-  if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) { state.ganttView=false; state.projectTab='tasks'; } state.projectId=opts.projectId; }
+  if (opts.projectId   !==undefined) { if(opts.projectId!==state.projectId) { state.ganttView=false; state.projectTab='tasks'; state.phaseTabs={}; } state.projectId=opts.projectId; }
   if (opts.templateId  !==undefined) state.templateId  =opts.templateId;
   if (opts.crmCompanyId!==undefined) state.crmCompanyId=opts.crmCompanyId;
   if (opts.crmContactId!==undefined) state.crmContactId=opts.crmContactId;
+  if (view==='crm-contacts') { state.crmContactPage=1; state.crmContactSearch=''; }
   render();
   if(view==='timesheet' && isSupabaseAuthMode()) {
     state.tsLoaded=false;
@@ -2573,7 +3109,17 @@ function render() {
       case 'projects':   main.innerHTML=renderProjects();   break;
       case 'project':    main.innerHTML=renderProject();    break;
       case 'notifications': main.innerHTML=renderNotifications(); break;
-      case 'users':      main.innerHTML=renderUsers();      break;
+      case 'users':
+        main.innerHTML=renderUsers();
+        // Φόρτωσε τα statuses ασύγχρονα και ενημέρωσε panel
+        if (isAdmin()) {
+          StatusLayer.loadAll().then(statuses => {
+            state._userStatuses = {};
+            statuses.forEach(r => { state._userStatuses[r.user_id] = r.status; });
+            _buildStatusPanel().catch(()=>{});
+          }).catch(()=>{});
+        }
+        break;
       case 'audit':      main.innerHTML=renderAudit();      break;
       case 'templates':  main.innerHTML=renderTemplates();  break;
       case 'template':   main.innerHTML=renderTemplateDetail(); break;
@@ -2588,6 +3134,12 @@ function render() {
       case 'crm-contact':      main.innerHTML=renderCrmContact();    break;
       case 'offers':           main.innerHTML=renderOffers(); setTimeout(_initOffersTopScroll,0); break;
       case 'assigned':         main.innerHTML=renderAssigned();      break;
+      case 'tt-reports':
+        main.innerHTML='<div style="text-align:center;padding:40px;color:var(--muted)">⏳ Φόρτωση αναφορών…</div>';
+        renderTtReports().then(html => { main.innerHTML = html; }).catch(()=>{
+          main.innerHTML='<div class="empty-state"><h3>Αδυναμία φόρτωσης αναφορών</h3></div>';
+        });
+        break;
       default:                 main.innerHTML=renderDashboard();
     }
     _updateSidebarFooter();
@@ -2612,10 +3164,31 @@ function _updateSidebarFooter() {
   if (footer) {
     if (cu && cu.role !== 'client') {
       const ri = ROLE_INFO[cu.role] || {};
+      // Status badge + toggle (μόνο για non-admin χρήστες: remote/training)
+      const ws = cu.workStatus;
+      const wsMeta = ws ? (_TT_STATUS_META[ws] || null) : null;
+      const statusBadge = wsMeta
+        ? `<div style="margin-bottom:8px;padding:4px 8px;border-radius:6px;background:${wsMeta.color}22;border:1px solid ${wsMeta.color}44;color:${wsMeta.color};font-size:.65rem;font-weight:700;display:flex;align-items:center;gap:5px">
+             <span>${wsMeta.emoji}</span><span>${wsMeta.label}</span>
+             ${!['admin','management'].includes(cu.role) && !wsMeta.timerOff
+               ? `<span style="margin-left:auto;cursor:pointer;opacity:.7" onclick="ttClearMyStatus()" title="Αφαίρεση status">✕</span>`
+               : ''}
+           </div>` : '';
+      // Toggle κουμπιά για non-client, non-admin χρήστες
+      const canSelfToggle = !['admin','management'].includes(cu.role) && cu.role !== 'client';
+      const toggleBtns = canSelfToggle ? `
+        <div style="display:flex;gap:4px;margin-bottom:8px">
+          <button class="logout-btn" style="flex:1;font-size:.6rem;padding:3px 4px;${ws==='remote'?'background:rgba(59,130,246,.25);color:#93c5fd':''}"
+            onclick="ttToggleMyStatus('remote')" title="Τηλεργασία">🏠 Remote</button>
+          <button class="logout-btn" style="flex:1;font-size:.6rem;padding:3px 4px;${ws==='training'?'background:rgba(139,92,246,.25);color:#c4b5fd':''}"
+            onclick="ttToggleMyStatus('training')" title="Εκπαίδευση">📚 Training</button>
+        </div>` : '';
       footer.innerHTML = `<div class="sidebar-footer-user">
         <div style="font-size:.72rem;font-weight:700;color:rgba(255,255,255,.85);margin-bottom:2px">${esc(cu.name)}</div>
         <div style="font-size:.65rem;color:rgba(255,255,255,.4);font-family:var(--mono);margin-bottom:8px">@${esc(cu.username)}</div>
         <div style="margin-bottom:10px"><span class="role-badge ${ri.cls||''}" style="font-size:.58rem">${ri.label||cu.role}</span></div>
+        ${statusBadge}
+        ${toggleBtns}
         <div style="display:flex;gap:6px">
           <button class="logout-btn" style="flex:1" data-action="my-account">
             <svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/></svg>
@@ -2631,6 +3204,23 @@ function _updateSidebarFooter() {
   }
   if (logoutBtn) logoutBtn.style.display = (cu && cu.role!=='client') ? '' : 'none';
 }
+
+/* ── Status toggle helpers (καλούνται από sidebar footer) ────────────── */
+window.ttToggleMyStatus = async function(s) {
+  if (!state.cu) return;
+  const newStatus = state.cu.workStatus === s ? null : s;
+  await StatusLayer.setStatus(state.cu.id, newStatus, null, false);
+};
+window.ttClearMyStatus = async function() {
+  if (!state.cu) return;
+  await StatusLayer.setStatus(state.cu.id, null, null, false);
+};
+window.ttAdminSetStatus = async function(uid, s) {
+  const note = s && ['leave','sick'].includes(s) ? (prompt('Σημείωση (προαιρετική):') || null) : null;
+  await StatusLayer.setStatus(uid, s||null, note, true);
+  // refresh admin panel
+  if (state.view === 'users') render();
+};
 
 function updateNav() {
   document.querySelectorAll('.nav-link[data-nav]').forEach(a=>a.classList.toggle('active',a.dataset.nav===state.view));
@@ -2657,6 +3247,7 @@ function updateBreadcrumb() {
     if (proj) html+=`${sep}<span class="bc-item current">${esc(proj.name)}</span>`;
   } else if (state.view==='notifications') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Ειδοποιήσεις</span>`;
   else if (state.view==='users') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Χρήστες</span>`;
+  else if (state.view==='tt-reports') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Αναφορές Χρόνου</span>`;
   else if (state.view==='audit') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Ιστορικό</span>`;
   else if (state.view==='templates') html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item current">Πρότυπα</span>`;
   else if (state.view==='template') { const tpl=getTemplate(state.templateId); html=`<span class="bc-item" data-action="nav-dashboard">Dashboard</span>${sep}<span class="bc-item" data-action="nav-templates">Πρότυπα</span>${sep}<span class="bc-item current">${esc(tpl?.name||'Πρότυπο')}</span>`; }
@@ -4072,7 +4663,23 @@ function renderProject() {
         }
         return '';
       })()}
-      <div class="phase-tasks">${tasksHtml||(cuEffectiveRole(proj.categoryId)==='team_member'?'<div class="text-sm text-muted" style="padding:12px 20px;font-style:italic">Δεν έχετε εργασίες σε αυτή τη φάση.</div>':'<div class="text-sm text-muted" style="padding:12px 20px">Δεν υπάρχουν εργασίες.</div>')}</div>
+      ${(()=>{
+        const canSeePhaseMsgs=['admin','management','project_manager','team_member'].includes(state.cu?.role);
+        if(!canSeePhaseMsgs) return `<div class="phase-tasks">${tasksHtml||'<div class="text-sm text-muted" style="padding:12px 20px">Δεν υπάρχουν εργασίες.</div>'}</div>`;
+        const phTab=state.phaseTabs[ph.id]||'tasks';
+        const phMsgCount=(ph.messages||[]).length;
+        const activeClr='var(--orange)';
+        const inactiveClr='var(--muted)';
+        const phTabsHtml=`<div style="display:flex;gap:0;border-bottom:2px solid var(--slate-100);margin:0 0 0 0;padding:0 16px">
+          <button onclick="state.phaseTabs['${ph.id}']='tasks';render()" style="padding:7px 14px;border:none;background:none;cursor:pointer;font-size:.8rem;font-weight:600;color:${phTab==='tasks'?activeClr:inactiveClr};border-bottom:${phTab==='tasks'?'2px solid var(--orange)':'2px solid transparent'};margin-bottom:-2px;transition:color .15s">📋 Εργασίες</button>
+          <button onclick="state.phaseTabs['${ph.id}']='messages';render()" style="padding:7px 14px;border:none;background:none;cursor:pointer;font-size:.8rem;font-weight:600;color:${phTab==='messages'?activeClr:inactiveClr};border-bottom:${phTab==='messages'?'2px solid var(--orange)':'2px solid transparent'};margin-bottom:-2px;transition:color .15s">💬 Μηνύματα${phMsgCount>0?` <span style="display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;border-radius:8px;font-size:.62rem;font-weight:700;background:${phTab==='messages'?'var(--orange)':'var(--slate-400)'};color:#fff;margin-left:4px">${phMsgCount}</span>`:''}</button>
+        </div>`;
+        if(phTab==='messages') return phTabsHtml+renderPhaseMessages(proj,ph);
+        const noTasksMsg=cuEffectiveRole(proj.categoryId)==='team_member'
+          ?'<div class="text-sm text-muted" style="padding:12px 20px;font-style:italic">Δεν έχετε εργασίες σε αυτή τη φάση.</div>'
+          :'<div class="text-sm text-muted" style="padding:12px 20px">Δεν υπάρχουν εργασίες.</div>';
+        return phTabsHtml+`<div class="phase-tasks">${tasksHtml||noTasksMsg}</div>`;
+      })()}
     </div>`;
   }).join('');
 
@@ -4221,6 +4828,148 @@ async function deleteProjectMessage(pid, msgId) {
   } catch(e){ showToast('Σφάλμα διαγραφής μηνύματος.','error'); console.error(e); }
 }
 
+// ── PHASE MESSAGES ────────────────────────────────────────────────
+function renderPhaseMessages(proj, ph) {
+  const canPost=['admin','management','project_manager'].includes(state.cu?.role);
+  const isTeamMember=state.cu?.role==='team_member';
+  const msgs=(ph.messages||[]).slice().reverse(); // νεώτερα πρώτα
+
+  const ROLE_LABELS={admin:'Διαχειριστής',management:'Διοίκηση',project_manager:'Υπ. Έργου',team_member:'Μέλος Ομάδας',client:'Πελάτης'};
+  const ROLE_COLORS={admin:'#7c3aed',management:'#0284c7',project_manager:'#059669',team_member:'#ea580c',client:'#6b7280'};
+
+  const msgsHtml=msgs.length===0
+    ? '<div class="empty-state" style="padding:36px 20px"><div class="es-icon">💬</div><h3>Δεν υπάρχουν μηνύματα</h3><p>Ξεκινήστε μια συζήτηση για τη φάση.</p></div>'
+    : msgs.map(m=>{
+        const initials=(m.userName||'?').split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();
+        const roleLbl=ROLE_LABELS[m.role]||m.role;
+        const roleColor=ROLE_COLORS[m.role]||'#6b7280';
+        const canDel=(state.cu?.id===m.userId)||(['admin','management'].includes(state.cu?.role));
+        return `<div class="proj-msg-row" style="display:flex;gap:12px;padding:12px 0;border-bottom:1px solid var(--slate-100)">
+          <div style="flex-shrink:0;width:34px;height:34px;border-radius:50%;background:${roleColor}22;color:${roleColor};display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:700">${initials}</div>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+              <span style="font-weight:700;font-size:.85rem">${esc(m.userName||'—')}</span>
+              <span style="font-size:.65rem;font-weight:600;padding:1px 7px;border-radius:9px;background:${roleColor}18;color:${roleColor}">${roleLbl}</span>
+              <span style="font-size:.7rem;color:var(--muted);margin-left:auto">${fmtDT(m.at)}</span>
+              ${canDel?`<button class="btn btn-ghost btn-icon btn-sm" data-action="delete-phase-message" data-pid="${proj.id}" data-phid="${ph.id}" data-mid="${m.id}" title="Διαγραφή μηνύματος" style="color:var(--muted);font-size:.7rem;padding:2px 6px">🗑</button>`:''}
+            </div>
+            <div style="font-size:.85rem;line-height:1.55;white-space:pre-wrap;word-break:break-word">${esc(m.text)}</div>
+          </div>
+        </div>`;
+      }).join('');
+
+  const inputId='phase-msg-input-'+ph.id;
+  const inputHtml=canPost
+    ? `<div style="display:flex;gap:10px;align-items:flex-end;margin-top:12px">
+        <textarea id="${inputId}" class="form-control" rows="2" placeholder="Γράψτε μήνυμα για τη φάση…" style="flex:1;resize:vertical;min-height:52px;font-size:.85rem" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendPhaseMessage('${proj.id}','${ph.id}')}"></textarea>
+        <button class="btn btn-primary" onclick="sendPhaseMessage('${proj.id}','${ph.id}')" style="height:52px;padding:0 16px;font-size:.85rem">Αποστολή</button>
+      </div>`
+    : isTeamMember
+    ? `<div style="margin-top:12px;padding:10px 14px;background:var(--slate-50);border-radius:8px;font-size:.8rem;color:var(--muted)">💬 Για να στείλετε μήνυμα, επικοινωνήστε με τον Υπεύθυνο Έργου.</div>`
+    : '';
+
+  return `<div style="padding:0 16px 16px 16px;background:var(--slate-50);border-radius:0 0 8px 8px">
+    <div style="max-height:380px;overflow-y:auto;padding-top:8px" id="phase-msgs-list-${ph.id}">${msgsHtml}</div>
+    ${inputHtml}
+  </div>`;
+}
+
+async function sendPhaseMessage(pid, phid) {
+  const proj=getProject(pid); if(!proj) return;
+  const ph=(proj.phases||[]).find(p=>p.id===phid); if(!ph) return;
+  const inputId='phase-msg-input-'+phid;
+  const inp=document.getElementById(inputId);
+  const text=(inp?.value||'').trim(); if(!text) return;
+  if(!['admin','management','project_manager'].includes(state.cu?.role)){
+    showToast('Δεν έχετε δικαίωμα αποστολής μηνύματος.','error'); return;
+  }
+  const msg={id:'msg_'+uid(),userId:state.cu.id,userName:state.cu.name,role:state.cu.role,text,at:nowTS()};
+  if(!ph.messages) ph.messages=[];
+  ph.messages.push(msg);
+  inp.value='';
+  try {
+    await dbSaveProject(proj);
+    // Ειδοποίηση μόνο σε εμπλεκόμενους της φάσης + project managers
+    const phaseAssignees=[...new Set((ph.tasks||[]).flatMap(t=>[t.assigneeId,...(t.memberIds||[])]).filter(Boolean))];
+    const managerIds=projManagerIds(proj);
+    const recipients=uniqRecipients([...phaseAssignees,...managerIds],state.cu.id);
+    const actor=state.cu;
+    const notifTitle=`💬 Μήνυμα φάσης "${esc(ph.name)}" από ${actor.name}`;
+    const notifBody=text.length>100?text.slice(0,97)+'…':text;
+    if(isSupabaseAuthMode()){
+      await sb.rpc('app_notification_emit',{
+        p_event_type:'phase_message',
+        p_project_id:proj.id,
+        p_phase_id:phid,
+        p_task_id:null,
+        p_subtask_id:null,
+        p_message:notifBody
+      }).catch(e=>console.warn('phase_message notify:',e));
+    } else {
+      for(const uid2 of recipients){
+        await pushLegacyNotificationToUser(uid2,{
+          id:'n_'+uid(),type:'phase_message',priority:'normal',
+          title:notifTitle,sub:notifBody,
+          projId:proj.id,phaseId:phid,at:nowTS(),read:false
+        }).catch(e=>console.warn('phase_message legacy notify:',e));
+      }
+    }
+    render();
+  } catch(e){ showToast('Σφάλμα αποστολής μηνύματος.','error'); console.error(e); }
+}
+
+async function deletePhaseMessage(pid, phid, msgId) {
+  const proj=getProject(pid); if(!proj) return;
+  const ph=(proj.phases||[]).find(p=>p.id===phid); if(!ph) return;
+  const msg=(ph.messages||[]).find(m=>m.id===msgId);
+  if(!msg) return;
+  const isOwner=state.cu?.id===msg.userId;
+  const isAdmin=['admin','management'].includes(state.cu?.role);
+  if(!isOwner&&!isAdmin){ showToast('Δεν έχετε δικαίωμα διαγραφής.','error'); return; }
+  ph.messages=(ph.messages||[]).filter(m=>m.id!==msgId);
+  try {
+    await dbSaveProject(proj);
+    render();
+    showToast('Μήνυμα διαγράφηκε.','');
+  } catch(e){ showToast('Σφάλμα διαγραφής μηνύματος.','error'); console.error(e); }
+}
+
+/* ── Admin Status Panel helper ───────────────────────────────────────── */
+async function _buildStatusPanel() {
+  const allStatuses = await StatusLayer.loadAll();
+  const statusMap = {};
+  allStatuses.forEach(r => { statusMap[r.user_id] = r; });
+
+  const users = (state.db.users || []).filter(u => u.role !== 'client' && u.active !== false);
+  const absent = users.filter(u => {
+    const s = statusMap[u.id];
+    return s && s.status && ['leave','sick','remote','training'].includes(s.status);
+  });
+
+  const panelEl = document.getElementById('tt-status-panel');
+  if (!panelEl) return;
+
+  if (!absent.length) {
+    panelEl.innerHTML = `<div style="color:rgba(255,255,255,.5);font-size:.75rem;padding:4px 0">Όλοι παρόντες στο γραφείο</div>`;
+    return;
+  }
+
+  const rows2 = absent.map(u => {
+    const s = statusMap[u.id];
+    const meta = _TT_STATUS_META[s.status] || {};
+    const updDT = s.updated_at ? new Date(s.updated_at).toLocaleDateString('el-GR') : '—';
+    return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+      <span>${meta.emoji||'❓'}</span>
+      <span style="flex:1;font-size:.75rem;font-weight:600">${esc(u.name)}</span>
+      <span style="font-size:.68rem;padding:2px 6px;border-radius:4px;background:${meta.color||'#666'}22;color:${meta.color||'#aaa'};font-weight:700">${meta.label||s.status}</span>
+      <span style="font-size:.65rem;color:rgba(255,255,255,.35)">${updDT}</span>
+      <button style="background:none;border:none;color:rgba(255,255,255,.4);cursor:pointer;font-size:11px;padding:2px" title="Αφαίρεση status" onclick="ttAdminSetStatus('${u.id}',null)">✕</button>
+    </div>`;
+  }).join('');
+
+  panelEl.innerHTML = rows2;
+}
+
 // ── VIEW: USERS ───────────────────────────────────────────────────
 function renderUsers() {
   if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
@@ -4267,6 +5016,31 @@ function renderUsers() {
       <button class="btn btn-primary" data-action="modal-add-user">+ Νέος Χρήστης</button>
     </div>
   </div>
+  <!-- ── Status panel (admin) ── -->
+  <div style="background:#1e293b;border-radius:10px;padding:14px 16px;margin-bottom:16px;border:1px solid rgba(255,255,255,.08)">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <strong style="font-size:.8rem;color:rgba(255,255,255,.7)">📋 Κατάσταση Ομάδας</strong>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${(state.db.users||[]).filter(u=>u.role!=='client'&&u.active!==false).map(u=>{
+          const ws = state._userStatuses && state._userStatuses[u.id];
+          const meta = ws ? (_TT_STATUS_META[ws]||null) : null;
+          return `<div style="position:relative;display:inline-block">
+            <select class="form-control" style="font-size:.65rem;padding:3px 22px 3px 6px;height:26px;width:auto;min-width:110px;background:#0f172a;color:rgba(255,255,255,.8)"
+              onchange="ttAdminSetStatus('${u.id}',this.value)" title="${esc(u.name)}">
+              <option value="" ${!ws?'selected':''}>👤 ${esc(u.name.split(' ')[0])}</option>
+              <option value="leave"    ${ws==='leave'?'selected':''}>🏖️ Άδεια</option>
+              <option value="sick"     ${ws==='sick'?'selected':''}>🤒 Ασθένεια</option>
+              <option value="remote"   ${ws==='remote'?'selected':''}>🏠 Remote</option>
+              <option value="training" ${ws==='training'?'selected':''}>📚 Training</option>
+            </select>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+    <div id="tt-status-panel" style="min-height:24px">
+      <div style="color:rgba(255,255,255,.4);font-size:.72rem">Φόρτωση…</div>
+    </div>
+  </div>
   <div class="users-table">
     <div class="users-table-head">
       <div>Χρήστης</div>
@@ -4279,6 +5053,260 @@ function renderUsers() {
     ${rows}
   </div>`;
 }
+
+// ── VIEW: TIME TRACKING REPORTS ───────────────────────────────────────
+/* Φορτώνει δεδομένα από be_time_sessions και τα εμφανίζει */
+async function renderTtReports() {
+  if (!isAdmin()) return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
+
+  // ── Φόρτωση φίλτρων από state ───────────────────────────────────
+  const period   = state.ttRptPeriod  || 'week';    // day/week/month/custom
+  const uid      = state.ttRptUser    || '';          // '' = όλοι
+  const groupBy  = state.ttRptGroup   || 'project';  // project/user/day
+
+  // ── Υπολογισμός date range ──────────────────────────────────────
+  const now  = new Date();
+  let dateFrom, dateTo;
+  if (period === 'day') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    dateTo   = new Date(dateFrom.getTime() + 86400000);
+  } else if (period === 'week') {
+    const dow = now.getDay() || 7;  // 1=Δευ
+    dateFrom  = new Date(now.getFullYear(), now.getMonth(), now.getDate() - dow + 1);
+    dateTo    = new Date(dateFrom.getTime() + 7 * 86400000);
+  } else if (period === 'month') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), 1);
+    dateTo   = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  } else {
+    // custom: χρησιμοποίησε state.ttRptFrom / state.ttRptTo
+    dateFrom = state.ttRptFrom ? new Date(state.ttRptFrom) : new Date(now.getFullYear(), now.getMonth(), 1);
+    dateTo   = state.ttRptTo   ? new Date(new Date(state.ttRptTo).getTime() + 86400000) : new Date(now.getFullYear(), now.getMonth()+1, 1);
+  }
+  const fromISO = dateFrom.toISOString();
+  const toISO   = dateTo.toISOString();
+
+  // ── Ανάκτηση δεδομένων ──────────────────────────────────────────
+  let sessions = [];
+  if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
+    let q = sb.from('be_time_sessions')
+      .select('id, user_id, context_type, context_id, context_label, started_at, ended_at, duration_s, flag')
+      .gte('started_at', fromISO)
+      .lt('started_at', toISO)
+      .not('ended_at', 'is', null)
+      .gt('duration_s', 0)
+      .order('started_at', { ascending: false });
+    if (uid) q = q.eq('user_id', uid);
+    const { data, error } = await q;
+    sessions = (!error && data) ? data : [];
+  }
+
+  // Δεσμεύσαμε username map
+  const userMap = {};
+  (state.db.users || []).forEach(u => { userMap[u.id] = u.name; });
+
+  // Φόρτωση project names
+  const projMap = {};
+  (state.projects || state.db.projects || []).forEach(p => { projMap[p.id] = p.name; });
+
+  // ── Ομαδοποίηση ──────────────────────────────────────────────────
+  const groups = {};
+  let totalSecs = 0;
+  sessions.forEach(s => {
+    const secs = s.duration_s || 0;
+    totalSecs += secs;
+    let key, label;
+    if (groupBy === 'project') {
+      label = s.context_label || s.context_id;
+      key   = s.context_id;
+    } else if (groupBy === 'user') {
+      label = userMap[s.user_id] || s.user_id;
+      key   = s.user_id;
+    } else {  // day
+      const d = new Date(s.started_at);
+      key = d.toISOString().slice(0,10);
+      label = d.toLocaleDateString('el-GR', { weekday:'short', day:'2-digit', month:'2-digit' });
+    }
+    if (!groups[key]) groups[key] = { label, secs: 0, count: 0, rows: [] };
+    groups[key].secs  += secs;
+    groups[key].count += 1;
+    groups[key].rows.push(s);
+  });
+
+  const sorted = Object.values(groups).sort((a,b) => b.secs - a.secs);
+
+  // ── User options ──────────────────────────────────────────────────
+  const userOpts = (state.db.users || [])
+    .filter(u => u.role !== 'client' && u.active !== false)
+    .map(u => `<option value="${u.id}" ${u.id===uid?'selected':''}>${esc(u.name)}</option>`)
+    .join('');
+
+  // ── Render rows ────────────────────────────────────────────────────
+  const rowsHtml = sorted.length ? sorted.map(g => {
+    const pct = totalSecs ? Math.round(g.secs / totalSecs * 100) : 0;
+    const subRows = g.rows.map(s => {
+      const d = new Date(s.started_at);
+      const hhmm = d.toLocaleString('el-GR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
+      const usr = userMap[s.user_id] || '—';
+      const flag = s.flag ? `<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:#f59e0b22;color:#f59e0b;margin-left:4px">${s.flag}</span>` : '';
+      return `<tr style="font-size:.72rem;color:var(--steel)">
+        <td style="padding:3px 8px 3px 28px">${hhmm}</td>
+        <td>${groupBy==='user'?esc(s.context_label||''):esc(usr)}</td>
+        <td style="text-align:right;font-family:var(--mono)">${_ttFmt(s.duration_s||0)}</td>
+        <td>${flag}</td>
+      </tr>`;
+    }).join('');
+    return `
+    <tr class="tt-rpt-group-row" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'" style="cursor:pointer">
+      <td style="padding:8px 8px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:.8rem;font-weight:700">${esc(g.label)}</span>
+          <span style="font-size:.68rem;color:var(--muted)">${g.count} sessions</span>
+        </div>
+        <div style="margin-top:4px;height:4px;border-radius:2px;background:var(--slate-200);overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:var(--blue);border-radius:2px"></div>
+        </div>
+      </td>
+      <td style="text-align:right;font-weight:700;font-family:var(--mono);padding:8px 8px">${_ttFmt(g.secs)}</td>
+      <td style="text-align:right;color:var(--muted);font-size:.75rem;padding:8px 8px">${pct}%</td>
+      <td style="padding:8px 8px;color:var(--muted);font-size:.75rem">▼</td>
+    </tr>
+    <tbody style="display:none">${subRows}</tbody>`;
+  }).join('') : `<tr><td colspan="4" style="text-align:center;padding:32px;color:var(--muted)">Δεν υπάρχουν εγγραφές για την επιλεγμένη περίοδο.</td></tr>`;
+
+  return `
+  <div class="page-hd">
+    <div>
+      <h1>⏱ Αναφορές Χρόνου</h1>
+      <div class="page-hd-sub">Σύνολο: <strong style="color:var(--blue)">${_ttFmt(totalSecs)}</strong> · ${sessions.length} sessions</div>
+    </div>
+    <div class="page-hd-actions" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-ghost btn-sm" onclick="ttExportExcel()" title="Εξαγωγή σε Excel">📥 Excel</button>
+    </div>
+  </div>
+
+  <!-- Φίλτρα -->
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px;padding:12px;background:var(--card);border-radius:8px;border:1px solid var(--border)">
+    <select class="form-control" style="width:auto" onchange="state.ttRptPeriod=this.value;render()">
+      <option value="day"    ${period==='day'?'selected':''}>Σήμερα</option>
+      <option value="week"   ${period==='week'?'selected':''}>Τρέχουσα εβδομάδα</option>
+      <option value="month"  ${period==='month'?'selected':''}>Τρέχων μήνας</option>
+      <option value="custom" ${period==='custom'?'selected':''}>Προσαρμογή…</option>
+    </select>
+    ${period==='custom'?`
+      <input type="date" class="form-control" style="width:auto" value="${state.ttRptFrom||''}" onchange="state.ttRptFrom=this.value;render()">
+      <span style="color:var(--muted)">—</span>
+      <input type="date" class="form-control" style="width:auto" value="${state.ttRptTo||''}" onchange="state.ttRptTo=this.value;render()">
+    `:''}
+    <select class="form-control" style="width:auto" onchange="state.ttRptUser=this.value;render()">
+      <option value="" ${!uid?'selected':''}>Όλοι οι χρήστες</option>
+      ${userOpts}
+    </select>
+    <select class="form-control" style="width:auto" onchange="state.ttRptGroup=this.value;render()">
+      <option value="project" ${groupBy==='project'?'selected':''}>Ανά Context</option>
+      <option value="user"    ${groupBy==='user'?'selected':''}>Ανά Χρήστη</option>
+      <option value="day"     ${groupBy==='day'?'selected':''}>Ανά Ημέρα</option>
+    </select>
+    <span style="font-size:.75rem;color:var(--muted)">${new Date(fromISO).toLocaleDateString('el-GR')} – ${new Date(toISO).toLocaleDateString('el-GR')}</span>
+  </div>
+
+  <!-- Πίνακας -->
+  <div style="background:var(--card);border-radius:10px;border:1px solid var(--border);overflow:hidden">
+    <table style="width:100%;border-collapse:collapse">
+      <thead>
+        <tr style="background:var(--thead-bg,rgba(0,0,0,.04))">
+          <th style="padding:10px 8px;text-align:left;font-size:.75rem">Context / Ομάδα</th>
+          <th style="padding:10px 8px;text-align:right;font-size:.75rem">Σύνολο</th>
+          <th style="padding:10px 8px;text-align:right;font-size:.75rem">%</th>
+          <th style="padding:10px 8px;width:28px"></th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+  </div>`;
+}
+
+/* ── Excel export για time sessions ──────────────────────────────────── */
+window.ttExportExcel = async function() {
+  if (!isAdmin()) return;
+  const period  = state.ttRptPeriod  || 'week';
+  const uid     = state.ttRptUser    || '';
+  const now     = new Date();
+  let dateFrom, dateTo;
+  if (period === 'day') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    dateTo   = new Date(dateFrom.getTime() + 86400000);
+  } else if (period === 'week') {
+    const dow = now.getDay() || 7;
+    dateFrom  = new Date(now.getFullYear(), now.getMonth(), now.getDate() - dow + 1);
+    dateTo    = new Date(dateFrom.getTime() + 7 * 86400000);
+  } else if (period === 'month') {
+    dateFrom = new Date(now.getFullYear(), now.getMonth(), 1);
+    dateTo   = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  } else {
+    dateFrom = state.ttRptFrom ? new Date(state.ttRptFrom) : new Date(now.getFullYear(), now.getMonth(), 1);
+    dateTo   = state.ttRptTo   ? new Date(new Date(state.ttRptTo).getTime() + 86400000) : new Date(now.getFullYear(), now.getMonth()+1, 1);
+  }
+
+  showToast('Δημιουργία Excel…', 'info');
+
+  let sessions = [];
+  if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
+    let q = sb.from('be_time_sessions')
+      .select('user_id, context_type, context_id, context_label, started_at, ended_at, duration_s, flag')
+      .gte('started_at', dateFrom.toISOString())
+      .lt('started_at', dateTo.toISOString())
+      .not('ended_at', 'is', null)
+      .gt('duration_s', 0)
+      .order('started_at', { ascending: true });
+    if (uid) q = q.eq('user_id', uid);
+    const { data } = await q;
+    sessions = data || [];
+  }
+
+  const userMap = {};
+  (state.db.users || []).forEach(u => { userMap[u.id] = u.name; });
+
+  if (typeof XLSX !== 'undefined') {
+    const rows = sessions.map(s => ({
+      'Χρήστης':        userMap[s.user_id] || s.user_id,
+      'Context':        s.context_label || s.context_id,
+      'Τύπος':          s.context_type,
+      'Έναρξη':         s.started_at ? new Date(s.started_at).toLocaleString('el-GR') : '',
+      'Λήξη':           s.ended_at   ? new Date(s.ended_at).toLocaleString('el-GR')   : '',
+      'Λεπτά':          s.duration_s ? Math.round(s.duration_s / 60) : 0,
+      'Ώρες':           s.duration_s ? parseFloat((s.duration_s / 3600).toFixed(2)) : 0,
+      'Flag':           s.flag || '',
+    }));
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{'': 'Δεν υπάρχουν δεδομένα'}]);
+    XLSX.utils.book_append_sheet(wb, ws, 'Χρόνοι');
+    const fname = 'time_report_' + dateFrom.toISOString().slice(0,10) + '.xlsx';
+    XLSX.writeFile(wb, fname);
+    showToast('Excel αποθηκεύτηκε: ' + fname, 'success');
+  } else if (window.ExcelJS) {
+    const wb2 = new ExcelJS.Workbook();
+    const ws2 = wb2.addWorksheet('Χρόνοι');
+    ws2.addRow(['Χρήστης','Context','Τύπος','Έναρξη','Λήξη','Λεπτά','Ώρες','Flag']);
+    sessions.forEach(s => ws2.addRow([
+      userMap[s.user_id] || s.user_id,
+      s.context_label || s.context_id,
+      s.context_type,
+      s.started_at ? new Date(s.started_at).toLocaleString('el-GR') : '',
+      s.ended_at   ? new Date(s.ended_at).toLocaleString('el-GR') : '',
+      s.duration_s ? Math.round(s.duration_s / 60) : 0,
+      s.duration_s ? parseFloat((s.duration_s / 3600).toFixed(2)) : 0,
+      s.flag || '',
+    ]));
+    const buf  = await wb2.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a'); a.href=url; a.download='time_report.xlsx'; a.click();
+    URL.revokeObjectURL(url);
+    showToast('Excel αποθηκεύτηκε.', 'success');
+  } else {
+    showToast('Η βιβλιοθήκη Excel δεν είναι διαθέσιμη.', 'error');
+  }
+};
 
 // ── BACKUP ────────────────────────────────────────────────────────
 window.backupAllData = async function() {
@@ -5820,6 +6848,7 @@ function handleClick(e) {
     case 'nav-notebook':       navigate('notebook');                        break;
     case 'nav-safety-visits':  navigate('safety-visits');                   break;
     case 'nav-timesheet':      navigate('timesheet');                       break;
+    case 'nav-tt-reports':    navigate('tt-reports');                      break;
     case 'nav-notifications':  navigate('notifications');                   break;
     case 'open-template':      navigate('template',{templateId:btn.dataset.tid}); break;
     case 'open-category':      navigate('projects',{categoryId:cid});       break;
@@ -5911,6 +6940,7 @@ function handleClick(e) {
     case 'toggle-notif':       navigate('notifications'); break;
     case 'delete-project':     confirmDeleteProject(pid);                   break;
     case 'delete-project-message': deleteProjectMessage(pid, btn.dataset.mid); break;
+    case 'delete-phase-message': deletePhaseMessage(pid, btn.dataset.phid, btn.dataset.mid); break;
     case 'delete-user':        confirmDeleteUser(uidVal);                   break;
     case 'clear-audit':        clearAudit();                                break;
     case 'modal-add-timesheet':      showModalAddTimesheet();                       break;
@@ -10137,7 +11167,7 @@ function _crmExtrasCo(co) {
 
 // ── CRM — COMPANIES LIST ───────────────────────────────────────
 function renderCrmCompanies() {
-  const canEdit = canManageTemplatesAndCrm();
+  const canEdit = canEditCrm();
   const q = (state.crmSearch||'').toLowerCase();
   let companies = (state.db.crmCompanies||[]).filter(co=>{
     if (!q) return true;
@@ -10202,7 +11232,7 @@ function renderCrmCompanies() {
 function renderCrmCompany() {
   const co = (state.db.crmCompanies||[]).find(x=>x.id===state.crmCompanyId);
   if (!co) return `<div class="empty-state"><h3>Εταιρεία δεν βρέθηκε</h3></div>`;
-  const canEdit = canManageTemplatesAndCrm();
+  const canEdit = canEditCrm();
   const phones = _crmPhonesList(co);
   const emails = _crmEmailsList(co);
   const addrs  = _crmAddrsList(co);
@@ -10272,27 +11302,64 @@ function renderCrmCompany() {
 }
 
 // ── CRM — CONTACTS LIST ───────────────────────────────────────
-function renderCrmContacts() {
-  const canEdit = canManageTemplatesAndCrm();
-  const q = (state.crmContactSearch||'').toLowerCase();
-  let contacts = (state.db.crmContacts||[]).filter(ct=>{
-    if (!q) return true;
-    return crmContactName(ct).toLowerCase().includes(q)
-        || (ct.organization_name||'').toLowerCase().includes(q)
-        || _crmEmails(ct).some(e=>e.toLowerCase().includes(q))
-        || _crmPhones(ct).some(p=>p.includes(q))
-        || (ct.afm||'').includes(q);
-  });
-
-  const _ctd = 'font-size:.78rem;padding:4px 8px;vertical-align:middle;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis';
-  const rows = contacts.map(ct=>{
+// ── CRM CONTACTS — FAST INDEX & SEARCH ───────────────────────────
+// Builds a pre-computed search index (called once after data load + after save/delete)
+function _buildCrmContactIndex() {
+  const coMap = new Map((state.db.crmCompanies||[]).map(co=>[co.id, co]));
+  state._crmContactIndex = (state.db.crmContacts||[]).map(ct => {
+    const name = crmContactName(ct);
     const phones = _crmPhones(ct);
     const emails = _crmEmails(ct);
-    const company = (state.db.crmCompanies||[]).find(co=>co.id===ct.company_id);
-    const nameLabel = esc(crmContactName(ct)) + (ct.organization_title ? `<span style="color:var(--muted);font-weight:400;font-size:.72rem;margin-left:5px">${esc(ct.organization_title)}</span>` : '');
+    const company = coMap.get(ct.company_id);
+    return {
+      ct,
+      name,
+      phones,
+      emails,
+      companyName: company ? company.company_name : (ct.organization_name||''),
+      searchStr: [name, ct.organization_name||'', ct.afm||'', ...phones, ...emails].join(' ').toLowerCase()
+    };
+  });
+}
+
+// 300ms debounce for search — only re-renders the tbody, not the whole page
+let _crmSearchTimer = null;
+function crmContactSearchDebounced(val) {
+  state.crmContactSearch = val;
+  state.crmContactPage = 1;
+  clearTimeout(_crmSearchTimer);
+  _crmSearchTimer = setTimeout(() => _crmContactsInPlace(), 300);
+}
+
+// Navigate to a contacts page without full render
+function crmContactsGoPage(p) {
+  state.crmContactPage = p;
+  _crmContactsInPlace();
+}
+
+// In-place update: rebuilds only tbody + count + pagination (no full render)
+function _crmContactsInPlace() {
+  if (!state._crmContactIndex) _buildCrmContactIndex();
+  const q = (state.crmContactSearch||'').toLowerCase().trim();
+  const filtered = q
+    ? state._crmContactIndex.filter(x => x.searchStr.includes(q))
+    : state._crmContactIndex;
+
+  const PAGE_SIZE = 30;
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (state.crmContactPage > totalPages) state.crmContactPage = 1;
+  const page = state.crmContactPage;
+  const slice = filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE);
+
+  const canEdit = canEditCrm();
+  const _ctd = 'font-size:.78rem;padding:4px 8px;vertical-align:middle;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis';
+
+  const rows = slice.map(({ct, name, phones, emails, companyName}) => {
+    const nameLabel = esc(name) + (ct.organization_title ? `<span style="color:var(--muted);font-weight:400;font-size:.72rem;margin-left:5px">${esc(ct.organization_title)}</span>` : '');
     return `<tr class="crm-tr" data-action="crm-ct-open" data-ctid="${ct.id}" style="cursor:pointer;line-height:1.2">
       <td class="crm-td" style="${_ctd};font-weight:600;max-width:260px">${nameLabel}</td>
-      <td class="crm-td" style="${_ctd}">${company?`<span class="crm-co-link">${esc(company.company_name)}</span>`:ct.organization_name?esc(ct.organization_name):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd}">${companyName?`<span class="crm-co-link">${esc(companyName)}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
       <td class="crm-td" style="${_ctd}">${phones.length?esc(phones[0]):'<span style="color:var(--muted)">—</span>'}</td>
       <td class="crm-td" style="${_ctd}">${emails.length?`<a href="mailto:${esc(emails[0])}" onclick="event.stopPropagation()" style="color:var(--blue)">${esc(emails[0])}</a>`:'<span style="color:var(--muted)">—</span>'}</td>
       <td class="crm-td crm-mono" style="${_ctd}">${ct.afm?esc(ct.afm):'<span style="color:var(--muted)">—</span>'}</td>
@@ -10302,9 +11369,62 @@ function renderCrmContacts() {
     </tr>`;
   }).join('');
 
+  const emptyRow = `<tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);font-size:.88rem">Δεν βρέθηκαν επαφές</td></tr>`;
+
+  const pagHtml = totalPages > 1 ? `<div style="display:flex;align-items:center;gap:8px;padding:10px 4px;flex-wrap:wrap">
+    <button class="btn btn-secondary btn-sm" onclick="crmContactsGoPage(${page-1})" ${page<=1?'disabled':''} style="font-size:.78rem">◀ Προηγ.</button>
+    <span style="font-size:.8rem;color:var(--muted)">Σελίδα ${page} / ${totalPages} &nbsp;·&nbsp; ${total} αποτελέσματα</span>
+    <button class="btn btn-secondary btn-sm" onclick="crmContactsGoPage(${page+1})" ${page>=totalPages?'disabled':''} style="font-size:.78rem">Επόμ. ▶</button>
+  </div>` : (total>0?`<div style="font-size:.78rem;color:var(--muted);padding:6px 4px">${total} αποτελέσματα</div>`:'');
+
+  const tbody = document.getElementById('crm-contacts-tbody');
+  const countEl = document.getElementById('crm-contacts-count');
+  const pagEl = document.getElementById('crm-contacts-pag');
+  if (tbody) tbody.innerHTML = rows || emptyRow;
+  if (countEl) countEl.textContent = q ? `${total} από ${(state._crmContactIndex||[]).length} επαφές` : `${total} επαφές συνολικά`;
+  if (pagEl) pagEl.innerHTML = pagHtml;
+}
+
+function renderCrmContacts() {
+  if (!state._crmContactIndex) _buildCrmContactIndex();
+  const q = (state.crmContactSearch||'').toLowerCase().trim();
+  const filtered = q
+    ? state._crmContactIndex.filter(x => x.searchStr.includes(q))
+    : state._crmContactIndex;
+
+  const PAGE_SIZE = 30;
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (state.crmContactPage > totalPages) state.crmContactPage = 1;
+  const page = state.crmContactPage;
+  const slice = filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE);
+
+  const canEdit = canEditCrm();
+  const _ctd = 'font-size:.78rem;padding:4px 8px;vertical-align:middle;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis';
+
+  const rows = slice.map(({ct, name, phones, emails, companyName}) => {
+    const nameLabel = esc(name) + (ct.organization_title ? `<span style="color:var(--muted);font-weight:400;font-size:.72rem;margin-left:5px">${esc(ct.organization_title)}</span>` : '');
+    return `<tr class="crm-tr" data-action="crm-ct-open" data-ctid="${ct.id}" style="cursor:pointer;line-height:1.2">
+      <td class="crm-td" style="${_ctd};font-weight:600;max-width:260px">${nameLabel}</td>
+      <td class="crm-td" style="${_ctd}">${companyName?`<span class="crm-co-link">${esc(companyName)}</span>`:'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd}">${phones.length?esc(phones[0]):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd}">${emails.length?`<a href="mailto:${esc(emails[0])}" onclick="event.stopPropagation()" style="color:var(--blue)">${esc(emails[0])}</a>`:'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td crm-mono" style="${_ctd}">${ct.afm?esc(ct.afm):'<span style="color:var(--muted)">—</span>'}</td>
+      <td class="crm-td" style="${_ctd};text-align:right;padding-right:6px;white-space:nowrap">
+        ${canEdit?`<button class="btn btn-ghost btn-sm" data-action="crm-ct-edit" data-ctid="${ct.id}" style="font-size:.7rem;padding:2px 6px;margin:0">✏</button><button class="btn btn-danger btn-sm" data-action="crm-ct-delete" data-ctid="${ct.id}" style="font-size:.7rem;padding:2px 6px;margin:0 0 0 2px">✕</button>`:''}
+      </td>
+    </tr>`;
+  }).join('');
+
+  const pagHtml = totalPages > 1 ? `<div style="display:flex;align-items:center;gap:8px;padding:10px 4px;flex-wrap:wrap">
+    <button class="btn btn-secondary btn-sm" onclick="crmContactsGoPage(${page-1})" ${page<=1?'disabled':''} style="font-size:.78rem">◀ Προηγ.</button>
+    <span style="font-size:.8rem;color:var(--muted)">Σελίδα ${page} / ${totalPages} &nbsp;·&nbsp; ${total} αποτελέσματα</span>
+    <button class="btn btn-secondary btn-sm" onclick="crmContactsGoPage(${page+1})" ${page>=totalPages?'disabled':''} style="font-size:.78rem">Επόμ. ▶</button>
+  </div>` : (total>0?`<div style="font-size:.78rem;color:var(--muted);padding:6px 4px">${total} αποτελέσματα</div>`:'');
+
   const gConnected = googleConnected();
   return `<div class="page-hd">
-    <div><h1>Επαφές</h1><div class="page-hd-sub">${(state.db.crmContacts||[]).length} επαφές συνολικά</div></div>
+    <div><h1>Επαφές</h1><div class="page-hd-sub" id="crm-contacts-count">${q ? `${total} από ${(state._crmContactIndex||[]).length} επαφές` : `${total} επαφές συνολικά`}</div></div>
     <div class="page-hd-actions">
       ${gConnected
         ? `<button class="btn btn-ghost btn-sm" onclick="disconnectGoogle()" title="Google Contacts συνδεδεμένο — κάντε κλικ για αποσύνδεση" style="color:#059669;font-size:.78rem">✓ Google Contacts</button>`
@@ -10313,9 +11433,10 @@ function renderCrmContacts() {
     </div>
   </div>
   <div class="crm-toolbar">
-    <input class="form-control crm-search" placeholder="🔍 Αναζήτηση επαφής…" value="${esc(state.crmContactSearch||'')}" oninput="state.crmContactSearch=this.value;render()" style="max-width:320px">
+    <input class="form-control crm-search" placeholder="🔍 Αναζήτηση επαφής…" value="${esc(state.crmContactSearch||'')}" oninput="crmContactSearchDebounced(this.value)" style="max-width:320px">
   </div>
-  ${contacts.length?`<div class="crm-table-wrap"><table class="crm-table" style="width:100%">
+  <div id="crm-contacts-pag">${pagHtml}</div>
+  ${slice.length||!q?`<div class="crm-table-wrap"><table class="crm-table" style="width:100%">
     <thead><tr style="font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;line-height:1.2">
       <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Όνομα</th>
       <th class="crm-th" style="padding:4px 8px;white-space:nowrap">Εταιρεία</th>
@@ -10324,7 +11445,7 @@ function renderCrmContacts() {
       <th class="crm-th" style="padding:4px 8px;white-space:nowrap">ΑΦΜ</th>
       <th class="crm-th" style="padding:4px 8px"></th>
     </tr></thead>
-    <tbody>${rows}</tbody>
+    <tbody id="crm-contacts-tbody">${rows}</tbody>
   </table></div>`:`<div class="empty-state"><div class="es-icon">👤</div><h3>Δεν βρέθηκαν επαφές</h3>${canEdit?`<button class="btn btn-primary" data-action="crm-ct-add">+ Νέα Επαφή</button>`:''}</div>`}`;
 }
 
@@ -10332,7 +11453,7 @@ function renderCrmContacts() {
 function renderCrmContact() {
   const ct = (state.db.crmContacts||[]).find(x=>x.id===state.crmContactId);
   if (!ct) return `<div class="empty-state"><h3>Επαφή δεν βρέθηκε</h3></div>`;
-  const canEdit = canManageTemplatesAndCrm();
+  const canEdit = canEditCrm();
   const phones = _crmPhones(ct);
   const emails = _crmEmails(ct);
   const company = (state.db.crmCompanies||[]).find(co=>co.id===ct.company_id);
@@ -10648,7 +11769,7 @@ window.setTaskRankManual = async function(pid, phid, tid, total) {
 };
 
 function renderOffers() {
-  const canEdit = canManageTemplatesAndCrm();
+  const canEdit = canEditCrm();
   const q = (state.offersSearch||'').toLowerCase();
   const stFilter    = state.offersStatus||'';
   const fCat        = state.offersFilterCat||'';
@@ -11492,6 +12613,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   render();
   initTheme();
   setTimeout(checkDeadlineAlerts, 1500);
+  // ── Time Tracker init (Phase 3: φόρτωσε status πριν ξεκινήσει ο timer) ──
+  if (state.cu) {
+    await StatusLayer.loadMine().catch(()=>{});
+    TimeTracker.recoverOrphaned().catch(()=>{});
+    TimeTracker.switchTo(state.view).catch(()=>{});
+  }
 
   sb.auth.onAuthStateChange((event)=>{
     if(event==='SIGNED_OUT' && isSupabaseAuthMode()){
@@ -11504,6 +12631,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       state.safetyLoaded=false;
       state.safetyLoading=false;
       state.view='login';
+      TimeTracker.stopAll().catch(()=>{});  // ← σταματάμε timer στο logout
     }
   });
 });
