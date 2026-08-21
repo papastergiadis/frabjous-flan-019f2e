@@ -1684,21 +1684,26 @@ function normalizeNotebookItem(item) {
 
 function normalizeSafetyVisit(item) {
   if(!item || typeof item!=='object') return null;
+  const createdAt=item.createdAt||item.created_at||nowTS();
   return {
     id:String(item.id||('safety_'+uid())),
     company:String(item.company||'').slice(0,180),
-    visitAt:item.visitAt||null,
-    durationMinutes:Math.max(0,Math.min(1440,Number(item.durationMinutes||60))),
+    visitAt:item.visitAt||item.visit_at||null,
+    durationMinutes:Math.max(0,Math.min(1440,Number(item.durationMinutes??item.duration_minutes??60))),
     location:String(item.location||'').slice(0,300),
     notes:String(item.notes||'').slice(0,2000),
-    reminderAt:item.reminderAt||null,
+    reminderAt:item.reminderAt||item.reminder_at||null,
     completed:!!item.completed,
-    announcementPath:item.announcementPath||null,
-    announcementName:item.announcementName?String(item.announcementName).slice(0,220):null,
-    announcementType:item.announcementType||null,
-    announcementSize:Number(item.announcementSize||0),
-    createdAt:item.createdAt||nowTS(),
-    updatedAt:item.updatedAt||item.createdAt||nowTS(),
+    announcementPath:item.announcementPath||item.announcement_path||null,
+    announcementName:(item.announcementName||item.announcement_name)?String(item.announcementName||item.announcement_name).slice(0,220):null,
+    announcementType:item.announcementType||item.announcement_type||null,
+    announcementSize:Number(item.announcementSize??item.announcement_size??0),
+    syncSource:item.syncSource||item.sync_source||null,
+    sourceFile:item.sourceFile||item.source_file||null,
+    syncKey:item.syncKey||item.sync_key||null,
+    sourcePayloadHash:item.sourcePayloadHash||item.source_payload_hash||null,
+    createdAt,
+    updatedAt:item.updatedAt||item.updated_at||createdAt,
   };
 }
 
@@ -1741,9 +1746,30 @@ async function persistNotebook() {
   state.notebook=clean;
 }
 
-function safetyVisitDbRow(item) {
+function safetyVisitDbRow(item,ownerAuthUserId) {
   const visit=normalizeSafetyVisit(item);
-  return visit||null;
+  if(!visit||!ownerAuthUserId) return null;
+  return {
+    id:visit.id,
+    owner_auth_user_id:ownerAuthUserId,
+    company:visit.company,
+    visit_at:visit.visitAt,
+    duration_minutes:visit.durationMinutes,
+    location:visit.location,
+    notes:visit.notes,
+    reminder_at:visit.reminderAt,
+    completed:visit.completed,
+    announcement_path:visit.announcementPath,
+    announcement_name:visit.announcementName,
+    announcement_type:visit.announcementType,
+    announcement_size:visit.announcementSize,
+    sync_source:visit.syncSource,
+    source_file:visit.sourceFile,
+    sync_key:visit.syncKey,
+    // A user edit must be seen by the next TA-SYNC reconciliation.
+    source_payload_hash:visit.syncSource==='TA-SYNC'?null:visit.sourcePayloadHash,
+    updated_at:nowTS(),
+  };
 }
 
 function safetyStorage() {
@@ -1841,20 +1867,31 @@ async function safetyFileDelete(fileId) {
 
 async function persistSafetyVisit(item) {
   if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') throw new Error('Απαιτείται ασφαλής εσωτερικός λογαριασμός.');
-  const {data,error}=await sb.auth.getUser();
-  if(error) throw error;
-  const user=data?.user;
+  const {data:userData,error:userError}=await sb.auth.getUser();
+  if(userError) throw userError;
+  const user=userData?.user;
   if(!user) throw new Error('Η συνεδρία έληξε. Συνδεθείτε ξανά.');
-  const clean=(state.safetyVisits||[]).slice(0,300).map(safetyVisitDbRow).filter(Boolean);
-  const metadata={...(user.user_metadata||{}),[SAFETY_METADATA_KEY]:clean};
-  const {error:updateError}=await sb.auth.updateUser({data:metadata});
-  if(updateError) throw updateError;
-  state.safetyVisits=clean;
-  return safetyVisitDbRow(item);
+
+  const row=safetyVisitDbRow(item,user.id);
+  if(!row) throw new Error('Η επίσκεψη δεν είναι έγκυρη.');
+  const {data,error}=await sb
+    .from('be_safety_visits')
+    .upsert(row,{onConflict:'id'})
+    .select('*')
+    .single();
+  if(error) throw error;
+
+  const stored=normalizeSafetyVisit(data);
+  const index=(state.safetyVisits||[]).findIndex(visit=>visit.id===stored.id);
+  if(index>=0) state.safetyVisits[index]=stored;
+  else state.safetyVisits.unshift(stored);
+  return stored;
 }
 
 async function removeSafetyVisit(visitId) {
-  await persistSafetyVisit(null);
+  if(!isSupabaseAuthMode() || !state.cu || state.cu.role==='client') throw new Error('Απαιτείται ασφαλής εσωτερικός λογαριασμός.');
+  const {error}=await sb.from('be_safety_visits').delete().eq('id',visitId);
+  if(error) throw error;
 }
 
 async function loadSafetyVisits() {
@@ -1864,10 +1901,12 @@ async function loadSafetyVisits() {
   state.safetyLoading=true;
   if(state.view==='safety-visits'||state.view==='calendar') render();
   try {
-    const {data,error}=await sb.auth.getUser();
+    const {data,error}=await sb
+      .from('be_safety_visits')
+      .select('*')
+      .order('visit_at',{ascending:true});
     if(error) throw error;
-    const raw=data?.user?.user_metadata?.[SAFETY_METADATA_KEY];
-    state.safetyVisits=(Array.isArray(raw)?raw:[]).map(normalizeSafetyVisit).filter(Boolean);
+    state.safetyVisits=(Array.isArray(data)?data:[]).map(normalizeSafetyVisit).filter(Boolean);
   } catch(error) {
     console.warn('safety visits load:',error);
     state.safetyVisits=[];
