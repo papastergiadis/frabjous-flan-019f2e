@@ -1933,7 +1933,7 @@ select.form-control { appearance: auto; cursor: pointer; }
 .ccal-head,
 .ccal-row {
   display: grid;
-  grid-template-columns: 1.6fr 160px 180px 200px 1fr 80px;
+  grid-template-columns: 250px 200px 200px 250px 1fr 80px;
   align-items: center;
   gap: 0;
 }
