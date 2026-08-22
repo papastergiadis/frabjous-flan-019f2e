@@ -1,7 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
-   Last Revision: 22/08/2026 12:00
+   Last Revision: 22/08/2026 23:50
    ================================================================ */
 'use strict';
 
@@ -2892,9 +2892,13 @@ const TimeTracker = {
       } catch(e) {}
     }
 
-    // ── Auto-timesheet για project & office sessions (>= 2 λεπτά) ──
-    if (elapsed >= 120) {
+    // ── Auto-timesheet ──
+    // Project: ξεχωριστή εγγραφή per-session (>= 2 λεπτά)
+    // Office : daily accumulator — αθροίζει ΟΛΕΣ τις μικρές επισκέψεις σε 1 εγγραφή/ημέρα
+    if (cur.context.type === 'project' && elapsed >= 120) {
       await this._autoTimesheet(cur, endedAt, elapsed);
+    } else if (cur.context.type === 'office') {
+      await this._accumulateOffice(cur, endedAt, elapsed);
     }
 
     // Προσθήκη στο log της ημέρας
@@ -2913,21 +2917,13 @@ const TimeTracker = {
     this._renderLog();
   },
 
-  /* Αυτόματη δημιουργία timesheet entry από project session */
+  /* Αυτόματη δημιουργία timesheet entry από project session (>= 2 λεπτά) */
   async _autoTimesheet(cur, endedAt, elapsed) {
     try {
-      const isProject = cur.context.type === 'project';
-
-      // Για project sessions: βρες το project object
-      let projectId = null, projectName = null;
-      if (isProject) {
-        const proj = (state.projects || []).find(p => p.id === cur.context.id);
-        if (!proj) return;  // project δεν βρέθηκε — ακύρωση
-        projectId   = proj.id;
-        projectName = proj.name;
-      }
-      // Για office sessions: projectId/projectName μένουν null,
-      // το context.label (π.χ. 'ΓΡΑΦΕΙΟ – Dashboard') μπαίνει στο desc
+      // Βρες το project object (fallback στο context αν state.projects δεν έχει φορτωθεί ακόμα)
+      const proj = (state.projects || []).find(p => p.id === cur.context.id);
+      const projectId   = cur.context.id;
+      const projectName = proj ? proj.name : cur.context.label;
 
       // Ώρες έναρξης / λήξης σε HH:MM (τοπική ώρα)
       const toHHMM = ts => {
@@ -2946,8 +2942,8 @@ const TimeTracker = {
       const date     = toDateStr(cur.startedAt);
       const hours    = parseFloat((elapsed / 3600).toFixed(2));
 
-      // Κατηγορία timesheet (μόνο για project sessions)
-      const cats = isProject && timesheetCategoryList ? timesheetCategoryList() : [];
+      // Κατηγορία timesheet
+      const cats = timesheetCategoryList ? timesheetCategoryList() : [];
       const defaultCat = cats[0] || null;
 
       const entry = {
@@ -2965,7 +2961,8 @@ const TimeTracker = {
       };
 
       if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
-        await sb.from('be_timesheets').upsert({ id: entry.id, data: entry });
+        const { error: upsertErr } = await sb.from('be_timesheets').upsert({ id: entry.id, data: entry });
+        if (upsertErr) { console.error('[AutoTS] upsert error:', upsertErr); throw upsertErr; }
       } else if (state.db) {
         if (!state.db.timesheets) state.db.timesheets = [];
         state.db.timesheets.push(entry);
@@ -2973,6 +2970,70 @@ const TimeTracker = {
 
       const label = projectName || cur.context.label;
       showToast('⏱ Timesheet αυτόματα καταχωρήθηκε: ' + label + ' (' + _ttFmt(elapsed) + ')', 'success');
+
+      // Ανανέωσε το timesheet view αν ο χρήστης βρίσκεται εκεί
+      if (state.view === 'timesheet') {
+        try { await refreshTimesheetAfterMutation(); } catch(re) {}
+      }
+    } catch(e) { console.error('[AutoTS] failed:', e); /* non-fatal */ }
+  },
+
+  /* ΓΡΑΦΕΙΟ Daily Accumulator
+   * Όλες οι επισκέψεις ΓΡΑΦΕΙΟ (ακόμα και < 2 λεπτά) αθροίζονται σε
+   * μία εγγραφή ανά ημέρα/χρήστη. Κάθε session ενημερώνει live την εγγραφή. */
+  async _accumulateOffice(cur, endedAt, elapsed) {
+    if (!elapsed || elapsed < 1 || !state.cu) return;
+    try {
+      const cu = state.cu;
+      const d  = new Date(cur.startedAt);
+      const date = d.getFullYear() + '-' +
+        String(d.getMonth()+1).padStart(2,'0') + '-' +
+        String(d.getDate()).padStart(2,'0');
+      const storageKey = 'tt_office_acc_' + cu.id + '_' + date;
+
+      // Φόρτωσε τον σημερινό accumulator από localStorage
+      let acc = { accumulated: 0, firstStart: cur.startedAt, date };
+      try {
+        const stored = JSON.parse(localStorage.getItem(storageKey) || 'null');
+        if (stored && stored.date === date) acc = stored;
+      } catch(e) {}
+
+      // Πρόσθεσε την τρέχουσα session και αποθήκευσε
+      acc.accumulated += elapsed;
+      try { localStorage.setItem(storageKey, JSON.stringify(acc)); } catch(e) {}
+
+      // Upsert: 1 εγγραφή ΓΡΑΦΕΙΟ για σήμερα (deterministic id)
+      const toHHMM = ts => {
+        const dt = new Date(ts);
+        return String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0');
+      };
+      const entryId = 'ts_office_' + cu.id + '_' + date;
+      const hours   = parseFloat((acc.accumulated / 3600).toFixed(2));
+
+      const entry = {
+        id: entryId,
+        userId: cu.id, userName: cu.name,
+        projectId: null, projectName: null,
+        projectCategoryId: null, projectCategoryName: null,
+        date,
+        timeFrom: toHHMM(acc.firstStart),
+        timeTo:   toHHMM(endedAt),
+        hours,
+        desc: '[Auto] ΓΡΑΦΕΙΟ – Σύνολο ημέρας',
+        km: null, comments: null, taskId: null, taskName: null,
+        createdAt: new Date(acc.firstStart).toISOString(),
+        autoGenerated: true,
+      };
+
+      if (isSupabaseAuthMode() && typeof sb !== 'undefined' && sb) {
+        await sb.from('be_timesheets').upsert({ id: entryId, data: entry });
+      } else if (state.db) {
+        if (!state.db.timesheets) state.db.timesheets = [];
+        const idx = state.db.timesheets.findIndex(t => t.id === entryId);
+        if (idx >= 0) state.db.timesheets[idx] = entry; else state.db.timesheets.push(entry);
+      }
+
+      showToast('🏢 ΓΡΑΦΕΙΟ σήμερα: ' + _ttFmt(acc.accumulated), 'info');
     } catch(e) { /* non-fatal */ }
   },
 
@@ -3041,7 +3102,7 @@ const TimeTracker = {
         <td style="color:#94a3b8;font-size:11px;white-space:nowrap">${hhmm}</td>
         <td style="padding:0 8px">${e.label}</td>
         <td style="text-align:right;font-weight:700;white-space:nowrap">${_ttFmt(e.elapsed)}</td>
-        ${e.isProject ? '<td style="color:#22c55e;font-size:10px">✓TS</td>' : '<td></td>'}
+        ${(e.isProject && e.elapsed >= 120) ? '<td style="color:#22c55e;font-size:10px">✓TS</td>' : '<td></td>'}
       </tr>`;
     }).join('');
     panel.innerHTML = `
