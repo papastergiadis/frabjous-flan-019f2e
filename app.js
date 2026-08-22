@@ -1,7 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
-   Last Revision: 22/08/2026 07:20
+   Last Revision: 22/08/2026 12:00
    ================================================================ */
 'use strict';
 
@@ -33,11 +33,12 @@ const WAITING_TASK_STATUSES = new Set([
 ]);
 
 const ROLE_INFO = {
-  admin:           { label:'Διαχειριστής',   cls:'role-admin',  level:4 },
-  management:      { label:'Διοίκηση',        cls:'role-mgmt',   level:3 },
-  project_manager: { label:'Υπ. Έργου',      cls:'role-pm',     level:2 },
-  team_member:     { label:'Μέλος Ομάδας',   cls:'role-team',   level:1 },
-  client:          { label:'Πελάτης',         cls:'role-client', level:0 },
+  admin:           { label:'Διαχειριστής',   cls:'role-admin',    level:4 },
+  management:      { label:'Διοίκηση',        cls:'role-mgmt',     level:3 },
+  project_manager: { label:'Υπ. Έργου',      cls:'role-pm',       level:2 },
+  team_member:     { label:'Μέλος Ομάδας',   cls:'role-team',     level:1 },
+  external:        { label:'Εξ. Συνεργάτης', cls:'role-external', level:1 },
+  client:          { label:'Πελάτης',         cls:'role-client',   level:0 },
 };
 
 // Simplified statuses shown to clients (hides internal states)
@@ -906,10 +907,11 @@ function clearCurrentUser() {
   sessionStorage.removeItem('be_pm_user');
 }
 
-function isAdmin()  { return ['admin','management'].includes(state.cu?.role); }
-function isPM()     { return state.cu?.role === 'project_manager'; }
-function isClient() { return state.cu?.role === 'client'; }
-function canEdit()  { return ['admin','management','project_manager','team_member'].includes(state.cu?.role); }
+function isAdmin()    { return ['admin','management'].includes(state.cu?.role); }
+function isPM()       { return state.cu?.role === 'project_manager'; }
+function isClient()   { return state.cu?.role === 'client'; }
+function isExternal() { return state.cu?.role === 'external'; }
+function canEdit()    { return ['admin','management','project_manager','team_member'].includes(state.cu?.role); }
 
 // ── STATE ─────────────────────────────────────────────────────────
 const state = {
@@ -1350,6 +1352,21 @@ function canModifyProject(proj) {
   if ((state.cu.categoryIds||[]).includes(catId)) return true;
   if ((state.cu.categoryRoles||{})[catId]==='project_manager') return true;
   return false;
+}
+
+// External collaborators who are members of the project can add content
+// (tasks, phases, messages) but cannot change project settings.
+function canContributeToProject(proj) {
+  if (!state.cu) return false;
+  if (canModifyProject(proj)) return true;
+  if (!isExternal()) return false;
+  const cu = state.cu;
+  return projManagerIds(proj).includes(cu.id) ||
+         (proj.memberIds||[]).includes(cu.id) ||
+         (cu.projectIds||[]).includes(proj.id) ||
+         (proj.phases||[]).some(ph =>
+           (ph.tasks||[]).some(t => t.assigneeId===cu.id || (t.memberIds||[]).includes(cu.id))
+         );
 }
 
 // Team members (globally or per-category) see only tasks assigned to them
@@ -2825,6 +2842,7 @@ const TimeTracker = {
 
   async switchTo(view) {
     if (_TT_NO_TRACK.has(view) || !state.cu) { await this.stopAll(); return; }
+    if (isExternal()) { await this.stopAll(); return; }   // Εξωτερικοί Συνεργάτες: δεν τρέχει timer
     const sc = StatusLayer.check();
     if (!sc.allowed) { await this.stopAll(); return; }
     const ctxFn = _TT_VIEW_MAP[view];
@@ -3251,6 +3269,7 @@ function updateNav() {
   document.querySelectorAll('[data-admin-only]').forEach(e2=>{ e2.style.display=isAdmin()?'':'none'; });
   document.querySelectorAll('[data-mgmt-only]').forEach(e2=>{ e2.style.display=canViewTemplates()?'':'none'; });
   document.querySelectorAll('[data-noClient-only]').forEach(e2=>{ e2.style.display=(state.cu&&state.cu.role!=='client')?'':'none'; });
+  document.querySelectorAll('[data-noExternal]').forEach(e2=>{ e2.style.display=isExternal()?'none':''; });
   const ni=el('nav-count'); if(ni) ni.textContent=visibleProjects().filter(p=>p.status==='in_progress').length;
   updateNotebookNavCount();
   updateSafetyNavCount();
@@ -4527,7 +4546,7 @@ function renderProject() {
   ensureProjectStyles();
   const proj=getProject(state.projectId); if(!proj) return '<p>Έργο not found.</p>';
   const cat=getCategory(proj.categoryId); const mgrNames=projManagerNames(proj);
-  const prog=projectProgress(proj); const isComp=proj.status==='completed'; const canMod=canModifyProject(proj);
+  const prog=projectProgress(proj); const isComp=proj.status==='completed'; const canMod=canModifyProject(proj); const canContrib=canContributeToProject(proj);
   const isAdminOrMgmt = ['admin','management'].includes(state.cu?.role);
   const init=proj.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();
 
@@ -4623,7 +4642,7 @@ function renderProject() {
         </div>
         <div class="task-row-body${isExp?' body-open':''}" id="body-${t.id}">
           ${depNames.length?`<div class="lock-msg" style="opacity:.7${!unlocked?';color:var(--red)':''}">${!unlocked?'🔒':'ℹ'} Εξαρτάται από: ${esc(depNames.join(', '))}</div>`:''}
-          ${canMod&&unlocked&&!isComp?`<div class="flex-center mb-12" style="gap:8px;flex-wrap:wrap"><select class="form-control" style="max-width:230px;font-size:.8rem" data-action="change-status" data-tid="${t.id}" data-phid="${ph.id}" data-pid="${proj.id}">${Object.entries(TASK_STATUSES).sort((a,b)=>a[1].label.localeCompare(b[1].label,'el')).map(([k,v])=>`<option value="${k}"${t.status===k?' selected':''}>${v.label}</option>`).join('')}</select><button class="btn btn-secondary btn-sm" data-action="modal-edit-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}">Επεξεργασία</button></div>`:''}
+          ${canContrib&&unlocked&&!isComp?`<div class="flex-center mb-12" style="gap:8px;flex-wrap:wrap"><select class="form-control" style="max-width:230px;font-size:.8rem" data-action="change-status" data-tid="${t.id}" data-phid="${ph.id}" data-pid="${proj.id}">${Object.entries(TASK_STATUSES).sort((a,b)=>a[1].label.localeCompare(b[1].label,'el')).map(([k,v])=>`<option value="${k}"${t.status===k?' selected':''}>${v.label}</option>`).join('')}</select><button class="btn btn-secondary btn-sm" data-action="modal-edit-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}">Επεξεργασία</button></div>`:''}
           ${(()=>{
             const logged=(state.db.timesheets||[]).filter(e=>e.taskId===t.id).reduce((s,e)=>s+(parseFloat(e.hours)||0),0);
             if(!t.estimatedHours&&!logged) return '';
@@ -4674,7 +4693,7 @@ function renderProject() {
     const canDropTasks = !isComp && state.cu && state.cu.role !== 'client';
     return `<div class="phase-section${phDone?' phase-done':''}" data-phase-idx="${phIdx}" data-phase-id="${ph.id}"${canReorder?` draggable="true" ondragstart="phaseDragStart(event,this,${phIdx})" ondragend="phaseDragEnd(this)"`:''} ${canDropTasks||canReorder?`ondragover="unifiedPhaseDragOver(event,this,${phIdx},'${ph.id}')" ondrop="unifiedPhaseDrop(event,this,${phIdx},'${ph.id}','${proj.id}')"`:''}>
       <div class="phase-header"><div class="phase-num${phDone?' pn-done':' pn-active'}">${phDone?'✓':phIdx+1}</div><div class="phase-title">${esc(ph.name)}</div>${phDone?'<span class="badge badge-green">Ολοκληρώθηκε</span>':''}
-      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canMod?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canContrib?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canContrib&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
       ${(()=>{const rs=ph.reviewStatus; const canReqRev=canMod&&['project_manager','team_member'].includes(state.cu?.role);
         if(isAdminOrMgmt&&rs==='pending') return `<div class="review-bar review-bar-pending phase-review-bar"><div class="review-bar-msg">📩 Η φάση <strong>${esc(ph.name)}</strong> χρειάζεται έλεγχο</div><div class="review-bar-acts"><button class="btn btn-primary btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','approved')">✅ Αποδοχή</button><button class="btn btn-danger btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','rejected')">❌ Απόρριψη</button></div></div>`;
         if(isAdminOrMgmt&&rs==='approved') return `<div class="review-bar review-bar-approved phase-review-bar">✅ Φάση Εγκρίθηκε</div>`;
@@ -4729,7 +4748,7 @@ function renderProject() {
           ${cpPhoneLines}${cpEmailLines}
         </div>`;
       })()}
-      <div class="cdh-actions">${isComp?'<span class="badge badge-green" style="font-size:.75rem;padding:5px 12px">Ολοκληρωμένο</span>':'<span class="badge badge-orange" style="font-size:.75rem;padding:5px 12px">Σε Εξέλιξη</span>'}<button class="btn btn-secondary btn-sm" data-action="export-project" data-pid="${proj.id}" title="Εξαγωγή έργου σε Excel">⬇ Excel</button><button class="btn btn-secondary btn-sm" data-action="export-project-pdf" data-pid="${proj.id}" title="Εξαγωγή έργου σε PDF">⬇ PDF</button>${state.cu.role!=='client'?`<button class="btn btn-secondary btn-sm" data-action="project-to-template" data-pid="${proj.id}" title="Αποθήκευση ως Πρότυπο Έργου">📋 Σε Πρότυπο</button>`:''}<button class="btn ${state.ganttView?'btn-primary':'btn-secondary'} btn-sm" data-action="toggle-gantt" title="Gantt Chart">📊 Gantt</button>${canMod?`<button class="btn btn-secondary btn-sm" data-action="modal-edit-project" data-pid="${proj.id}" title="Επεξεργασία έργου">✏ Επεξεργασία</button><button class="btn btn-secondary btn-sm" data-action="apply-template-to-project" data-pid="${proj.id}" title="Εφαρμογή ή ενημέρωση προτύπου">📋 Πρότυπο</button>`:''}${canMod&&!isComp&&proj.clientId?`<button class="btn btn-secondary btn-sm" data-action="send-client-reminder" data-pid="${proj.id}" title="Αποστολή υπενθύμισης στον πελάτη">🔔 Υπενθύμιση</button>`:''}${canMod&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-phase" data-pid="${proj.id}">+ Φάση</button>`:''}${canMod?`<button class="btn btn-danger btn-sm" data-action="delete-project" data-pid="${proj.id}">Διαγραφή</button>`:''}</div>
+      <div class="cdh-actions">${isComp?'<span class="badge badge-green" style="font-size:.75rem;padding:5px 12px">Ολοκληρωμένο</span>':'<span class="badge badge-orange" style="font-size:.75rem;padding:5px 12px">Σε Εξέλιξη</span>'}<button class="btn btn-secondary btn-sm" data-action="export-project" data-pid="${proj.id}" title="Εξαγωγή έργου σε Excel">⬇ Excel</button><button class="btn btn-secondary btn-sm" data-action="export-project-pdf" data-pid="${proj.id}" title="Εξαγωγή έργου σε PDF">⬇ PDF</button>${(!isClient()&&!isExternal())?`<button class="btn btn-secondary btn-sm" data-action="project-to-template" data-pid="${proj.id}" title="Αποθήκευση ως Πρότυπο Έργου">📋 Σε Πρότυπο</button>`:''}<button class="btn ${state.ganttView?'btn-primary':'btn-secondary'} btn-sm" data-action="toggle-gantt" title="Gantt Chart">📊 Gantt</button>${canMod?`<button class="btn btn-secondary btn-sm" data-action="modal-edit-project" data-pid="${proj.id}" title="Επεξεργασία έργου">✏ Επεξεργασία</button><button class="btn btn-secondary btn-sm" data-action="apply-template-to-project" data-pid="${proj.id}" title="Εφαρμογή ή ενημέρωση προτύπου">📋 Πρότυπο</button>`:''}${canMod&&!isComp&&proj.clientId?`<button class="btn btn-secondary btn-sm" data-action="send-client-reminder" data-pid="${proj.id}" title="Αποστολή υπενθύμισης στον πελάτη">🔔 Υπενθύμιση</button>`:''}${canContrib&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-phase" data-pid="${proj.id}">+ Φάση</button>`:''}${canMod?`<button class="btn btn-danger btn-sm" data-action="delete-project" data-pid="${proj.id}">Διαγραφή</button>`:''}</div>
     </div>
     <div class="cdh-progress-full">${renderProjectProgressChart(proj, prog)}</div>
   </div>
