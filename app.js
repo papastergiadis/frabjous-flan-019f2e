@@ -1,7 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
-   Last Revision: 25/08/2026 14:00
+   Last Revision: 25/08/2026 20:38
    ================================================================ */
 'use strict';
 
@@ -5859,9 +5859,10 @@ function _calMondayOf(dateStr) {
 function _calToggle() {
   const vm = state.calViewMode || 'month';
   return `<div class="cal-view-toggle">
-    <button data-action="cal-view-month" class="${vm==='month'?'cvt-active':''}">Μήνας</button>
-    <button data-action="cal-view-week"  class="${vm==='week' ?'cvt-active':''}">Εβδομάδα</button>
-    <button data-action="cal-view-day"   class="${vm==='day'  ?'cvt-active':''}">Ημέρα</button>
+    <button data-action="cal-view-month"  class="${vm==='month' ?'cvt-active':''}">Μήνας</button>
+    <button data-action="cal-view-week"   class="${vm==='week'  ?'cvt-active':''}">Εβδομάδα</button>
+    <button data-action="cal-view-7days"  class="${vm==='7days' ?'cvt-active':''}">7 Ημέρες</button>
+    <button data-action="cal-view-day"    class="${vm==='day'   ?'cvt-active':''}">Ημέρα</button>
   </div>`;
 }
 
@@ -5978,8 +5979,9 @@ function renderCalendar() {
   if (!state.cu || state.cu.role === 'client') return '<div class="empty-state"><h3>Δεν έχετε πρόσβαση</h3></div>';
   ensureCalMeetingStyle();
   const vm = state.calViewMode || 'month';
-  if (vm === 'week') return _renderCalWeek();
-  if (vm === 'day')  return _renderCalDay();
+  if (vm === 'week')  return _renderCalWeek();
+  if (vm === '7days') return _renderCal7Days();
+  if (vm === 'day')   return _renderCalDay();
   return _renderCalMonth();
 }
 
@@ -6105,34 +6107,16 @@ function _renderCalMonth() {
     if (dow>=5) continue; // Σάββατο/Κυριακή — δεν εμφανίζονται
     const dateStr=`${monthPrefix}${String(day).padStart(2,'0')}`;
     const isToday=dateStr===todayStr;
-    const dayPhases=phasesByDay[day]||[];
-    const dayTasks=tasksByDay[day]||[];
     const dayPersonal=personalByDate[dateStr]||[];
-    const totalItems=dayPersonal.length+dayPhases.length+dayTasks.length;
+    const totalItems=dayPersonal.length;
     const maxVisible=3;
 
-    // Personal appointments take priority so they never disappear behind
-    // project phases or tasks in the compact monthly cells.
+    // Month view: μόνο συναντήσεις/προσωπικά events
     const personalVisible=dayPersonal.slice(0,maxVisible);
     const personalPills=personalVisible.map(_calPersonalMonthPill).join('');
-    const remainingAfterPersonal=Math.max(0,maxVisible-personalVisible.length);
 
-    const visiblePhases=dayPhases.slice(0,remainingAfterPersonal);
-    const phaseBars = visiblePhases.map(({ph, proj, color, isFirst, isLast}) => {
-      const nm = isFirst ? (ph.name.length>14?ph.name.slice(0,13)+'…':ph.name) : '';
-      return `<div class="cal-phase-bar" data-action="open-project" data-pid="${proj.id}" style="background:${color}20;border-left:3px solid ${color}" title="${esc(ph.name)} · ${esc(proj.name)}">${nm?`<span style="color:${color};font-weight:700">${esc(nm)}</span>`:''}</div>`;
-    }).join('');
-
-    const maxTasks=Math.max(0,remainingAfterPersonal-visiblePhases.length);
-    const pills=dayTasks.slice(0,maxTasks).map(({task,proj})=>{
-      const st=TASK_STATUSES[task.status]||TASK_STATUSES.not_started;
-      const nm=task.name.length>16?task.name.slice(0,15)+'…':task.name;
-      const pn=proj.name.length>13?proj.name.slice(0,12)+'…':proj.name;
-      const timeLabel=task.startTime?`<span style="font-size:.55rem;opacity:.7"> ${task.startTime}</span>`:'';
-      return `<div class="cal-task ${st.cls}" data-action="open-project" data-pid="${proj.id}" title="${esc(task.name)} · ${esc(proj.name)}">${esc(nm)}${timeLabel}<span class="cal-task-proj">${esc(pn)}</span></div>`;
-    }).join('');
     const more=totalItems>maxVisible?`<div class="cal-more">+${totalItems-maxVisible} ακόμα</div>`:'';
-    cells+=`<div class="cal-cell${isToday?' cal-today':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${personalPills}${phaseBars}${pills}${more}</div>`;
+    cells+=`<div class="cal-cell${isToday?' cal-today':''}"><div class="cal-day-num">${day}${totalItems>0?`<span class="cal-day-badge">${totalItems}</span>`:''}</div>${personalPills}${more}</div>`;
   }
 
   return `
@@ -6192,6 +6176,123 @@ function ensureCalWeekWorkdaysStyle() {
     }
   `;
   document.head.appendChild(style);
+}
+
+function _renderCal7Days() {
+  ensureCalWeekWorkdaysStyle();
+
+  const todayStr = today();
+  const todayD   = new Date(todayStr);
+
+  // Next 7 weekdays (Δευ–Παρ) starting from today, weekends skipped
+  const days = [];
+  const _cursor = new Date(todayD);
+  while (days.length < 7) {
+    const _dow = _cursor.getDay();
+    if (_dow !== 0 && _dow !== 6) days.push(new Date(_cursor));
+    _cursor.setDate(_cursor.getDate() + 1);
+  }
+
+  const dayDateStrs = days.map(d => d.toISOString().slice(0, 10));
+  const dayDatesSet = new Set(dayDateStrs);
+  const personalByDate = _calPersonalEventsByDate();
+
+  // "Next actionable" tasks per project for the current user
+  const myNextTasksByDate = {};
+  visibleProjects().forEach(proj => {
+    assignedRowsForProject(proj, state.cu.id).forEach(({proj: p, task}) => {
+      const ts = task.plannedStart || task.startDate;
+      const te = task.plannedEnd   || task.startDate;
+      if (!te) return;
+      const dates = ts && ts < te ? _datesBetween(ts, te) : [te];
+      dates.forEach(ds => {
+        if (!dayDatesSet.has(ds)) return;
+        if (!myNextTasksByDate[ds]) myNextTasksByDate[ds] = [];
+        if (!myNextTasksByDate[ds].some(x => x.task.id === task.id))
+          myNextTasksByDate[ds].push({task, proj: p});
+      });
+    });
+  });
+
+  const _renderCard7 = ({task, proj}) => {
+    const st = TASK_STATUSES[task.status] || TASK_STATUSES.not_started;
+    const timeRange = task.startTime
+      ? `<div class="cwc-time">⏰ ${task.startTime}${task.endTime ? ' – ' + task.endTime : ''}</div>`
+      : '';
+    return `<div class="cwc" data-action="open-project" data-pid="${proj.id}" style="border-left-color:${st.color}" title="${esc(task.name)}">
+      <div class="cwc-name">${esc(task.name)}</div>
+      ${timeRange}
+      <div class="cwc-proj">📁 ${esc(proj.name)}</div>
+      <span class="task-status-badge ${st.cls}" style="font-size:.58rem;margin-top:5px;display:inline-block">${st.label}</span>
+    </div>`;
+  };
+
+  const dayNamesShort = ['Κυρ','Δευ','Τρί','Τετ','Πέμ','Παρ','Σάβ'];
+  const dayNamesLong  = ['Κυριακή','Δευτέρα','Τρίτη','Τετάρτη','Πέμπτη','Παρασκευή','Σάββατο'];
+
+  const cols = days.map((d, i) => {
+    const dateStr  = dayDateStrs[i];
+    const isToday  = dateStr === todayStr;
+
+    const meetingCards = (personalByDate[dateStr] || [])
+      .sort((a, b) => (a.time || '').localeCompare(b.time || ''))
+      .map(ev => _calPersonalWeekCard(ev))
+      .join('');
+
+    const myTaskCards = (myNextTasksByDate[dateStr] || [])
+      .sort((a, b) => (a.task.startTime || '99:99').localeCompare(b.task.startTime || '99:99'))
+      .map(_renderCard7)
+      .join('');
+
+    const allContent = meetingCards + myTaskCards;
+
+    const dayLabel = d.toLocaleDateString('el-GR', {day: 'numeric', month: 'short'});
+    return `<div class="cal-week-col">
+      <div class="cal-week-head${isToday ? ' cwh-today' : ''}">
+        <div class="cwh-name">${dayNamesLong[d.getDay()]}</div>
+        <div class="cwh-date${isToday ? ' cwh-date-today' : ''}">${dayLabel}${isToday ? ' 📍' : ''}</div>
+      </div>
+      <div class="cal-week-tasks">
+        ${allContent || '<div class="cwc-empty">—</div>'}
+      </div>
+    </div>`;
+  }).join('');
+
+  // 7-column grid style (injected once)
+  if (!document.getElementById('be-cal-7days-style')) {
+    const s = document.createElement('style');
+    s.id = 'be-cal-7days-style';
+    s.textContent = `
+      .cal-7days-grid {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0,1fr));
+        gap: 8px;
+        margin-top: 12px;
+      }
+      @media (max-width: 1200px) { .cal-7days-grid { grid-template-columns: repeat(4,minmax(0,1fr)); } }
+      @media (max-width: 800px)  { .cal-7days-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+      @media (max-width: 480px)  { .cal-7days-grid { grid-template-columns: 1fr; } }
+    `;
+    document.head.appendChild(s);
+  }
+
+  const fromStr = days[0].toLocaleDateString('el-GR', {day: 'numeric', month: 'long'});
+  const toStr   = days[6].toLocaleDateString('el-GR', {day: 'numeric', month: 'long', year: 'numeric'});
+
+  return `
+  <div class="page-hd">
+    <div>
+      <h1>Ημερολόγιο</h1>
+      <div class="page-hd-sub">Επόμενες 7 ημέρες · ${fromStr} – ${toStr}</div>
+    </div>
+    <div class="page-hd-actions" style="gap:8px;align-items:center;flex-wrap:wrap">
+      ${_calToggle()}
+      <button class="btn btn-secondary btn-sm" data-action="cal-today">Σήμερα</button>
+      ${state.cu && state.cu.role !== 'client' ? `<button class="btn btn-primary btn-sm" data-action="modal-add-meeting">🤝 + Συνάντηση</button>` : ''}
+    </div>
+  </div>
+  <div class="cal-7days-grid">${cols}</div>
+  ${_calLegend()}`;
 }
 
 function _renderCalWeek() {
@@ -6266,18 +6367,55 @@ function _renderCalWeek() {
   const fromStr = days[0].toLocaleDateString('el-GR',{day:'numeric',month:'short'});
   const toStr   = days[4].toLocaleDateString('el-GR',{day:'numeric',month:'short',year:'numeric'});
 
+  // Επόμενη ενέργεια ανά έργο για τον τρέχοντα χρήστη (μόνο αν ήρθε η σειρά)
+  const myNextTasksByDate = {};
+  visibleProjects().forEach(proj => {
+    assignedRowsForProject(proj, state.cu.id).forEach(({proj: p, task}) => {
+      const ts = task.plannedStart || task.startDate;
+      const te = task.plannedEnd || task.startDate;
+      if (!te) return;
+      const dates = ts && ts < te ? _datesBetween(ts, te) : [te];
+      dates.forEach(ds => {
+        if (!weekDatesSet.has(ds)) return;
+        if (!myNextTasksByDate[ds]) myNextTasksByDate[ds] = [];
+        if (!myNextTasksByDate[ds].some(x => x.task.id === task.id))
+          myNextTasksByDate[ds].push({task, proj: p});
+      });
+    });
+  });
+
+  const _renderTaskCardWeek = ({task, proj}) => {
+    const st = TASK_STATUSES[task.status] || TASK_STATUSES.not_started;
+    const timeRange = task.startTime
+      ? `<div class="cwc-time">⏰ ${task.startTime}${task.endTime?' – '+task.endTime:''}</div>`
+      : '';
+    return `<div class="cwc" data-action="open-project" data-pid="${proj.id}" style="border-left-color:${st.color}" title="${esc(task.name)}">
+      <div class="cwc-name">${esc(task.name)}</div>
+      ${timeRange}
+      <div class="cwc-proj">📁 ${esc(proj.name)}</div>
+      <span class="task-status-badge ${st.cls}" style="font-size:.58rem;margin-top:5px;display:inline-block">${st.label}</span>
+    </div>`;
+  };
+
   const cols = days.map((d,i) => {
     const dateStr = weekDateStrs[i];
     const isToday = dateStr===todayStr;
 
-    const dayItems=[
-      ...(personalByDate[dateStr]||[]).map(event=>({type:'personal',time:event.time||'',event})),
-      ...(tasksByDate[dateStr]||[]).map(entry=>({type:'task',time:entry.task.startTime||'99:99',...entry})),
-    ].sort((a,b)=>a.time.localeCompare(b.time));
+    // (1) Συναντήσεις — ταξινομημένες κατά ώρα
+    const meetingCards = (personalByDate[dateStr]||[])
+      .sort((a,b)=>(a.time||'').localeCompare(b.time||''))
+      .map(ev => _calPersonalWeekCard(ev))
+      .join('');
+
+    // (2) Επόμενη εργασία ανά έργο — μόνο αν ήρθε η σειρά του χρήστη
+    const myTaskCards = (myNextTasksByDate[dateStr]||[])
+      .sort((a,b)=>(a.task.startTime||'99:99').localeCompare(b.task.startTime||'99:99'))
+      .map(_renderTaskCardWeek)
+      .join('');
 
     // Phase bars για την εβδομαδιαία προβολή
     const dayPhases = phasesByDate[dateStr]||[];
-    const phaseBars = dayPhases.map(({ph, proj, color, isFirst}) => {
+    const phaseBars = dayPhases.map(({ph, proj, color}) => {
       const nm = ph.name.length>18 ? ph.name.slice(0,17)+'…' : ph.name;
       const pn = proj.name.length>16 ? proj.name.slice(0,15)+'…' : proj.name;
       return `<div class="cwc" data-action="open-project" data-pid="${proj.id}"
@@ -6289,30 +6427,7 @@ function _renderCalWeek() {
       </div>`;
     }).join('');
 
-    const cards = dayItems.map(item => {
-      if(item.type==='personal') return _calPersonalWeekCard(item.event);
-      const {task,proj}=item;
-      const st = TASK_STATUSES[task.status] || TASK_STATUSES.not_started;
-
-      // startTime/endTime represent the planned working time for this day.
-      const timeRange = task.startTime
-        ? `<div class="cwc-time">⏰ ${task.startTime}${task.endTime?' – '+task.endTime:''}</div>`
-        : '';
-
-      return `<div class="cwc"
-          data-action="open-project"
-          data-pid="${proj.id}"
-          style="border-left-color:${st.color}"
-          title="${esc(task.name)}">
-        <div class="cwc-name">${esc(task.name)}</div>
-        ${timeRange}
-        <div class="cwc-proj">📁 ${esc(proj.name)}</div>
-        <span class="task-status-badge ${st.cls}"
-          style="font-size:.58rem;margin-top:5px;display:inline-block">${st.label}</span>
-      </div>`;
-    }).join('');
-
-    const allContent = phaseBars + cards;
+    const allContent = meetingCards + myTaskCards;
 
     return `<div class="cal-week-col">
       <div class="cal-week-head${isToday?' cwh-today':''}">
@@ -7139,9 +7254,10 @@ function handleClick(e) {
     case 'delete-comment':     deleteComment(pid,phid,tid,btn.dataset.cid); break;
     case 'toggle-comments':    if(!state.commentsOpen)state.commentsOpen={}; state.commentsOpen[tid]=!state.commentsOpen[tid]; state.expandedTasks[tid]=true; render(); requestAnimationFrame(()=>restoreExpanded()); break;
     case 'client-toggle-task': if(!state.clientExpanded)state.clientExpanded={}; state.clientExpanded[tid]=!state.clientExpanded[tid]; render(); break;
-    case 'cal-view-month': state.calViewMode='month'; render(); break;
-    case 'cal-view-week':  state.calViewMode='week';  if(!state.calWeekStart)state.calWeekStart=_calMondayOf(null); render(); break;
-    case 'cal-view-day':   state.calViewMode='day';   if(!state.calDayDate)state.calDayDate=today(); render(); break;
+    case 'cal-view-month':  state.calViewMode='month';  render(); break;
+    case 'cal-view-week':   state.calViewMode='week';   if(!state.calWeekStart)state.calWeekStart=_calMondayOf(null); render(); break;
+    case 'cal-view-7days':  state.calViewMode='7days';  render(); break;
+    case 'cal-view-day':    state.calViewMode='day';    if(!state.calDayDate)state.calDayDate=today(); render(); break;
     case 'cal-prev': {
       const vm=state.calViewMode||'month';
       if (vm==='week') {
