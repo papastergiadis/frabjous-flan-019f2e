@@ -1,7 +1,7 @@
 /* ================================================================
    B&E Solutions – Project Management v2.1  |  Secure Client Delivery Fix 8
    Backend: Supabase (PostgreSQL + Storage)
-   Last Revision: 26/08/2026 10:00
+   Last Revision: 26/08/2026 11:00
    ================================================================ */
 'use strict';
 
@@ -10401,7 +10401,7 @@ function showModalEditUser(userId) {
 
   showModal(`<div class="modal-header"><div class="modal-title">Επεξεργασία – ${esc(user.name)}</div><button class="modal-close" onclick="closeModal()">✕</button></div><div class="modal-body"><div class="form-group"><label class="form-label">Ονοματεπώνυμο</label><input class="form-control" id="eu-name" value="${esc(user.name)}"></div><div class="form-group"><label class="form-label">Username</label><input class="form-control" id="eu-user" value="${esc(user.username)}" autocomplete="off"></div>${isSupabaseAuthMode()
     ? `<div class="form-hint" style="margin-bottom:12px">Ο κωδικός διαχειρίζεται από Supabase Auth και δεν αλλάζει από αυτή τη φόρμα.</div>
-       <div class="form-group"><label class="form-label">Email Auth</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}" readonly></div>`
+       <div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div>`
     : `<div class="form-group"><label class="form-label">Νέος Κωδικός (κενό = χωρίς αλλαγή)</label><input class="form-control" type="password" id="eu-pass" placeholder="••••••••" autocomplete="new-password"></div>
        <div class="form-group"><label class="form-label">Email</label><input class="form-control" type="email" id="eu-email" value="${esc(user.email||'')}"></div>`}<div class="form-group"><label class="form-label">Global Ρόλος</label><select class="form-control" id="eu-role">${Object.entries(ROLE_INFO).map(([k,v])=>`<option value="${k}"${k===user.role?' selected':''}>${v.label}</option>`).join('')}</select><div class="form-hint">Ισχύει όπου δεν υπάρχει ειδικός ρόλος κατηγορίας.</div></div>${catRolesHtml}${accessHtml}${templatesCrmPermissionHtml}</div><div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="modalUpdateUser('${userId}')">Αποθήκευση</button></div>`);
 }
@@ -10413,7 +10413,7 @@ window.euToggleCat=function(cb, cid){
 window.modalUpdateUser=async function(userId){
   const user=getUser(userId); if(!user) return;
   user.name=el('eu-name').value.trim()||user.name;
-  if (!isSupabaseAuthMode()) user.email=el('eu-email').value.trim();
+  user.email=el('eu-email').value.trim()||user.email;
   user.role=el('eu-role').value;
   const newUser=(el('eu-user')?.value||'').trim().toLowerCase();
   if (newUser && newUser!==user.username) {
@@ -12835,10 +12835,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         await sb.auth.signOut({scope:'local'}).catch(()=>{});
         AUTH_MODE='legacy';
         state.cu=null;
-        await loadFromDB();
-
+        // Session found but no app profile — avoid anonymous loadFromDB()
+        // (be_users is RLS-protected; anon reads are denied)
         const legacy=getCurrentUser();
         if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
+          try { await loadFromDB(); } catch(e) { state.db=emptyDbState(); }
           const fresh=state.db.users.find(u=>u.id===legacy.id);
           if(fresh){
             state.cu=fresh;
@@ -12846,15 +12847,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             await loadSafetyVisits();
             initPresence();
             initProjectsRealtime();
-          } else clearCurrentUser();
-        } else clearCurrentUser();
+          } else { clearCurrentUser(); state.cu=null; state.view='login'; }
+        } else { clearCurrentUser(); state.cu=null; state.view='login'; }
       }
     } else {
+      // No Supabase session — check for legacy user BEFORE loadFromDB()
+      // Prevents 'permission denied for be_users' on anonymous page load.
       AUTH_MODE='legacy';
-      await loadFromDB();
-
       const legacy=getCurrentUser();
       if (legacy && !AUTH_REQUIRED_ROLES.has(legacy.role)) {
+        try { await loadFromDB(); } catch(e) { state.db=emptyDbState(); }
         const fresh=state.db.users.find(u=>u.id===legacy.id);
         if(fresh){
           state.cu=fresh;
@@ -12879,7 +12881,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     AUTH_MODE='legacy';
     state.cu=null;
     state.view='login';
-    try { await loadFromDB(); } catch(e) { state.db=emptyDbState(); }
+    state.db=emptyDbState();
+    // Do not retry loadFromDB() here — session is gone, be_users is RLS-protected
     showToast('Αποτυχία αρχικοποίησης: '+(err.message||err),'error');
   }
 
