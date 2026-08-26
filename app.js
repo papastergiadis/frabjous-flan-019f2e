@@ -381,6 +381,34 @@ async function dbSaveProject(proj) {
   if (error) { showToast('Σφάλμα αποθήκευσης έργου.','error'); throw error; }
 }
 
+// ── UNDO SYSTEM ──────────────────────────────────────────────────────────────
+window._undoStack = [];
+window._undoInProgress = false;
+
+function pushUndo(label, projId, snapshot) {
+  if (window._undoInProgress) return;
+  window._undoStack.push({ label, projId, snapshot: JSON.parse(JSON.stringify(snapshot)) });
+  if (window._undoStack.length > 20) window._undoStack.shift();
+}
+
+async function undoLast() {
+  if (!window._undoStack.length) { showToast('Δεν υπάρχει ενέργεια για αναίρεση.', ''); return; }
+  const { label, projId, snapshot } = window._undoStack.pop();
+  const idx = (state.db.projects||[]).findIndex(p => p.id === projId);
+  if (idx >= 0) state.db.projects[idx] = snapshot;
+  window._undoInProgress = true;
+  try {
+    await dbSaveProject(snapshot);
+    render();
+    showToast(`↩ Αναίρεση: "${label}"`, 'success');
+  } catch(e) {
+    showToast('Η αναίρεση απέτυχε.', 'error');
+    console.error('undo:', e);
+  } finally {
+    window._undoInProgress = false;
+  }
+}
+
 // Phase 2E: refresh the authoritative server copy after a narrow mutation RPC.
 async function refreshProjectFromServer(projectId) {
   const {data,error}=await sb.from('be_projects').select('data').eq('id',projectId).single();
@@ -2239,7 +2267,7 @@ function showModalViewMeeting(meetingId) {
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" data-action="export-meeting-ics" data-mid="${mtg.id}">⬇ .ics</button>
+      <button class="btn btn-ghost" data-action="export-meeting-ics" data-mid="${mtg.id}">⬇ .ics</button>${(()=>{const gcal=meetingGCalUrl(mtg);return gcal?`<a class="btn btn-ghost" href="${gcal}" target="_blank" rel="noopener" title="Άνοιγμα στο Google Calendar">📅 Google Calendar</a>`:''})()}
       ${canEdit?`<button class="btn btn-ghost" onclick="closeModal();showModalEditMeeting('${mtg.id}')">✏ Επεξεργασία</button><button class="btn btn-danger" onclick="closeModal();deleteMeeting('${mtg.id}')">Διαγραφή</button>`:''}
       <button class="btn btn-secondary" onclick="closeModal()">Κλείσιμο</button>
     </div>`);
@@ -2276,6 +2304,41 @@ async function deleteMeeting(meetingId) {
   await dbDeleteMeeting(meetingId);
   if (state.view==='calendar') render();
   showToast('Συνάντηση διαγράφηκε.', 'success');
+}
+
+function meetingGCalUrl(mtg) {
+  if (!mtg || !mtg.date) return null;
+  const pad = n => String(n).padStart(2,'0');
+  const d = mtg.date.replace(/-/g,'');
+  const t = (mtg.time||'').replace(':','');
+  let dtStart, dtEnd;
+  if (t) {
+    dtStart = `${d}T${t}00`;
+    if (mtg.duration) {
+      const endMs = new Date(mtg.date + 'T' + mtg.time + ':00').getTime() + mtg.duration * 60000;
+      const e = new Date(endMs);
+      dtEnd = `${e.getFullYear()}${pad(e.getMonth()+1)}${pad(e.getDate())}T${pad(e.getHours())}${pad(e.getMinutes())}00`;
+    } else {
+      dtEnd = dtStart;
+    }
+  } else {
+    // All-day: YYYYMMDD/YYYYMMDD+1
+    const nextDay = new Date(mtg.date);
+    nextDay.setDate(nextDay.getDate()+1);
+    dtStart = d;
+    dtEnd = `${nextDay.getFullYear()}${pad(nextDay.getMonth()+1)}${pad(nextDay.getDate())}`;
+  }
+  const params = new URLSearchParams({
+    action: 'TEMPLATE',
+    text: mtg.title||'Συνάντηση',
+    dates: `${dtStart}/${dtEnd}`,
+    details: [
+      mtg.notes||'',
+      mtg.attendeeIds?.length ? '👥 Συμμετέχοντες: ' + (mtg.attendeeIds.map(id=>{const u=getUser(id);return u?.name;}).filter(Boolean).join(', ')) : '',
+    ].filter(Boolean).join('\n'),
+    location: mtg.location||'',
+  });
+  return `https://www.google.com/calendar/render?${params.toString()}`;
 }
 
 function exportMeetingIcs(meetingId) {
@@ -2407,6 +2470,60 @@ async function deleteNotebookItem(noteId) {
   }
 }
 
+function showEmailImportModal() {
+  const today=new Date();const pad=n=>String(n).padStart(2,'0');
+  const todayStr=`${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+  showModal(`<div class="modal-header"><div class="modal-title">📧 Εισαγωγή από Email</div><button class="modal-close" onclick="closeModal()" aria-label="Κλείσιμο">✕</button></div>
+    <div class="modal-body">
+      <div class="form-group"><label class="form-label" for="em-from">Αποστολέας</label><input class="form-control" id="em-from" placeholder="π.χ. info@εταιρεία.gr"></div>
+      <div class="form-group"><label class="form-label" for="em-subject">Θέμα email <sup>*</sup></label><input class="form-control" id="em-subject" maxlength="180" placeholder="Θέμα του email"></div>
+      <div class="form-group"><label class="form-label" for="em-date">Ημερομηνία</label><input class="form-control" type="date" id="em-date" value="${todayStr}"></div>
+      <div class="form-group"><label class="form-label" for="em-body">Κείμενο email</label><textarea class="form-control" id="em-body" rows="6" maxlength="2800" placeholder="Επικολλήστε εδώ το κείμενο του email…"></textarea></div>
+      <div class="form-group"><label class="form-label" for="em-priority">Προτεραιότητα</label><select class="form-control" id="em-priority"><option value="low">Χαμηλή</option><option value="normal" selected>Κανονική</option><option value="high">Υψηλή</option><option value="critical">Επείγουσα</option></select></div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Άκυρο</button><button class="btn btn-primary" onclick="saveEmailImportModal()">Αποθήκευση στο Σημειωματάριο</button></div>`);
+  setTimeout(()=>el('em-subject')?.focus(),0);
+}
+
+window.saveEmailImportModal=async function(){
+  const subject=(el('em-subject')?.value||'').trim();
+  if(!subject){showToast('Γράψτε το θέμα του email.','error');el('em-subject')?.focus();return;}
+  const from=(el('em-from')?.value||'').trim();
+  const dateVal=el('em-date')?.value||'';
+  const body=(el('em-body')?.value||'').trim();
+  const dateStr=dateVal?new Date(dateVal).toLocaleDateString('el-GR'):'';
+  const parts=[];
+  if(from) parts.push(`📧 Από: ${from}`);
+  if(dateStr) parts.push(`📅 ${dateStr}`);
+  if(body){parts.push('');parts.push(body);}
+  const details=parts.join('\n').slice(0,3000);
+  const previous=JSON.stringify(state.notebook||[]);
+  const now=nowTS();
+  const item={
+    id:'note_email_'+uid(),
+    title:subject.slice(0,180),
+    details,
+    dueAt:null,
+    reminderAt:null,
+    priority:el('em-priority')?.value||'normal',
+    completed:false,
+    createdAt:now,
+    updatedAt:now,
+  };
+  state.notebook.unshift(item);
+  try{
+    await persistNotebook();
+    closeModal();
+    render();
+    checkNotebookReminders();
+    showToast('Το email αποθηκεύτηκε στο Σημειωματάριο.','success');
+  }catch(error){
+    state.notebook=JSON.parse(previous);
+    console.error('email import save:',error);
+    showToast('Δεν ήταν δυνατή η αποθήκευση. Δοκιμάστε ξανά.','error');
+  }
+};
+
 window.setNotebookFilter=function(value){state.notebookFilter=value||'open';render();};
 window.filterNotebookTable=function(value){
   state.notebookSearch=String(value||'');
@@ -2456,7 +2573,7 @@ function renderNotebook() {
     </tr>`;
   }).join('');
 
-  return `<div class="page-hd notebook-page-hd"><div><h1>Σημειωματάριο</h1><div class="page-hd-sub">Προσωπικές εκκρεμότητες · ορατές μόνο σε εσάς</div></div><div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-notebook">+ Νέα εκκρεμότητα</button></div></div>
+  return `<div class="page-hd notebook-page-hd"><div><h1>Σημειωματάριο</h1><div class="page-hd-sub">Προσωπικές εκκρεμότητες · ορατές μόνο σε εσάς</div></div><div class="page-hd-actions"><button class="btn btn-secondary" data-action="modal-import-email-notebook" style="margin-right:8px">📧 Εισαγωγή από Email</button><button class="btn btn-primary" data-action="modal-add-notebook">+ Νέα εκκρεμότητα</button></div></div>
     <div class="notebook-privacy"><span>🔒</span><div><strong>Προσωπικός χώρος</strong><p>Οι σημειώσεις αποθηκεύονται στον δικό σας λογαριασμό και δεν εμφανίζονται σε συναδέλφους ή διαχειριστές του πίνακα έργων.</p></div></div>
     ${reminderAlerts.length?`<div class="notebook-alert"><strong>⏰ ${reminderAlerts.length===1?'Έχετε μία ενεργή υπενθύμιση':`Έχετε ${reminderAlerts.length} ενεργές υπενθυμίσεις`}</strong><span>${esc(reminderAlerts.slice(0,2).map(n=>n.title).join(' · '))}${reminderAlerts.length>2?' …':''}</span></div>`:''}
     <div class="notebook-stats"><div class="notebook-stat"><span>Ανοιχτές</span><strong>${open.length}</strong></div><div class="notebook-stat today"><span>Σήμερα</span><strong>${todayItems.length}</strong></div><div class="notebook-stat overdue"><span>Εκπρόθεσμες</span><strong>${overdue.length}</strong></div><div class="notebook-stat upcoming"><span>Προσεχώς</span><strong>${upcoming.length}</strong></div></div>
@@ -4798,11 +4915,11 @@ function renderProject() {
         </div>
       </div>`;
     }).join('');
-    const canReorder = state.cu && ['admin','management'].includes(state.cu.role);
+    const canReorder = canMod;
     const totalPhases = (proj.phases||[]).length;
     const canDropTasks = !isComp && state.cu && state.cu.role !== 'client';
     return `<div class="phase-section${phDone?' phase-done':''}" data-phase-idx="${phIdx}" data-phase-id="${ph.id}"${canReorder?` draggable="true" ondragstart="phaseDragStart(event,this,${phIdx})" ondragend="phaseDragEnd(this)"`:''} ${canDropTasks||canReorder?`ondragover="unifiedPhaseDragOver(event,this,${phIdx},'${ph.id}')" ondrop="unifiedPhaseDrop(event,this,${phIdx},'${ph.id}','${proj.id}')"`:''}>
-      <div class="phase-header"><div class="phase-num${phDone?' pn-done':' pn-active'}">${phDone?'✓':phIdx+1}</div><div class="phase-title">${esc(ph.name)}</div>${phDone?'<span class="badge badge-green">Ολοκληρώθηκε</span>':''}
+      <div class="phase-header">${canReorder?'<div class="tpl-drag-handle phase-drag-handle" title="Σύρετε για αναδιάταξη">⠿</div>':''}<div class="phase-num${phDone?' pn-done':' pn-active'}">${phDone?'✓':phIdx+1}</div><div class="phase-title">${esc(ph.name)}</div>${phDone?'<span class="badge badge-green">Ολοκληρώθηκε</span>':''}
       <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canContrib?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canMod?`<button class="btn btn-ghost btn-sm" data-action="delete-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px;color:var(--red)" title="Διαγραφή φάσης">🗑</button>`:''}${canContrib&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
       ${(()=>{const rs=ph.reviewStatus; const canReqRev=canMod&&['project_manager','team_member'].includes(state.cu?.role);
         if(isAdminOrMgmt&&rs==='pending') return `<div class="review-bar review-bar-pending phase-review-bar"><div class="review-bar-msg">📩 Η φάση <strong>${esc(ph.name)}</strong> χρειάζεται έλεγχο</div><div class="review-bar-acts"><button class="btn btn-primary btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','approved')">✅ Αποδοχή</button><button class="btn btn-danger btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','rejected')">❌ Απόρριψη</button></div></div>`;
@@ -5097,8 +5214,9 @@ async function deleteProjectPhase(pid, phid) {
     ? `Διαγραφή φάσης "${ph.name}" και ${taskCount} εργασί${taskCount===1?'ας':'ών'};`
     : `Διαγραφή φάσης "${ph.name}";`;
   if(!confirm(msg)) return;
+  pushUndo(`Διαγραφή φάσης "${ph.name}"`, proj.id, proj);
   proj.phases=(proj.phases||[]).filter(p=>p.id!==phid);
-  try { await dbSaveProject(proj); render(); showToast('Φάση διαγράφηκε.',''); }
+  try { await dbSaveProject(proj); render(); showToast('Φάση διαγράφηκε.','',true); }
   catch(e){ showToast('Σφάλμα διαγραφής φάσης.','error'); console.error(e); await loadFromDB().catch(()=>{}); render(); }
 }
 async function deleteProjectTask(pid, phid, tid) {
@@ -5107,8 +5225,9 @@ async function deleteProjectTask(pid, phid, tid) {
   const ph=(proj.phases||[]).find(p=>p.id===phid); if(!ph) return;
   const task=(ph.tasks||[]).find(t=>t.id===tid); if(!task) return;
   if(!confirm(`Διαγραφή εργασίας "${task.name}";`)) return;
+  pushUndo(`Διαγραφή εργασίας "${task.name}"`, proj.id, proj);
   ph.tasks=(ph.tasks||[]).filter(t=>t.id!==tid);
-  try { await dbSaveProject(proj); render(); showToast('Εργασία διαγράφηκε.',''); }
+  try { await dbSaveProject(proj); render(); showToast('Εργασία διαγράφηκε.','',true); }
   catch(e){ showToast('Σφάλμα διαγραφής εργασίας.','error'); console.error(e); await loadFromDB().catch(()=>{}); render(); }
 }
 
@@ -7238,6 +7357,7 @@ function handleClick(e) {
     case 'modal-billing':            showModalBilling();                            break;
     case 'modal-add-template':       showModalAddTemplate();                        break;
     case 'modal-add-notebook':       showNotebookModal();                           break;
+    case 'modal-import-email-notebook': showEmailImportModal();                        break;
     case 'modal-edit-notebook':      showNotebookModal(btn.dataset.nid);            break;
     case 'toggle-notebook':          toggleNotebookItem(btn.dataset.nid);           break;
     case 'delete-notebook':          deleteNotebookItem(btn.dataset.nid);           break;
@@ -9974,6 +10094,7 @@ async function movePhase(projId, idxStr, dir) {
   const newIdx = idx + dir;
   const phases = proj.phases || [];
   if (newIdx < 0 || newIdx >= phases.length) return;
+  pushUndo('Αλλαγή σειράς φάσεων', proj.id, proj);
   [phases[idx], phases[newIdx]] = [phases[newIdx], phases[idx]];
   proj.phases = phases;
   await dbSaveProject(proj);
@@ -9987,10 +10108,10 @@ window.phaseDragStart = function(e, el, idx) {
   if (e.target.closest('button,input,select,a')) { e.preventDefault(); return; }
   window._phaseDragIdx = idx;
   e.dataTransfer.effectAllowed = 'move';
-  setTimeout(() => { el.style.opacity = '.5'; }, 0);
+  setTimeout(() => { el.classList.add('phase-dragging'); }, 0);
 };
 window.phaseDragEnd = function(el) {
-  el.style.opacity = '1';
+  el.classList.remove('phase-dragging');
   document.querySelectorAll('.phase-section').forEach(r => r.classList.remove('phase-drag-over'));
 };
 window.phaseDragOver = function(e) {
@@ -10065,13 +10186,14 @@ async function moveTaskToPhase(projId, fromPhaseId, taskId, targetPhaseId) {
   if (!fromPh || !targetPh) return;
   const taskIdx = (fromPh.tasks||[]).findIndex(t => t.id === taskId);
   if (taskIdx < 0) return;
+  pushUndo(`Μετακίνηση εργασίας στη "${targetPh.name}"`, proj.id, proj);
   const [task] = fromPh.tasks.splice(taskIdx, 1);
   if (!targetPh.tasks) targetPh.tasks = [];
   targetPh.tasks.push(task);
   await dbSaveProject(proj);
   auditLog('Μετακίνηση εργασίας', `"${task.name}" → "${targetPh.name}"`);
   render();
-  showToast(`Εργασία μεταφέρθηκε στη "${esc(targetPh.name)}"`, 'success');
+  showToast(`Εργασία μεταφέρθηκε στη "${esc(targetPh.name)}"`, 'success', true);
 }
 
 window._projTaskDrag = null;
@@ -12781,10 +12903,16 @@ window.modalSaveCrmContact = async function(id) {
 };
 
 // ── TOAST ─────────────────────────────────────────────────────────
-function showToast(msg,type='') {
+function showToast(msg,type='',undoable=false) {
   const wrap=el('toast-wrap'); if(!wrap) return;
   const t=document.createElement('div'); t.className=`toast${type?' t-'+type:''}`;
-  t.textContent=msg; wrap.appendChild(t); setTimeout(()=>t.remove(),3500);
+  if (undoable && window._undoStack && window._undoStack.length) {
+    const sp=document.createElement('span'); sp.textContent=msg;
+    const btn=document.createElement('button'); btn.className='toast-undo-btn'; btn.textContent='↩ Αναίρεση';
+    btn.onclick=()=>{ undoLast(); t.remove(); };
+    t.appendChild(sp); t.appendChild(btn);
+  } else { t.textContent=msg; }
+  wrap.appendChild(t); setTimeout(()=>t.remove(),undoable?6000:3500);
 }
 
 // ── DARK MODE ─────────────────────────────────────────────────────
@@ -12808,6 +12936,11 @@ function initTheme() {
 // ── INIT ──────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey||e.metaKey) && e.key==='k') { e.preventDefault(); if(state.cu&&state.cu.role!=='client') showGlobalSearch(); }
+  if ((e.ctrlKey||e.metaKey) && e.key==='z' && !e.shiftKey) {
+    const tag=(document.activeElement?.tagName||'');
+    if (['INPUT','TEXTAREA','SELECT'].includes(tag)) return;
+    e.preventDefault(); undoLast();
+  }
 });
 
 document.addEventListener('DOMContentLoaded', async () => {
