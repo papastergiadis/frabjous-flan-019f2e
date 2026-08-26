@@ -2797,8 +2797,22 @@ function _ttFmt(s) {
       transition:opacity .15s;
     }
     #tt-bar .tt-log-btn:hover { opacity:1; }
-    body:has(#tt-bar:not(.tt-hidden)) { padding-bottom: 44px; }
-    body:has(#tt-bar:not(.tt-hidden)) #main-content { padding-bottom: 52px; }
+    #tt-bar .tt-min-btn {
+      cursor:pointer; opacity:.55; font-size:13px;
+      padding:2px 5px; border-radius:4px; background:rgba(255,255,255,.1);
+      transition:opacity .15s; flex-shrink:0; margin-left:4px; line-height:1;
+    }
+    #tt-bar .tt-min-btn:hover { opacity:1; }
+    #tt-bar.tt-minimized {
+      left:auto; right:16px; bottom:16px; border-radius:20px;
+      padding:6px 12px; width:auto; box-shadow:0 2px 12px rgba(0,0,0,.5);
+    }
+    #tt-bar.tt-minimized .tt-label,
+    #tt-bar.tt-minimized .tt-flag-badge,
+    #tt-bar.tt-minimized .tt-log-btn { display:none; }
+    #tt-bar.tt-minimized .tt-min-btn { margin-left:6px; }
+    body:has(#tt-bar:not(.tt-hidden):not(.tt-minimized)) { padding-bottom: 44px; }
+    body:has(#tt-bar:not(.tt-hidden):not(.tt-minimized)) #main-content { padding-bottom: 52px; }
     body:has(#bulk-action-bar.bulk-bar-visible) #main-content { padding-bottom: 68px; }
     #tt-log-panel {
       position:fixed; bottom:42px; right:0; left:0; z-index:9998;
@@ -3095,13 +3109,23 @@ const TimeTracker = {
       ${badge}
       ${logCount}
       <span class="tt-time" id="tt-time">${_ttFmt(cur.elapsed)}</span>
+      <span class="tt-min-btn" title="Ελαχιστοποίηση / Επαναφορά" onclick="TimeTracker._toggleMinimize()">⌃</span>
     `;
+    const isMin = localStorage.getItem('tt-minimized') === '1';
+    if (isMin) bar.classList.add('tt-minimized'); else bar.classList.remove('tt-minimized');
     bar.classList.remove('tt-hidden');
   },
 
   _toggleLog() {
     this._logOpen = !this._logOpen;
     this._renderLog();
+  },
+
+  _toggleMinimize() {
+    const bar = document.getElementById('tt-bar');
+    if (!bar) return;
+    const isMin = bar.classList.toggle('tt-minimized');
+    localStorage.setItem('tt-minimized', isMin ? '1' : '0');
   },
 
   _renderLog() {
@@ -4721,7 +4745,7 @@ function renderProject() {
             <span class="task-status-badge ${stInfo.cls}">${stInfo.label}</span>
             <div class="mini-prog"><div class="mini-bar"><div class="mini-fill" style="width:${dp.pct}%;background:${t.status==='completed'?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${dp.done}/${dp.total}</span></div>
             ${!unlocked?'<span class="badge badge-amber" style="font-size:.58rem">Κλειδωμένη</span>':''}
-            ${canMod&&!isComp?`<button class="btn btn-ghost btn-sm" data-action="duplicate-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" title="Αντιγραφή εργασίας" style="font-size:.7rem;padding:3px 8px">⧉</button>`:''}${isAdminOrMgmt?`<button class="btn btn-ghost btn-sm" data-action="delete-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" title="Διαγραφή εργασίας" style="font-size:.7rem;padding:3px 8px;color:var(--red)">🗑</button>`:''}
+            ${canMod&&!isComp?`<button class="btn btn-ghost btn-sm" data-action="duplicate-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" title="Αντιγραφή εργασίας" style="font-size:.7rem;padding:3px 8px">⧉</button>`:''}${canMod?`<button class="btn btn-ghost btn-sm" data-action="delete-task" data-pid="${proj.id}" data-phid="${ph.id}" data-tid="${t.id}" title="Διαγραφή εργασίας" style="font-size:.7rem;padding:3px 8px;color:var(--red)">🗑</button>`:''}
             ${phaseMoveButtons}
             <span class="expand-icon${isExp?' ei-open':''}" id="ei-${t.id}">▼</span>
           </div>
@@ -4779,7 +4803,7 @@ function renderProject() {
     const canDropTasks = !isComp && state.cu && state.cu.role !== 'client';
     return `<div class="phase-section${phDone?' phase-done':''}" data-phase-idx="${phIdx}" data-phase-id="${ph.id}"${canReorder?` draggable="true" ondragstart="phaseDragStart(event,this,${phIdx})" ondragend="phaseDragEnd(this)"`:''} ${canDropTasks||canReorder?`ondragover="unifiedPhaseDragOver(event,this,${phIdx},'${ph.id}')" ondrop="unifiedPhaseDrop(event,this,${phIdx},'${ph.id}','${proj.id}')"`:''}>
       <div class="phase-header"><div class="phase-num${phDone?' pn-done':' pn-active'}">${phDone?'✓':phIdx+1}</div><div class="phase-title">${esc(ph.name)}</div>${phDone?'<span class="badge badge-green">Ολοκληρώθηκε</span>':''}
-      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canContrib?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${isAdminOrMgmt?`<button class="btn btn-ghost btn-sm" data-action="delete-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px;color:var(--red)" title="Διαγραφή φάσης">🗑</button>`:''}${canContrib&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:10px">${canReorder?`<div style="display:flex;flex-direction:column;gap:2px"><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-up" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===0?'disabled':''} style="padding:1px 6px;font-size:.7rem">▲</button><button class="btn btn-ghost btn-sm prio-arrow-btn" data-action="move-phase-down" data-pid="${proj.id}" data-phidx="${phIdx}" ${phIdx===totalPhases-1?'disabled':''} style="padding:1px 6px;font-size:.7rem">▼</button></div>`:''}<div class="mini-prog"><div class="mini-bar" style="width:70px"><div class="mini-fill" style="width:${phPct}%;background:${phDone?'var(--green)':'var(--orange)'}"></div></div><span class="mini-count">${phPct}%</span></div><button class="btn btn-ghost btn-sm" data-action="export-phase" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε Excel" style="font-size:.7rem;padding:3px 8px">⬇ Excel</button><button class="btn btn-ghost btn-sm" data-action="export-phase-pdf" data-pid="${proj.id}" data-phid="${ph.id}" title="Εξαγωγή φάσης σε PDF" style="font-size:.7rem;padding:3px 8px">⬇ PDF</button>${canContrib?`<button class="btn btn-ghost btn-sm" data-action="modal-edit-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px" title="Επεξεργασία φάσης">✏</button>`:''} ${canMod?`<button class="btn btn-ghost btn-sm" data-action="delete-phase" data-pid="${proj.id}" data-phid="${ph.id}" style="font-size:.7rem;padding:3px 8px;color:var(--red)" title="Διαγραφή φάσης">🗑</button>`:''}${canContrib&&!isComp?`<button class="btn btn-secondary btn-sm" data-action="modal-add-task" data-pid="${proj.id}" data-phid="${ph.id}">+ Εργασία</button>`:''}</div></div>
       ${(()=>{const rs=ph.reviewStatus; const canReqRev=canMod&&['project_manager','team_member'].includes(state.cu?.role);
         if(isAdminOrMgmt&&rs==='pending') return `<div class="review-bar review-bar-pending phase-review-bar"><div class="review-bar-msg">📩 Η φάση <strong>${esc(ph.name)}</strong> χρειάζεται έλεγχο</div><div class="review-bar-acts"><button class="btn btn-primary btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','approved')">✅ Αποδοχή</button><button class="btn btn-danger btn-sm" onclick="resolvePhaseReview('${proj.id}','${ph.id}','rejected')">❌ Απόρριψη</button></div></div>`;
         if(isAdminOrMgmt&&rs==='approved') return `<div class="review-bar review-bar-approved phase-review-bar">✅ Φάση Εγκρίθηκε</div>`;
@@ -5066,7 +5090,7 @@ async function deletePhaseMessage(pid, phid, msgId) {
 /* ── Delete phase / task (admin & management only) ──────────────────── */
 async function deleteProjectPhase(pid, phid) {
   const proj=getProject(pid); if(!proj) return;
-  if(!['admin','management'].includes(state.cu?.role)){ showToast('Δεν έχετε δικαίωμα.','error'); return; }
+  if(!canModifyProject(proj)){ showToast('Δεν έχετε δικαίωμα.','error'); return; }
   const ph=(proj.phases||[]).find(p=>p.id===phid); if(!ph) return;
   const taskCount=(ph.tasks||[]).length;
   const msg=taskCount>0
@@ -5079,7 +5103,7 @@ async function deleteProjectPhase(pid, phid) {
 }
 async function deleteProjectTask(pid, phid, tid) {
   const proj=getProject(pid); if(!proj) return;
-  if(!['admin','management'].includes(state.cu?.role)){ showToast('Δεν έχετε δικαίωμα.','error'); return; }
+  if(!canModifyProject(proj)){ showToast('Δεν έχετε δικαίωμα.','error'); return; }
   const ph=(proj.phases||[]).find(p=>p.id===phid); if(!ph) return;
   const task=(ph.tasks||[]).find(t=>t.id===tid); if(!task) return;
   if(!confirm(`Διαγραφή εργασίας "${task.name}";`)) return;
