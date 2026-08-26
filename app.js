@@ -6441,7 +6441,12 @@ function _renderCalWeek() {
     const dayItems=[
       ...(personalByDate[dateStr]||[]).map(event=>({type:'personal',time:event.time||'',event})),
       ...(tasksByDate[dateStr]||[]).map(entry=>({type:'task',time:entry.task.startTime||'99:99',...entry})),
-    ].sort((a,b)=>a.time.localeCompare(b.time));
+    ].sort((a,b)=>{
+      // Priority: meetings (0) → safety/notes (1) → tasks (2); within group sort by time
+      const _wp=x=>x.type==='personal'?(x.event.kind==='meeting'?0:1):2;
+      const d=_wp(a)-_wp(b);
+      return d!==0?d:a.time.localeCompare(b.time);
+    });
 
     // Phase bars για την εβδομαδιαία προβολή
     const dayPhases = phasesByDate[dateStr]||[];
