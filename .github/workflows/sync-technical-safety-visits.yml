@@ -4,9 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type SYNC-BOTH-35 to synchronize 35 visits for elias and thomas"
+        description: "Type SYNC-BOTH-<count>, for example SYNC-BOTH-25"
         required: true
         type: string
+      source_file:
+        description: "Exact source filename, for example 2026_09.pdf"
+        required: true
+        default: "2026_09.pdf"
+        type: string
+      expected_count:
+        description: "Validated number of visits in the source PDF"
+        required: true
+        default: 106
+        type: number
 
 permissions:
   contents: read
@@ -17,7 +27,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync 35 September visits for both owners
+    name: Sync ${{ inputs.source_file }} for both owners
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 10
@@ -29,9 +39,12 @@ jobs:
     steps:
       - name: Require explicit production confirmation
         shell: bash
+        env:
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
-          if [ "${{ inputs.confirmation }}" != "SYNC-BOTH-35" ]; then
-            echo "::error::Production sync stopped. Enter exactly SYNC-BOTH-35."
+          expected_confirmation="SYNC-BOTH-$EXPECTED_COUNT"
+          if [ "${{ inputs.confirmation }}" != "$expected_confirmation" ]; then
+            echo "::error::Production sync stopped. Enter exactly $expected_confirmation."
             exit 1
           fi
 
@@ -51,16 +64,31 @@ jobs:
       - name: Prepare canonical payload
         id: payload
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           base_file="$RUNNER_TEMP/technical-safety-base.json"
           canonical_file="$RUNNER_TEMP/technical-safety-canonical.json"
           printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$base_file"
 
-          jq -e '
+          source_file="$SOURCE_FILE"
+          expected_count="$EXPECTED_COUNT"
+
+          if ! [[ "$source_file" =~ ^[0-9]{4}_(0[1-9]|1[0-2])\.pdf$ ]]; then
+            echo "::error::source_file must match YYYY_MM.pdf"
+            exit 1
+          fi
+          if ! [[ "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::expected_count must be a positive integer"
+            exit 1
+          fi
+
+          jq -e --arg source "$source_file" --argjson count "$expected_count" '
             .dryRun == true
-            and .sourceFile == "2026_09.pdf"
+            and .sourceFile == $source
             and (.visits | type == "array")
-            and (.visits | length == 35)
+            and (.visits | length == $count)
           ' "$base_file" >/dev/null
 
           jq '
@@ -73,8 +101,8 @@ jobs:
               )
           ' "$base_file" > "$canonical_file"
 
-          jq -e '
-            ([.visits[].syncKey] | unique | length) == 35
+          jq -e --argjson count "$expected_count" '
+            ([.visits[].syncKey] | unique | length) == $count
             and all(.visits[]; .notes == .syncKey)
           ' "$canonical_file" >/dev/null
 
@@ -82,6 +110,9 @@ jobs:
 
       - name: Reconfirm both owners without writes
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           for owner in elias thomas
           do
@@ -105,11 +136,11 @@ jobs:
               exit 1
             fi
 
-            jq -e --arg owner "$owner" '
+            jq -e --arg owner "$owner" --arg source "$SOURCE_FILE" --argjson count "$EXPECTED_COUNT" '
               .owner == $owner
               and .dryRun == true
-              and .sourceFile == "2026_09.pdf"
-              and .total == 35
+              and .sourceFile == $source
+              and .total == $count
             ' "$response_file" >/dev/null || {
               echo "::error::Unexpected preflight response for $owner. No live sync was performed."
               exit 1
@@ -118,6 +149,9 @@ jobs:
 
       - name: Apply production sync to both owners
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           for owner in elias thomas
           do
@@ -141,11 +175,11 @@ jobs:
               exit 1
             fi
 
-            jq -e --arg owner "$owner" '
+            jq -e --arg owner "$owner" --arg source "$SOURCE_FILE" --argjson count "$EXPECTED_COUNT" '
               .owner == $owner
               and .dryRun == false
-              and .sourceFile == "2026_09.pdf"
-              and .total == 35
+              and .sourceFile == $source
+              and .total == $count
             ' "$response_file" >/dev/null
 
             jq -r '"- " + .owner + ": created " + (.created|tostring) + ", updated " + (.updated|tostring) + ", deleted " + (.deleted|tostring) + ", unchanged " + (.unchanged|tostring)' \
@@ -158,7 +192,8 @@ jobs:
           {
             echo "## Technical Safety two-owner production sync"
             echo
-            echo "- Source: 2026_09.pdf"
+            echo "- Source: ${{ inputs.source_file }}"
+            echo "- Expected visits: ${{ inputs.expected_count }}"
             cat "$RUNNER_TEMP/summary-lines.txt"
           } >> "$GITHUB_STEP_SUMMARY"
 
