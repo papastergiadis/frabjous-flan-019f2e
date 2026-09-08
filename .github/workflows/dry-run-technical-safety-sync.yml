@@ -8,14 +8,14 @@ on:
         required: true
         type: string
       source_file:
-        description: "Exact source filename, for example 2026_10.pdf"
+        description: "Exact source filename, for example 2026_09.pdf"
         required: true
-        default: "2026_10.pdf"
+        default: "2026_09.pdf"
         type: string
       expected_count:
         description: "Validated number of visits in the source PDF"
         required: true
-        default: 25
+        default: 106
         type: number
 
 permissions:
