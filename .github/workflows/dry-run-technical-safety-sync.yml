@@ -7,6 +7,16 @@ on:
         description: "Type DRY-RUN-BOTH to validate elias and thomas without changing visits"
         required: true
         type: string
+      source_file:
+        description: "Exact source filename, for example 2026_10.pdf"
+        required: true
+        default: "2026_10.pdf"
+        type: string
+      expected_count:
+        description: "Validated number of visits in the source PDF"
+        required: true
+        default: 25
+        type: number
 
 permissions:
   contents: read
@@ -17,7 +27,7 @@ concurrency:
 
 jobs:
   dry-run:
-    name: Validate September visits for both owners
+    name: Validate ${{ inputs.source_file }} for both owners
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 10
@@ -55,11 +65,23 @@ jobs:
           base_file="$RUNNER_TEMP/technical-safety-base.json"
           printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$base_file"
 
-          jq -e '
+          source_file='${{ inputs.source_file }}'
+          expected_count='${{ inputs.expected_count }}'
+
+          if ! [[ "$source_file" =~ ^[0-9]{4}_(0[1-9]|1[0-2])\.pdf$ ]]; then
+            echo "::error::source_file must match YYYY_MM.pdf"
+            exit 1
+          fi
+          if ! [[ "$expected_count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::expected_count must be a positive integer"
+            exit 1
+          fi
+
+          jq -e --arg source "$source_file" --argjson count "$expected_count" '
             .dryRun == true
-            and .sourceFile == "2026_09.pdf"
+            and .sourceFile == $source
             and (.visits | type == "array")
-            and (.visits | length == 35)
+            and (.visits | length == $count)
           ' "$base_file" >/dev/null
 
           jq '
@@ -99,11 +121,11 @@ jobs:
               exit 1
             fi
 
-            jq -e --arg owner "$owner" '
+            jq -e --arg owner "$owner" --arg source '${{ inputs.source_file }}' --argjson count '${{ inputs.expected_count }}' '
               .owner == $owner
               and .dryRun == true
-              and .sourceFile == "2026_09.pdf"
-              and .total == 35
+              and .sourceFile == $source
+              and .total == $count
             ' "$response_file" >/dev/null
 
             jq -r '"- " + .owner + ": create " + (.created|tostring) + ", update " + (.updated|tostring) + ", delete " + (.deleted|tostring) + ", unchanged " + (.unchanged|tostring)' \
@@ -116,7 +138,8 @@ jobs:
           {
             echo "## Technical Safety two-owner dry-run"
             echo
-            echo "- Source: 2026_09.pdf"
+            echo "- Source: ${{ inputs.source_file }}"
+            echo "- Expected visits: ${{ inputs.expected_count }}"
             cat "$RUNNER_TEMP/summary-lines.txt"
             echo "- No visit writes were performed"
           } >> "$GITHUB_STEP_SUMMARY"
