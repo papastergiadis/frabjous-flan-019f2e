@@ -35,6 +35,8 @@ jobs:
       SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
       TECHNICAL_SAFETY_SYNC_KEY: ${{ secrets.TECHNICAL_SAFETY_SYNC_KEY }}
       TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64: ${{ secrets.TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64 }}
+      TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1: ${{ secrets.TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1 }}
+      TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2: ${{ secrets.TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2 }}
 
     steps:
       - name: Require explicit dry-run confirmation
@@ -49,13 +51,24 @@ jobs:
         shell: bash
         run: |
           missing=0
-          for name in SUPABASE_PROJECT_REF TECHNICAL_SAFETY_SYNC_KEY TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64
+          for name in SUPABASE_PROJECT_REF TECHNICAL_SAFETY_SYNC_KEY
           do
             if [ -z "${!name}" ]; then
               echo "::error::Missing GitHub secret: $name"
               missing=1
             fi
           done
+
+          if { [ -n "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1" ] && [ -z "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2" ]; } ||
+             { [ -z "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1" ] && [ -n "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2" ]; }; then
+            echo "::error::Both split payload secrets are required when either part is set."
+            missing=1
+          elif [ -z "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" ] &&
+               [ -z "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1" ]; then
+            echo "::error::Missing payload secret: set the single secret or both split parts."
+            missing=1
+          fi
+
           exit "$missing"
 
       - name: Prepare canonical payload
@@ -66,7 +79,12 @@ jobs:
           EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           base_file="$RUNNER_TEMP/technical-safety-base.json"
-          printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$base_file"
+          payload_b64="$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64"
+          if [ -n "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1" ] &&
+             [ -n "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2" ]; then
+            payload_b64="${TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART1}${TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64_PART2}"
+          fi
+          printf '%s' "$payload_b64" | base64 --decode > "$base_file"
 
           source_file="$SOURCE_FILE"
           expected_count="$EXPECTED_COUNT"
