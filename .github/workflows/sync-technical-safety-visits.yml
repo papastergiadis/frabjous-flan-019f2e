@@ -39,8 +39,10 @@ jobs:
     steps:
       - name: Require explicit production confirmation
         shell: bash
+        env:
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
-          expected_confirmation="SYNC-BOTH-${{ inputs.expected_count }}"
+          expected_confirmation="SYNC-BOTH-$EXPECTED_COUNT"
           if [ "${{ inputs.confirmation }}" != "$expected_confirmation" ]; then
             echo "::error::Production sync stopped. Enter exactly $expected_confirmation."
             exit 1
@@ -62,13 +64,16 @@ jobs:
       - name: Prepare canonical payload
         id: payload
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           base_file="$RUNNER_TEMP/technical-safety-base.json"
           canonical_file="$RUNNER_TEMP/technical-safety-canonical.json"
           printf '%s' "$TECHNICAL_SAFETY_DRY_RUN_PAYLOAD_B64" | base64 --decode > "$base_file"
 
-          source_file='${{ inputs.source_file }}'
-          expected_count='${{ inputs.expected_count }}'
+          source_file="$SOURCE_FILE"
+          expected_count="$EXPECTED_COUNT"
 
           if ! [[ "$source_file" =~ ^[0-9]{4}_(0[1-9]|1[0-2])\.pdf$ ]]; then
             echo "::error::source_file must match YYYY_MM.pdf"
@@ -96,8 +101,8 @@ jobs:
               )
           ' "$base_file" > "$canonical_file"
 
-          jq -e '
-            ([.visits[].syncKey] | unique | length) == (${{ inputs.expected_count }})
+          jq -e --argjson count "$expected_count" '
+            ([.visits[].syncKey] | unique | length) == $count
             and all(.visits[]; .notes == .syncKey)
           ' "$canonical_file" >/dev/null
 
@@ -105,6 +110,9 @@ jobs:
 
       - name: Reconfirm both owners without writes
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           for owner in elias thomas
           do
@@ -128,7 +136,7 @@ jobs:
               exit 1
             fi
 
-            jq -e --arg owner "$owner" --arg source '${{ inputs.source_file }}' --argjson count '${{ inputs.expected_count }}' '
+            jq -e --arg owner "$owner" --arg source "$SOURCE_FILE" --argjson count "$EXPECTED_COUNT" '
               .owner == $owner
               and .dryRun == true
               and .sourceFile == $source
@@ -141,6 +149,9 @@ jobs:
 
       - name: Apply production sync to both owners
         shell: bash
+        env:
+          SOURCE_FILE: ${{ inputs.source_file }}
+          EXPECTED_COUNT: ${{ inputs.expected_count }}
         run: |
           for owner in elias thomas
           do
@@ -164,7 +175,7 @@ jobs:
               exit 1
             fi
 
-            jq -e --arg owner "$owner" --arg source '${{ inputs.source_file }}' --argjson count '${{ inputs.expected_count }}' '
+            jq -e --arg owner "$owner" --arg source "$SOURCE_FILE" --argjson count "$EXPECTED_COUNT" '
               .owner == $owner
               and .dryRun == false
               and .sourceFile == $source
