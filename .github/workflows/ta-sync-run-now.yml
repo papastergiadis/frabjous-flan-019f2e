@@ -1,4 +1,5 @@
 name: Technical Safety Sync Run Now
+# trigger: 2026-09-09T19:00:00+03:00
 
 on:
   push:
