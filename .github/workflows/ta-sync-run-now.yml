@@ -1,0 +1,141 @@
+name: Technical Safety Sync Run Now
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ta-sync-run-now.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: technical-safety-run-now
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+    env:
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      TECHNICAL_SAFETY_SYNC_KEY: ${{ secrets.TECHNICAL_SAFETY_SYNC_KEY }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+      DROPBOX_NAMESPACE_ID: ${{ secrets.DROPBOX_NAMESPACE_ID }}
+      DROPBOX_SOURCE_PATH: /03. ΤΕΧΝΙΚΟΣ ΑΣΦΑΛΕΙΑΣ/technical_safety_schedule.pdf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in SUPABASE_PROJECT_REF TECHNICAL_SAFETY_SYNC_KEY DROPBOX_APP_KEY DROPBOX_APP_SECRET DROPBOX_REFRESH_TOKEN DROPBOX_NAMESPACE_ID; do
+            if [ -z "${!name}" ]; then echo "::error::Missing secret: $name"; missing=1; fi
+          done
+          exit "$missing"
+      - name: Install parser
+        run: python -m pip install --disable-pip-version-check --quiet pdfplumber==0.11.7
+      - name: Download exact Dropbox source
+        shell: bash
+        run: |
+          token_file="$RUNNER_TEMP/dropbox-token.json"
+          status="$(curl -sS -L -o "$token_file" -w '%{http_code}' -u "$DROPBOX_APP_KEY:$DROPBOX_APP_SECRET" --data-urlencode grant_type=refresh_token --data-urlencode refresh_token="$DROPBOX_REFRESH_TOKEN" https://api.dropboxapi.com/oauth2/token)"
+          [ "$status" = 200 ] || { echo "::error::Dropbox token HTTP $status"; exit 1; }
+          access_token="$(jq -er '.access_token' "$token_file")"
+          api_arg="$(jq -cn --arg path "$DROPBOX_SOURCE_PATH" '{path:$path}')"
+          path_root="$(jq -cn --arg namespace_id "$DROPBOX_NAMESPACE_ID" '{".tag":"namespace_id",namespace_id:$namespace_id}')"
+          mkdir -p "$RUNNER_TEMP/ta"
+          pdf="$RUNNER_TEMP/ta/technical_safety_schedule.pdf"
+          status="$(curl -sS -L -o "$pdf" -w '%{http_code}' -X POST https://content.dropboxapi.com/2/files/download -H "Authorization: Bearer $access_token" -H "Dropbox-API-Path-Root: $path_root" -H "Dropbox-API-Arg: $api_arg")"
+          unset access_token
+          rm -f "$token_file"
+          [ "$status" = 200 ] && [ -s "$pdf" ] || { echo "::error::Dropbox download HTTP $status"; exit 1; }
+          file "$pdf" | grep -q 'PDF document' || { echo "::error::Source is not PDF"; exit 1; }
+      - name: Parse and validate all current/future months
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ta/payloads"
+          python scripts/technical_safety_schedule.py --pdf "$RUNNER_TEMP/ta/technical_safety_schedule.pdf" --output-dir "$RUNNER_TEMP/ta/payloads" | tee "$RUNNER_TEMP/ta/parser-output.json"
+      - name: Dry-run both owners
+        id: preview
+        shell: bash
+        run: |
+          : > "$RUNNER_TEMP/ta/preview.tsv"
+          deletion_total=0
+          while IFS=$'\t' read -r source payload count; do
+            for owner in elias thomas; do
+              req="$RUNNER_TEMP/ta/request-$owner-${source%.pdf}.json"
+              res="$RUNNER_TEMP/ta/preview-$owner-${source%.pdf}.json"
+              jq --arg owner "$owner" '.owner=$owner | .dryRun=true' "$RUNNER_TEMP/ta/payloads/$payload" > "$req"
+              status="$(curl -sS -L -o "$res" -w '%{http_code}' -X POST "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync" -H "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY" -H 'Content-Type: application/json' --data-binary "@$req")"
+              [ "$status" = 200 ] || { echo "::error::Dry-run $owner $source HTTP $status"; exit 1; }
+              jq -e --arg owner "$owner" --arg source "$source" --argjson count "$count" '.owner==$owner and .sourceFile==$source and .dryRun==true and .total==$count' "$res" >/dev/null || exit 1
+              created="$(jq -r '.created' "$res")"; updated="$(jq -r '.updated' "$res")"; deleted="$(jq -r '.deleted' "$res")"; unchanged="$(jq -r '.unchanged' "$res")"
+              deletion_total=$((deletion_total + deleted))
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$source" "$owner" "$created" "$updated" "$deleted" "$unchanged" >> "$RUNNER_TEMP/ta/preview.tsv"
+            done
+          done < <(jq -r '.months[] | [.sourceFile,.payload,.count] | @tsv' "$RUNNER_TEMP/ta/payloads/manifest.json")
+          echo "$deletion_total" > "$RUNNER_TEMP/ta/deletion_total.txt"
+          echo "deletion_total=$deletion_total" >> "$GITHUB_OUTPUT"
+      - name: Stop before deletions without explicit approval
+        if: steps.preview.outputs.deletion_total != '0'
+        shell: bash
+        run: |
+          echo "blocked_deletions" > "$RUNNER_TEMP/ta/status.txt"
+          echo "::error::Dry-run proposes ${{ steps.preview.outputs.deletion_total }} deletions across both owners. Live sync blocked pending explicit approval."
+          exit 1
+      - name: Live sync both owners
+        if: steps.preview.outputs.deletion_total == '0'
+        shell: bash
+        run: |
+          : > "$RUNNER_TEMP/ta/live.tsv"
+          while IFS=$'\t' read -r source payload count; do
+            for owner in elias thomas; do
+              req="$RUNNER_TEMP/ta/live-request-$owner-${source%.pdf}.json"
+              res="$RUNNER_TEMP/ta/live-$owner-${source%.pdf}.json"
+              jq --arg owner "$owner" '.owner=$owner | .dryRun=false' "$RUNNER_TEMP/ta/payloads/$payload" > "$req"
+              status="$(curl -sS -L -o "$res" -w '%{http_code}' -X POST "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync" -H "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY" -H 'Content-Type: application/json' --data-binary "@$req")"
+              [ "$status" = 200 ] || { echo "::error::Live $owner $source HTTP $status"; exit 1; }
+              jq -e --arg owner "$owner" --arg source "$source" --argjson count "$count" '.owner==$owner and .sourceFile==$source and .dryRun==false and .total==$count and .deleted==0' "$res" >/dev/null || exit 1
+              jq -r '[.sourceFile,.owner,.created,.updated,.deleted,.unchanged] | @tsv' "$res" >> "$RUNNER_TEMP/ta/live.tsv"
+            done
+          done < <(jq -r '.months[] | [.sourceFile,.payload,.count] | @tsv' "$RUNNER_TEMP/ta/payloads/manifest.json")
+      - name: Post-live idempotency check
+        if: steps.preview.outputs.deletion_total == '0'
+        shell: bash
+        run: |
+          while IFS=$'\t' read -r source payload count; do
+            for owner in elias thomas; do
+              req="$RUNNER_TEMP/ta/post-request-$owner-${source%.pdf}.json"
+              res="$RUNNER_TEMP/ta/post-$owner-${source%.pdf}.json"
+              jq --arg owner "$owner" '.owner=$owner | .dryRun=true' "$RUNNER_TEMP/ta/payloads/$payload" > "$req"
+              status="$(curl -sS -L -o "$res" -w '%{http_code}' -X POST "https://$SUPABASE_PROJECT_REF.supabase.co/functions/v1/technical-safety-sync" -H "Authorization: Bearer $TECHNICAL_SAFETY_SYNC_KEY" -H 'Content-Type: application/json' --data-binary "@$req")"
+              [ "$status" = 200 ] || exit 1
+              jq -e --arg owner "$owner" --arg source "$source" --argjson count "$count" '.owner==$owner and .sourceFile==$source and .dryRun==true and .total==$count and .created==0 and .updated==0 and .deleted==0 and .unchanged==$count' "$res" >/dev/null || exit 1
+            done
+          done < <(jq -r '.months[] | [.sourceFile,.payload,.count] | @tsv' "$RUNNER_TEMP/ta/payloads/manifest.json")
+          echo "success" > "$RUNNER_TEMP/ta/status.txt"
+      - name: Remove request files containing auth-adjacent payload copies
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/ta"/request-*.json "$RUNNER_TEMP/ta"/live-request-*.json "$RUNNER_TEMP/ta"/post-request-*.json
+      - name: Upload safe sync artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: technical-safety-run-now
+          path: |
+            ${{ runner.temp }}/ta/payloads/manifest.json
+            ${{ runner.temp }}/ta/payloads/*.json
+            ${{ runner.temp }}/ta/preview.tsv
+            ${{ runner.temp }}/ta/live.tsv
+            ${{ runner.temp }}/ta/deletion_total.txt
+            ${{ runner.temp }}/ta/status.txt
+          if-no-files-found: warn
+          retention-days: 1
