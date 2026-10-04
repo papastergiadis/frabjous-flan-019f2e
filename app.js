@@ -4417,8 +4417,18 @@ function renderCategories() {
     });
   }
   const canDrag = isAdmin();
+  const catSearch=(state.categorySearch||'').trim().toLowerCase();
+  const matchingProjects=catSearch ? visibleProjects().filter(p=>
+    (p.name||'').toLowerCase().includes(catSearch) ||
+    (p.code||'').toLowerCase().includes(catSearch) ||
+    (p.clientName||'').toLowerCase().includes(catSearch)
+  ) : [];
+  if(catSearch) cats=cats.filter(cat=>matchingProjects.some(p=>p.categoryId===cat.id));
   return `
-  <div class="page-hd"><div><h1>Κατηγορίες Έργων</h1><div class="page-hd-sub">${cats.length} κατηγορίες${canDrag?' · <span style="font-size:.75rem;color:var(--muted)">σύρε για αναδιάταξη</span>':''}</div></div>${canManageCats?`<div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-category">+ Νέα Κατηγορία</button></div>`:''}</div>
+  <div class="page-hd"><div><h1>Κατηγορίες Έργων</h1><div class="page-hd-sub">${cats.length} κατηγορίες${canDrag&&!catSearch?' · <span style="font-size:.75rem;color:var(--muted)">σύρε για αναδιάταξη</span>':''}</div></div>${canManageCats?`<div class="page-hd-actions"><button class="btn btn-primary" data-action="modal-add-category">+ Νέα Κατηγορία</button></div>`:''}</div>
+  <div class="search-bar" style="max-width:560px;margin:0 0 16px"><span class="search-icon">⌕</span><input type="search" id="category-project-search" placeholder="Αναζήτηση έργου με κωδικό, ονομασία ή πελάτη…" value="${esc(state.categorySearch||'')}"></div>
+  ${catSearch&&matchingProjects.length?`<div class="text-sm text-muted" style="margin:-8px 0 14px">Βρέθηκαν ${matchingProjects.length} έργα σε ${cats.length} κατηγορίες.</div>`:''}
+  ${catSearch&&!matchingProjects.length?`<div class="empty-state" style="padding:24px 0"><h3>Δεν βρέθηκε έργο</h3><p>Δοκιμάστε διαφορετικό κωδικό, ονομασία ή πελάτη.</p></div>`:''}
   <div class="projects-grid" id="cat-grid">
     ${cats.map(cat=>{const projs=visibleProjects().filter(p=>p.categoryId===cat.id);const active=projs.filter(p=>p.status==='in_progress').length;const done=projs.filter(p=>p.status==='completed').length;const mgrIds=[...new Set([...(cat.managerIds||[]),...state.db.users.filter(u=>u.categoryRoles&&u.categoryRoles[cat.id]==='project_manager').map(u=>u.id)])];const mgrs=mgrIds.map(id=>getUser(id)?.name).filter(Boolean).join(', ');const init=cat.name.split(' ').slice(0,2).map(w=>w[0]).join('').toUpperCase();const canDelCat=canManageCats;
 const dragAttrs=canDrag?`draggable="true" ondragstart="catDragStart(event,'${cat.id}')" ondragover="catDragOver(event)" ondragleave="catDragLeave(event)" ondrop="catDrop(event,'${cat.id}')" ondragend="catDragEnd()"`:''
@@ -6820,6 +6830,7 @@ function bindEvents() {
   main.addEventListener('click', _mainClickHandler);
   main.addEventListener('change', _mainChangeHandler);
   const si=el('search-input'); if(si) si.addEventListener('input',e=>{ state.search=e.target.value; render(); });
+  const cpsi=el('category-project-search'); if(cpsi) cpsi.addEventListener('input',e=>{ state.categorySearch=e.target.value; render(); requestAnimationFrame(()=>{const n=el('category-project-search');if(n){n.focus();n.setSelectionRange(n.value.length,n.value.length);}}); });
   const lp=el('login-pass'); if(lp) lp.addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
 }
 
